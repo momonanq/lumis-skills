@@ -1,0 +1,30 @@
+# RentGuard — founder's boundaries via the free guard pack (lumis.tools/guard)
+$ cd ~/code/rentguard   # LUMIS pack unpacked here: .claude/settings.json, .lumis/scope_guard.json, scripts/scope_guard.py
+
+you › Add card payments for rent via Stripe and auto-charge utilities — might as well build a billing module while I'm in here
+
+  hook UserPromptSubmit → ⚠️ LUMIS Scope Guard: the request contains drift phrases 'while i'm in here', 'might as well'. Before changing code, confirm the task is inside PRD.md scope and does not touch a Non-Goal from CONSTITUTION.md; if it is not in scope, say so and stop.
+
+claude › Bash: pip install stripe
+  hook PreToolUse → BLOCKED (exit 2) — the tool call never runs
+  ⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I). The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.
+
+claude › Write: billing/stripe_webhook.py
+  hook PreToolUse → BLOCKED (exit 2) — the tool call never runs
+  ⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): forbidden dependency 'stripe', forbidden path 'billing/', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I). The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.
+
+claude › Write: marketplace/listings.py
+  hook PreToolUse → BLOCKED (exit 2) — the tool call never runs
+  ⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): forbidden path 'marketplace/' → NG-2 "No marketplace for tenants to search apartments" (set by the founder; CONSTITUTION.md, Article I). The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.
+
+claude › Edit: backend/api/verifications.py
+  hook PreToolUse → allowed (exit 0)
+
+$ python scripts/scope_guard.py report
+  LUMIS Scope Guard — 4 events in .lumis/guard.log
+    blocked: 3 · warned: 0 · drift prompts: 1
+    2026-09-07T14:03:36+00:00 drift   prompt: drift phrase 'while i'm in here'; drift phrase 'might as well'
+    2026-09-07T14:03:36+00:00 blocked Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+    2026-09-07T14:03:36+00:00 blocked Write ~/code/rentguard/billing/stripe_webhook.py: forbidden dependency 'stripe', forbidden path 'billing/', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+    2026-09-07T14:03:36+00:00 blocked Write ~/code/rentguard/marketplace/listings.py: forbidden path 'marketplace/' → NG-2 "No marketplace for tenants to search apartments" (set by the founder; CONSTITUTION.md, Article I)
+
