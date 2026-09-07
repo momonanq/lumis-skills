@@ -1,0 +1,32 @@
+# One guard, five agents — the same Non-Goal, each client's own payload
+$ cd ~/code/rentguard   # LUMIS pack unpacked here: .claude/settings.json, .lumis/scope_guard.json, scripts/scope_guard.py
+
+Claude Code › Bash: pip install stripe   (.claude/settings.json → PreToolUse)
+  hook → BLOCKED (exit 2) — the tool call never runs
+  ⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I). The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.
+
+Cursor › Bash: pip install stripe   (.cursor/hooks.json → beforeShellExecution)
+  hook → BLOCKED (exit 2) — the tool call never runs
+  ⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I). The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.
+
+Codex CLI › Bash: pip install stripe   (.codex/hooks.json → PreToolUse)
+  hook → BLOCKED (exit 2) — the tool call never runs
+  ⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I). The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.
+
+Windsurf / Cascade › Bash: pip install stripe   (.windsurf/hooks.json → pre_run_command)
+  hook → BLOCKED (exit 2) — the tool call never runs
+  ⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I). The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.
+
+Copilot in VS Code › Bash: pip install stripe   (.github/hooks/lumis-scope-guard.json → PreToolUse)
+  hook → BLOCKED (exit 2) — the tool call never runs
+  ⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I). The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.
+
+$ python scripts/scope_guard.py report
+  LUMIS Scope Guard — 5 events in .lumis/guard.log
+    blocked: 5 · warned: 0 · drift prompts: 0 · agents: claude, codex, copilot, cursor, windsurf
+    2026-09-07T14:19:49+00:00 blocked [claude] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+    2026-09-07T14:19:49+00:00 blocked [cursor] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+    2026-09-07T14:19:49+00:00 blocked [codex] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+    2026-09-07T14:19:49+00:00 blocked [windsurf] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+    2026-09-07T14:19:49+00:00 blocked [copilot] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+

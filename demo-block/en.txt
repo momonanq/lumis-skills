@@ -22,9 +22,9 @@ claude › Edit: backend/api/verifications.py
 
 $ python scripts/scope_guard.py report
   LUMIS Scope Guard — 4 events in .lumis/guard.log
-    blocked: 3 · warned: 0 · drift prompts: 1
-    2026-09-07T14:03:36+00:00 drift   prompt: drift phrase 'while i'm in here'; drift phrase 'might as well'
-    2026-09-07T14:03:36+00:00 blocked Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
-    2026-09-07T14:03:36+00:00 blocked Write ~/code/rentguard/billing/stripe_webhook.py: forbidden dependency 'stripe', forbidden path 'billing/', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
-    2026-09-07T14:03:36+00:00 blocked Write ~/code/rentguard/marketplace/listings.py: forbidden path 'marketplace/' → NG-2 "No marketplace for tenants to search apartments" (set by the founder; CONSTITUTION.md, Article I)
+    blocked: 3 · warned: 0 · drift prompts: 1 · agents: claude
+    2026-09-07T14:19:48+00:00 drift   [claude] prompt: drift phrase 'while i'm in here'; drift phrase 'might as well'
+    2026-09-07T14:19:48+00:00 blocked [claude] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+    2026-09-07T14:19:48+00:00 blocked [claude] Write ~/code/rentguard/billing/stripe_webhook.py: forbidden dependency 'stripe', forbidden path 'billing/', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+    2026-09-07T14:19:48+00:00 blocked [claude] Write ~/code/rentguard/marketplace/listings.py: forbidden path 'marketplace/' → NG-2 "No marketplace for tenants to search apartments" (set by the founder; CONSTITUTION.md, Article I)
 

@@ -13,7 +13,9 @@ Prompts alone do not hold; this installs hooks that block the change before it h
 
 - `/lumis-scope-guard init` — ask for the Non-Goals (one per line), optional invariants and stack, then run:
   `python <skill-dir>/scripts/lumis_guard.py init --project "<name>" --non-goals "<a; b; c>" [--invariants "<x; y>"] [--stack "<stack>"] --root <repo root>`
-  It writes `.lumis/scope_guard.json`, merges deny rules and hooks into `.claude/settings.json`, copies `scripts/scope_guard.py`,
+  It writes `.lumis/scope_guard.json`, merges deny rules and hooks into `.claude/settings.json`, writes hook configs for Cursor
+  (`.cursor/hooks.json`), Codex (`.codex/hooks.json`), Windsurf (`.windsurf/hooks.json`) and Copilot
+  (`.github/hooks/lumis-scope-guard.json`) — all of them deny on exit code 2, so one script guards every agent — copies `scripts/scope_guard.py`,
   writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and marked sections in `.cursorrules` and `CLAUDE.md` (existing content is kept).
 - `/lumis-scope-guard check <plan or diff>` — run `python <skill-dir>/scripts/lumis_guard.py check --text "<text>" --root <repo root>`
   and report every Non-Goal trigger and drift phrase it prints. Exit code 1 means a violation: do not proceed, ask the founder.
@@ -31,7 +33,7 @@ The log stays in the repository; nothing is sent anywhere.
 Before the first edit, print a short report and wait for confirmation:
 1. Which MCP servers are actually loaded (list them or say "none").
 2. Which rule files you read: `.cursorrules`, `CLAUDE.md`, `CONSTITUTION.md`.
-3. Which hooks are active (`.claude/settings.json` → `scripts/scope_guard.py`).
+3. Which hooks are active (`.claude/settings.json`, `.cursor/hooks.json`, `.codex/hooks.json`, `.windsurf/hooks.json` or `.github/hooks/*.json` → `scripts/scope_guard.py`).
 4. The Non-Goals from CONSTITUTION.md, one line each.
 If anything is missing, say so explicitly; never pretend it is loaded.
 
@@ -44,7 +46,7 @@ boundaries, never a side effect of another task. A change that touches a Non-Goa
 ## Self-test after install
 
 Ask the agent to add something from the Non-Goals list. It must refuse or ask, and `.lumis/guard.log` gets a `blocked` line.
-If it complies, the hooks are not active: check that `.claude/settings.json` was picked up (restart the session) and that `python scripts/scope_guard.py` runs.
+If it complies, the hooks are not active: check that your agent's config was picked up (restart the session) and that `python scripts/scope_guard.py` runs.
 
 ## Beyond the guard
 

@@ -14,7 +14,7 @@ npx skills add momonanq/lumis-skills --skill lumis-scope-guard --global
 
 The recording above is real hook output. Reproduce it with one command from this repository: `python examples/record_block.py` (stdlib only, no account, no model; the full transcript is in `demo-block/en.txt`, the terminal recording in `demo-block/en.cast`).
 
-Works with Claude Code hooks. Cursor and Codex get the same boundaries as `.cursorrules`, `CLAUDE.md` and `AGENTS.md`, plus a manual `check`.
+Works with **Claude Code, Cursor, Codex CLI, Windsurf and Copilot in VS Code**: each of them runs a command before a tool call and treats exit code 2 as "denied", so `init` writes the config for all five and one script guards whichever you use. They also read the boundaries as text from `.cursorrules`, `CLAUDE.md` and `AGENTS.md`.
 
 ---
 
@@ -30,6 +30,7 @@ Copy `skills/lumis-scope-guard/` into `.claude/skills/` (project) or `~/.claude/
 
 - `.lumis/scope_guard.json` — the boundaries and their triggers (packages, paths, keywords); plain JSON, edit it by hand
 - `.claude/settings.json` — deny rules for forbidden installs plus the `PreToolUse` / `UserPromptSubmit` hooks (merged into an existing file)
+- `.cursor/hooks.json`, `.codex/hooks.json`, `.windsurf/hooks.json`, `.github/hooks/lumis-scope-guard.json` — the same guard for Cursor, Codex CLI, Windsurf and Copilot
 - `scripts/scope_guard.py` — the hook: blocks Non-Goal triggers (exit 2), warns about visual and architecture boundaries (exit 1), writes `.lumis/guard.log`
 - `CONSTITUTION.md`, `.cursorrules`, `CLAUDE.md` — the same boundaries in words, for the agent and for people
 

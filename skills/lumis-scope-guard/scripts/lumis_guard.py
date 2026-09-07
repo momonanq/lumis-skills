@@ -7,6 +7,7 @@
 
 `init` writes into the repository root: .lumis/scope_guard.json (triggers), .claude/settings.json (deny rules + hooks,
 merged into an existing file), scripts/scope_guard.py (the hook), CONSTITUTION.md (Non-Goals and invariants verbatim)
+hook configs for Cursor / Codex / Windsurf / Copilot,
 and LUMIS sections in .cursorrules and CLAUDE.md (existing content kept). `check` reports Non-Goal triggers and drift phrases in a text. No network, no model.
 Same engine as https://lumis.tools/guard.
 """
@@ -133,6 +134,26 @@ def read_log(root: Path, cfg: dict) -> list[dict]:
     return out
 
 
+def agent_hook_files(hook_path: str = "scripts/scope_guard.py") -> dict[str, dict]:
+    """Hook configs for the agents that can stop a tool call before it runs. All of them deny on exit code 2,
+    so one script serves Cursor, Codex, Windsurf and Copilot; Claude Code is configured in .claude/settings.json."""
+    py = f"python {hook_path}"
+    return {
+        ".cursor/hooks.json": {"hooks": {
+            "preToolUse": [{"command": f"{py} pre-tool --agent cursor"}],
+            "beforeShellExecution": [{"command": f"{py} pre-tool --agent cursor"}],
+            "beforeSubmitPrompt": [{"command": f"{py} prompt --agent cursor"}],
+        }},
+        ".codex/hooks.json": {"hooks": {"PreToolUse": [{"command": f"{py} pre-tool --agent codex"}]}},
+        ".windsurf/hooks.json": {"hooks": {
+            "pre_run_command": [{"command": f"python3 {hook_path} pre-tool --agent windsurf", "powershell": f"{py} pre-tool --agent windsurf", "show_output": True}],
+            "pre_write_code": [{"command": f"python3 {hook_path} pre-tool --agent windsurf", "powershell": f"{py} pre-tool --agent windsurf", "show_output": True}],
+            "pre_user_prompt": [{"command": f"python3 {hook_path} prompt --agent windsurf", "powershell": f"{py} prompt --agent windsurf", "show_output": True}],
+        }},
+        ".github/hooks/lumis-scope-guard.json": {"hooks": {"PreToolUse": [{"type": "command", "command": f"{py} pre-tool --agent copilot", "timeout": 15}]}},
+    }
+
+
 def claude_settings(cfg: dict, existing: dict | None) -> dict:
     deny: list[str] = []
     for pkg in cfg.get("deny_packages", []):
@@ -246,6 +267,24 @@ def cmd_init(args: argparse.Namespace) -> int:
     settings_path.write_text(json.dumps(claude_settings(cfg, existing), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (root / "scripts").mkdir(parents=True, exist_ok=True)
     (root / "scripts" / "scope_guard.py").write_text((HERE / "scope_guard.py").read_text(encoding="utf-8"), encoding="utf-8")
+    for rel, content in agent_hook_files().items():  # Cursor, Codex, Windsurf, Copilot — same hook, same exit code 2
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        merged = content
+        if target.exists():  # keep the user's own hooks, add ours per event
+            try:
+                current = json.loads(target.read_text(encoding="utf-8"))
+                hooks = dict(current.get("hooks") or {})
+                for event, entries in content["hooks"].items():
+                    existing_entries = list(hooks.get(event) or [])
+                    if not any("scope_guard.py" in json.dumps(h) for h in existing_entries):
+                        existing_entries += entries
+                    hooks[event] = existing_entries
+                current["hooks"] = hooks
+                merged = current
+            except Exception:
+                merged = content
+        target.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     const_path = root / "CONSTITUTION.md"
     if const_path.exists() and "LUMIS" not in const_path.read_text(encoding="utf-8"):
         const_path = root / "CONSTITUTION.lumis.md"  # never overwrite a hand-written constitution
@@ -255,6 +294,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"LUMIS scope guard installed in {root}")
     print(f"  Non-Goals: {len(non_goals)} · invariants: {len(invariants)} · deny packages: {len(cfg['deny_packages'])} · deny paths: {len(cfg['deny_paths'])} · keywords: {len(cfg['keywords'])}")
     print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section), CLAUDE.md (section)")
+    print("  Agents: Claude Code (.claude/settings.json), Cursor (.cursor/hooks.json), Codex (.codex/hooks.json), Windsurf (.windsurf/hooks.json), Copilot (.github/hooks/lumis-scope-guard.json)")
     print("  Self-test: ask the agent to add something from the Non-Goals list — it must refuse or ask.")
     return 0
 
@@ -295,7 +335,8 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
-    for rel in (".lumis/scope_guard.json", ".claude/settings.json", "scripts/scope_guard.py", "CONSTITUTION.md", ".cursorrules", "CLAUDE.md"):
+    for rel in (".lumis/scope_guard.json", ".claude/settings.json", "scripts/scope_guard.py", "CONSTITUTION.md", ".cursorrules", "CLAUDE.md",
+                ".cursor/hooks.json", ".codex/hooks.json", ".windsurf/hooks.json", ".github/hooks/lumis-scope-guard.json"):
         print(("✓ " if (root / rel).exists() else "✗ ") + rel)
     cfg_path = root / ".lumis" / "scope_guard.json"
     if cfg_path.exists():
