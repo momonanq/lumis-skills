@@ -14,7 +14,7 @@ Prompts alone do not hold; this installs hooks that block the change before it h
 - `/lumis-scope-guard init` — ask for the Non-Goals (one per line), optional invariants and stack, then run:
   `python <skill-dir>/scripts/lumis_guard.py init --project "<name>" --non-goals "<a; b; c>" [--invariants "<x; y>"] [--stack "<stack>"] --root <repo root>`
   It writes `.lumis/scope_guard.json`, merges deny rules and hooks into `.claude/settings.json`, copies `scripts/scope_guard.py`,
-  writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and a marked section in `.cursorrules`.
+  writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and marked sections in `.cursorrules` and `CLAUDE.md` (existing content is kept).
 - `/lumis-scope-guard check <plan or diff>` — run `python <skill-dir>/scripts/lumis_guard.py check --text "<text>" --root <repo root>`
   and report every Non-Goal trigger and drift phrase it prints. Exit code 1 means a violation: do not proceed, ask the founder.
 - `/lumis-scope-guard status` — which guard files exist, how many triggers are in force, and what the guard has done so far

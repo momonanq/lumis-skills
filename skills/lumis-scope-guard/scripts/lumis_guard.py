@@ -7,7 +7,7 @@
 
 `init` writes into the repository root: .lumis/scope_guard.json (triggers), .claude/settings.json (deny rules + hooks,
 merged into an existing file), scripts/scope_guard.py (the hook), CONSTITUTION.md (Non-Goals and invariants verbatim)
-and a LUMIS section in .cursorrules. `check` reports Non-Goal triggers and drift phrases in a text. No network, no model.
+and LUMIS sections in .cursorrules and CLAUDE.md (existing content kept). `check` reports Non-Goal triggers and drift phrases in a text. No network, no model.
 Same engine as https://lumis.tools/guard.
 """
 from __future__ import annotations
@@ -69,6 +69,8 @@ DRIFT_PHRASES = (
 )
 MARK_START = "# --- LUMIS scope guard (generated; edit .lumis/scope_guard.json instead) ---"
 MARK_END = "# --- end LUMIS scope guard ---"
+MD_START = "<!-- LUMIS scope guard (generated; edit .lumis/scope_guard.json instead) -->"
+MD_END = "<!-- end LUMIS scope guard -->"
 
 
 def split_items(text: str) -> list[str]:
@@ -193,10 +195,28 @@ def cursorrules_section(project: str, non_goals: list[str], invariants: list[str
     return "\n".join(lines)
 
 
-def upsert_block(path: Path, block: str) -> None:
+def claude_md_section(project: str, non_goals: list[str], invariants: list[str], stack: str) -> str:
+    """The same boundaries for Claude Code's CLAUDE.md (merged into an existing file, never replacing it)."""
+    lines = [MD_START, f"## Boundaries of {project} (LUMIS scope guard)", "",
+             "Before the first edit: list the loaded rule files (.cursorrules, CLAUDE.md, CONSTITUTION.md) and active hooks, restate the Non-Goals below, wait for confirmation.",
+             "", "### Non-Goals (never implement, never suggest)"]
+    lines += [f"- {x}" for x in non_goals] or ["- (none)"]
+    if stack:
+        lines += ["", "### Stack (user-mandated; do not add servers, frameworks or build steps beyond it)", f"- {stack}"]
+    if invariants:
+        lines += ["", "### Invariants"] + [f"- {x}" for x in invariants]
+    lines += ["", "### Guard",
+              "`.claude/settings.json` runs `scripts/scope_guard.py` before every edit and command; a Non-Goal trigger is blocked with the boundary named (NG-n). "
+              "Events land in `.lumis/guard.log` (`python scripts/scope_guard.py report`). Never edit the hook or the deny rules to get past them.",
+              "If the request or your own plan contains 'quick fix for now', 'while I'm in here', 'might as well', 'заодно', 'на всякий случай' — stop and ask: is this in scope? y/n.",
+              MD_END, ""]
+    return "\n".join(lines)
+
+
+def upsert_block(path: Path, block: str, start_mark: str = MARK_START, end_mark: str = MARK_END) -> None:
     text = path.read_text(encoding="utf-8") if path.exists() else ""
-    if MARK_START in text and MARK_END in text:
-        start, end = text.index(MARK_START), text.index(MARK_END) + len(MARK_END)
+    if start_mark in text and end_mark in text:
+        start, end = text.index(start_mark), text.index(end_mark) + len(end_mark)
         text = text[:start] + block.rstrip("\n") + text[end:]
     else:
         text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
@@ -231,9 +251,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         const_path = root / "CONSTITUTION.lumis.md"  # never overwrite a hand-written constitution
     const_path.write_text(constitution(project, non_goals, invariants, stack), encoding="utf-8")
     upsert_block(root / ".cursorrules", cursorrules_section(project, non_goals, invariants, stack))
+    upsert_block(root / "CLAUDE.md", claude_md_section(project, non_goals, invariants, stack), MD_START, MD_END)
     print(f"LUMIS scope guard installed in {root}")
     print(f"  Non-Goals: {len(non_goals)} · invariants: {len(invariants)} · deny packages: {len(cfg['deny_packages'])} · deny paths: {len(cfg['deny_paths'])} · keywords: {len(cfg['keywords'])}")
-    print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section)")
+    print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section), CLAUDE.md (section)")
     print("  Self-test: ask the agent to add something from the Non-Goals list — it must refuse or ask.")
     return 0
 
@@ -274,7 +295,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
-    for rel in (".lumis/scope_guard.json", ".claude/settings.json", "scripts/scope_guard.py", "CONSTITUTION.md", ".cursorrules"):
+    for rel in (".lumis/scope_guard.json", ".claude/settings.json", "scripts/scope_guard.py", "CONSTITUTION.md", ".cursorrules", "CLAUDE.md"):
         print(("✓ " if (root / rel).exists() else "✗ ") + rel)
     cfg_path = root / ".lumis" / "scope_guard.json"
     if cfg_path.exists():
