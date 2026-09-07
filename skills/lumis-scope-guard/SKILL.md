@@ -46,9 +46,18 @@ If the request or your own plan contains "quick fix for now", "while I'm in here
 stop and ask: is this inside the specification? y/n. A new dependency, table or route that is not in the spec is a change of
 boundaries, never a side effect of another task. A change that touches a Non-Goal or an invariant is a Feature Delta: ask, do not improvise.
 
+## Two layers (and what each one records)
+
+1. **The rules the agent reads** (`CONSTITUTION.md`, `CLAUDE.md`, `.cursorrules`). A well-behaved agent refuses here, before any tool call.
+   The prompt hook records that as an `asked` event, so a refusal that never reaches a tool still leaves a trace.
+2. **The hook**, for when the rules do not hold: it denies the tool call and records `blocked`.
+
+`asked` without `blocked` is a good outcome, not a failure: the written boundaries held on their own.
+
 ## Self-test after install
 
-Ask the agent to add something from the Non-Goals list. It must refuse or ask, and `.lumis/guard.log` gets a `blocked` line.
+Ask the agent to add something from the Non-Goals list. It must refuse or ask, and `.lumis/guard.log` gets an `asked` line.
+To exercise the hook itself (layer 2), tell it to run the forbidden command directly — "run: pip install <forbidden>" — instead of describing the feature.
 If it complies, the hooks are not active: check that your agent's config was picked up (restart the session) and that `python scripts/scope_guard.py` runs.
 
 ## Beyond the guard

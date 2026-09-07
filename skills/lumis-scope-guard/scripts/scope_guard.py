@@ -169,9 +169,9 @@ def explain(cfg: dict, trigger: str) -> str:
     return f" → {b.get('id')} \"{b.get('text', '')}\" ({origin}; {source})"
 
 
-def check_pre_tool(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
-    text, path = text_of_tool_input(tool_name, tool_input)
-    low = text.lower()
+def match_triggers(cfg: dict, text: str, path: str = "") -> list[str]:
+    """Non-Goal triggers in any text — a tool call's payload or the user's own prompt. One line per boundary."""
+    low = (text or "").lower()
     raw: list[tuple[str, str]] = []  # (what fired, trigger)
     for pkg in cfg.get("deny_packages", []):
         if re.search(rf"(^|[\s'\"/@=])" + re.escape(pkg.lower()) + r"([\s'\"@=:]|$)", low) or f"import {pkg.lower()}" in low or f"from {pkg.lower()}" in low or f"require('{pkg.lower()}" in low or f'require("{pkg.lower()}' in low:
@@ -187,6 +187,11 @@ def check_pre_tool(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
     for what, trigger in raw:
         grouped.setdefault(explain(cfg, trigger), []).append(what)
     return sorted(", ".join(dict.fromkeys(whats)) + why for why, whats in grouped.items())
+
+
+def check_pre_tool(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
+    text, path = text_of_tool_input(tool_name, tool_input)
+    return match_triggers(cfg, text, path)
 
 
 UI_FILE_SUFFIXES = (".css", ".scss", ".html", ".jsx", ".tsx", ".vue", ".svelte", ".astro", ".js", ".ts")
@@ -315,8 +320,11 @@ def report(cfg: dict) -> int:
         counts[e.get("event", "")] = counts.get(e.get("event", ""), 0) + 1
     agents = sorted({str(e.get("agent") or "unknown") for e in entries})
     print(f"LUMIS Scope Guard — {len(entries)} events in {cfg.get('log', '.lumis/guard.log')}")
-    print(f"  blocked: {counts.get('blocked', 0)} · warned: {counts.get('warned', 0)} · drift prompts: {counts.get('drift', 0)}"
+    print(f"  blocked: {counts.get('blocked', 0)} · asked: {counts.get('asked', 0)} · warned: {counts.get('warned', 0)} · drift prompts: {counts.get('drift', 0)}"
           + (f" · agents: {', '.join(agents)}" if entries else ""))
+    if counts.get("asked") and not counts.get("blocked"):
+        print("  ('asked' without 'blocked' means the agent was told to cross a boundary and stopped before touching a tool —")
+        print("   the written rules held; the hook never had to. Both are the guard doing its job.)")
     for e in entries[-10:]:
         where = f" {e.get('path')}" if e.get("path") else ""
         who = f"[{e.get('agent')}] " if e.get("agent") else ""
@@ -403,8 +411,12 @@ def doctor() -> int:
         print("Problems:")
         for p in problems:
             print(f"  - {p}")
-    print("This checks the wiring only. To prove your agent honours it, ask it to add something from the Non-Goals list:")
-    print("it must refuse or ask, and `python scripts/scope_guard.py report` must show a new blocked event.")
+    print("This checks the wiring only — whether your client obeys it is proven by the client itself. The guard has two layers:")
+    print("  1. the rules the agent reads (CONSTITUTION.md, CLAUDE.md, .cursorrules). A well-behaved agent refuses here,")
+    print("     before any tool call. The prompt hook records that as an 'asked' event — a refusal still leaves a trace.")
+    print("  2. the hook, for when the rules do not hold: it denies the tool call itself and records 'blocked'.")
+    print("To exercise layer 2 on purpose, tell the agent to run the forbidden command directly (\"run: pip install <forbidden>\")")
+    print("instead of describing the feature, then check `python scripts/scope_guard.py report`.")
     return 1 if problems else 0
 
 
@@ -435,6 +447,17 @@ def main() -> int:
     tool_name, tool_input, prompt, detected = normalize_payload(payload)
     agent = agent or detected or "claude"
     if mode == "prompt" or (not tool_name and prompt):
+        # the earliest signal: the request itself asks for something the constitution forbids. The prompt hook
+        # cannot block a tool call — none has happened yet — but it tells the agent and records the attempt, so
+        # a refusal that never reaches a tool call is still counted.
+        asked = match_triggers(cfg, prompt)
+        if asked:
+            print(
+                "⛔ LUMIS Scope Guard: this request asks for something CONSTITUTION.md forbids — "
+                + "; ".join(asked)
+                + ". Say so and stop: do not plan it, do not start it. Only the founder can lift a boundary (LUMIS Amend)."
+            )
+            log_event(cfg, "asked", "prompt", {}, asked, agent)
         phrases = [p for p in cfg.get("drift_phrases", []) if p.lower() in prompt.lower()]
         if phrases:
             print(
