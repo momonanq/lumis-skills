@@ -21,6 +21,7 @@ so the same guard works everywhere; only the config file and the payload shape d
         adds a warning to the context when the prompt contains a drift phrase
         ("quick fix for now", "while I'm in here", ...) — the agent must confirm the task is in scope.
   * `python scripts/scope_guard.py report`   -> what the guard blocked and warned about so far (.lumis/guard.log)
+  * `python scripts/scope_guard.py doctor`   -> is the guard wired up here: files, configs, interpreter on PATH
 
 `--agent` only picks the shape of the refusal each client renders best; the payload is recognised automatically,
 so a missing or wrong flag still blocks with exit 2. Every block and warning is appended to .lumis/guard.log
@@ -33,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -324,6 +326,88 @@ def report(cfg: dict) -> int:
     return 0
 
 
+AGENT_CONFIGS = {
+    "Claude Code": (".claude/settings.json", "hooks"),
+    "Cursor": (".cursor/hooks.json", "hooks"),
+    "Codex CLI": (".codex/hooks.json", "hooks"),
+    "Windsurf": (".windsurf/hooks.json", "hooks"),
+    "Copilot (VS Code)": (".github/hooks/lumis-scope-guard.json", "hooks"),
+}
+
+
+def doctor() -> int:
+    """Is the guard actually wired up here? Checks the files, the interpreter each config calls and the boundaries.
+    It cannot prove your client loaded the config — only the client can, by refusing. Run the self-test after this."""
+    root = project_root()
+    problems: list[str] = []
+    print(f"LUMIS Scope Guard — checking {root}")
+    script = root / "scripts" / "scope_guard.py"
+    print(("  ✓ " if script.exists() else "  ✗ ") + "scripts/scope_guard.py")
+    if not script.exists():
+        problems.append("the hook script itself is missing")
+    cfg_path = root / ".lumis" / "scope_guard.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            print(f"  ✓ .lumis/scope_guard.json — {len(cfg.get('non_goals', []))} Non-Goals, "
+                  f"{len(cfg.get('deny_packages', []))} forbidden packages, {len(cfg.get('keywords', []))} keywords")
+            if not (cfg.get("deny_packages") or cfg.get("deny_paths") or cfg.get("keywords")):
+                problems.append("no triggers in .lumis/scope_guard.json: nothing would ever be blocked")
+        except Exception as exc:
+            problems.append(f".lumis/scope_guard.json is not valid JSON ({exc})")
+            print("  ✗ .lumis/scope_guard.json — invalid JSON")
+    else:
+        problems.append(".lumis/scope_guard.json is missing")
+        print("  ✗ .lumis/scope_guard.json")
+    interpreters: set[str] = set()
+    for agent, (rel, key) in AGENT_CONFIGS.items():
+        path = root / rel
+        if not path.exists():
+            print(f"  – {agent}: {rel} not present (fine if you do not use it)")
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            problems.append(f"{rel} is not valid JSON ({exc})")
+            print(f"  ✗ {agent}: {rel} — invalid JSON")
+            continue
+        blob = json.dumps(data.get(key) or data)
+        if "scope_guard.py" not in blob:
+            problems.append(f"{rel} exists but does not call scope_guard.py")
+            print(f"  ✗ {agent}: {rel} — no scope_guard.py in it")
+            continue
+        # Windsurf carries a separate "powershell" command for Windows; check only what this OS would run
+        win = os.name == "nt"
+        for entries in (data.get(key) or {}).values() if isinstance(data.get(key), dict) else []:
+            for entry in entries if isinstance(entries, list) else []:
+                if not isinstance(entry, dict):
+                    continue
+                for hook in (entry.get("hooks") or [entry]):
+                    line = str((hook.get("powershell") if win and hook.get("powershell") else hook.get("command")) or "")
+                    if "scope_guard.py" in line:
+                        interpreters.add(line.split()[0])
+        print(f"  ✓ {agent}: {rel}")
+    for exe in sorted(interpreters):
+        found = shutil.which(exe)
+        print(("  ✓ " if found else "  ✗ ") + f"interpreter '{exe}'" + (f" → {found}" if found else " is not on PATH — the hook would fail to start"))
+        if not found:
+            problems.append(f"'{exe}' is not on PATH; the agent cannot run the hook")
+    events = read_log({"log": ".lumis/guard.log"})
+    if events:
+        agents = sorted({str(e.get("agent") or "unknown") for e in events})
+        print(f"  ✓ .lumis/guard.log — {len(events)} events so far, from: {', '.join(agents)}")
+    else:
+        print("  – .lumis/guard.log — empty: no agent has hit a boundary here yet (or none has run)")
+    print()
+    if problems:
+        print("Problems:")
+        for p in problems:
+            print(f"  - {p}")
+    print("This checks the wiring only. To prove your agent honours it, ask it to add something from the Non-Goals list:")
+    print("it must refuse or ask, and `python scripts/scope_guard.py report` must show a new blocked event.")
+    return 1 if problems else 0
+
+
 def parse_args(argv: list[str]) -> tuple[str, str]:
     """(mode, agent). `--agent <name>` is optional: the payload itself says which client called us."""
     mode = "pre-tool"
@@ -345,6 +429,8 @@ def main() -> int:
     cfg = load_config()
     if mode == "report":
         return report(cfg)
+    if mode == "doctor":
+        return doctor()
     payload = read_stdin_json()
     tool_name, tool_input, prompt, detected = normalize_payload(payload)
     agent = agent or detected or "claude"

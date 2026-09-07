@@ -11,6 +11,7 @@ npx skills add momonanq/lumis-skills --skill lumis-scope-guard --global
 1. Write ten lines of what your project will NOT do. Or paste them at https://lumis.tools/guard and get the pack without an account.
 2. The agent tries to step over one of them. The hook stops the tool call before it runs and names the boundary and who set it.
 3. `python scripts/scope_guard.py report` shows what was blocked, what was warned, and which prompts drifted. The log stays in your repo. Nothing leaves it.
+   (`python scripts/scope_guard.py doctor` checks the wiring first: files, configs, interpreter on PATH.)
 
 The recording above is real hook output. Reproduce it with one command from this repository: `python examples/record_block.py` (stdlib only, no account, no model; the full transcript is in `demo-block/en.txt`, the terminal recording in `demo-block/en.cast`).
 

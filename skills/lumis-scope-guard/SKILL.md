@@ -19,6 +19,9 @@ Prompts alone do not hold; this installs hooks that block the change before it h
   writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and marked sections in `.cursorrules` and `CLAUDE.md` (existing content is kept).
 - `/lumis-scope-guard check <plan or diff>` — run `python <skill-dir>/scripts/lumis_guard.py check --text "<text>" --root <repo root>`
   and report every Non-Goal trigger and drift phrase it prints. Exit code 1 means a violation: do not proceed, ask the founder.
+- `/lumis-scope-guard doctor` — run `python <skill-dir>/scripts/scope_guard.py doctor --root <repo root>` (or `python scripts/scope_guard.py doctor`
+  from the repository): checks that the hook script, `.lumis/scope_guard.json` and each agent's config are present and valid, and that the
+  interpreter they call is on PATH. It checks the wiring only — whether your client actually honours the hook is proven by the self-test below.
 - `/lumis-scope-guard status` — which guard files exist, how many triggers are in force, and what the guard has done so far
   (`.lumis/guard.log`: blocked / warned / drift events, last five shown). `python scripts/scope_guard.py report` prints the full summary.
 
