@@ -101,17 +101,21 @@ def check_pre_tool(cfg: dict, payload: dict) -> list[str]:
     tool_input = payload.get("tool_input", {}) or {}
     text, path = text_of_tool_input(tool_name, tool_input)
     low = text.lower()
-    hits: list[str] = []
+    raw: list[tuple[str, str]] = []  # (what fired, trigger)
     for pkg in cfg.get("deny_packages", []):
         if re.search(rf"(^|[\s'\"/@=])" + re.escape(pkg.lower()) + r"([\s'\"@=:]|$)", low) or f"import {pkg.lower()}" in low or f"from {pkg.lower()}" in low or f"require('{pkg.lower()}" in low or f'require("{pkg.lower()}' in low:
-            hits.append(f"forbidden dependency '{pkg}'" + explain(cfg, pkg))
+            raw.append((f"forbidden dependency '{pkg}'", pkg))
     for deny_path in cfg.get("deny_paths", []):
         if deny_path and (deny_path.lower() in path.lower() or deny_path.lower() in low):
-            hits.append(f"forbidden path '{deny_path}'" + explain(cfg, deny_path))
+            raw.append((f"forbidden path '{deny_path}'", deny_path))
     for kw in cfg.get("keywords", []):
         if kw and re.search(r"(?<![\w-])" + re.escape(kw.lower()) + r"(?![\w-])", low):
-            hits.append(f"Non-Goal keyword '{kw}'" + explain(cfg, kw))
-    return sorted(set(hits))
+            raw.append((f"Non-Goal keyword '{kw}'", kw))
+    # one line per boundary: "forbidden dependency 'stripe', forbidden path 'billing/' → NG-1 "..." (set by the founder; ...)"
+    grouped: dict[str, list[str]] = {}
+    for what, trigger in raw:
+        grouped.setdefault(explain(cfg, trigger), []).append(what)
+    return sorted(", ".join(dict.fromkeys(whats)) + why for why, whats in grouped.items())
 
 
 UI_FILE_SUFFIXES = (".css", ".scss", ".html", ".jsx", ".tsx", ".vue", ".svelte", ".astro", ".js", ".ts")
@@ -168,11 +172,15 @@ def check_architecture(cfg: dict, payload: dict) -> list[str]:
     # 1) a new top-level directory outside the file plan (Write of a new file only; edits touch existing files)
     top_level = {str(d).strip("/").lower() for d in arch.get("top_level") or []}
     if tool_name == "Write" and top_level:
-        try:
-            rel = Path(path).resolve().relative_to(project_root().resolve())
-        except Exception:
+        rel: Path | None
+        if Path(path).is_absolute():
+            try:
+                rel = Path(path).resolve().relative_to(project_root().resolve())
+            except Exception:
+                rel = None  # outside the repository: not this guard's business
+        else:
             rel = Path(path)
-        parts = [p for p in rel.parts if p not in ("", ".")]
+        parts = [p for p in rel.parts if p not in ("", ".")] if rel is not None else []
         if len(parts) > 1 and not str(rel).startswith("..") and not Path(path).exists():
             head = parts[0].lower()
             if head not in top_level and head not in ALWAYS_ALLOWED_DIRS:
