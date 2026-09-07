@@ -1,21 +1,20 @@
 # lumis-scope-guard
 
-**Boundaries for Claude Code that survive the session.**
+**Boundaries your coding agent can't step over.**
 
-![Claude Code tries `pip install stripe`; the hook blocks it before it runs and names the boundary NG-1, set by the founder](demo-block/en-3.png)
+![One Non-Goal, five clients: Claude Code, Cursor, Codex CLI, Windsurf and Copilot each try `pip install stripe`; the same hook blocks all five before the call runs and names boundary NG-1, set by the founder](demo-block/agents-6.png)
 
 ```bash
 npx skills add momonanq/lumis-skills --skill lumis-scope-guard --global
 ```
 
 1. Write ten lines of what your project will NOT do. Or paste them at https://lumis.tools/guard and get the pack without an account.
-2. The agent tries to step over one of them. The hook stops the tool call before it runs and names the boundary and who set it.
-3. `python scripts/scope_guard.py report` shows what was blocked, what was warned, and which prompts drifted. The log stays in your repo. Nothing leaves it.
-   (`python scripts/scope_guard.py doctor` checks the wiring first: files, configs, interpreter on PATH.)
+2. The agent tries to step over one of them. The hook stops the tool call before it runs and names the boundary and who set it. One script, five clients: Claude Code, Cursor, Codex CLI, Windsurf, Copilot in VS Code.
+3. `python scripts/scope_guard.py report` shows what was blocked, what was warned, which prompts drifted, and which agent tried. The log stays in your repo. Nothing leaves it.
 
-The recording above is real hook output. Reproduce it with one command from this repository: `python examples/record_block.py` (stdlib only, no account, no model; the full transcript is in `demo-block/en.txt`, the terminal recording in `demo-block/en.cast`).
+The recording above is real hook output. Reproduce it with one command from this repository: `python examples/record_block.py` (stdlib only, no account, no model; transcripts in `demo-block/`).
 
-Works with **Claude Code, Cursor, Codex CLI, Windsurf and Copilot in VS Code**: each of them runs a command before a tool call and treats exit code 2 as "denied", so `init` writes the config for all five and one script guards whichever you use. They also read the boundaries as text from `.cursorrules`, `CLAUDE.md` and `AGENTS.md`.
+The pack writes hook configs for five clients (`.claude/settings.json`, `.cursor/hooks.json`, `.codex/hooks.json`, `.windsurf/hooks.json`, `.github/hooks/lumis-scope-guard.json`); the same script answers each client's call format with exit code 2. Run `python scripts/scope_guard.py doctor` to check the wiring in your repo. The proof that counts is your own client's refusal: if you see it, send a screenshot and we list the client as verified. Any other editor gets the same boundaries as text rules: `.cursorrules`, `CLAUDE.md`, `AGENTS.md`, plus a manual `check`.
 
 ---
 
@@ -25,7 +24,7 @@ Copy `skills/lumis-scope-guard/` into `.claude/skills/` (project) or `~/.claude/
 
 | skill | what it does |
 |---|---|
-| `lumis-scope-guard` | Non-Goals → enforceable boundaries: deny rules and hooks for Claude Code, `CONSTITUTION.md`, sections in `.cursorrules` and `CLAUDE.md`, a drift check for any plan. Every block names the boundary it enforces (`NG-n`, who set it, where it is written); every event lands in `.lumis/guard.log` inside the repo (`status` / `report` summarise it). Stdlib Python, no model, no account, no telemetry. Same engine as https://lumis.tools/guard. |
+| `lumis-scope-guard` | Non-Goals → enforceable boundaries: hook configs for five agents, `CONSTITUTION.md`, sections in `.cursorrules` and `CLAUDE.md`, a drift check for any plan. Every block names the boundary it enforces (`NG-n`, who set it, where it is written); every event lands in `.lumis/guard.log` inside the repo — `status` and `report` summarise it, `doctor` checks the wiring. Stdlib Python, no model, no account, no telemetry. Same engine as https://lumis.tools/guard. |
 
 ## What the pack contains
 
