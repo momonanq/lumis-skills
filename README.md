@@ -12,6 +12,6 @@ or by pasting into Claude Code / Cursor: `Install the /lumis-scope-guard skill f
 
 | skill | what it does |
 |---|---|
-| `lumis-scope-guard` | Non-Goals → enforceable boundaries: deny rules and hooks for Claude Code, `CONSTITUTION.md`, a `.cursorrules` section, a drift check for any plan. Stdlib Python, no model, no account. Same engine as https://lumis.tools/guard. |
+| `lumis-scope-guard` | Non-Goals → enforceable boundaries: deny rules and hooks for Claude Code, `CONSTITUTION.md`, a `.cursorrules` section, a drift check for any plan. Every block names the boundary it enforces (`NG-n`, who set it, where it is written); every event lands in `.lumis/guard.log` inside the repo (`status` / `report` summarise it). Stdlib Python, no model, no account, no telemetry. Same engine as https://lumis.tools/guard. |
 
 `skills/lumis-scope-guard/scripts/scope_guard.py` is a verbatim copy of `lumis/exports/scope_guard.py` (kept in sync by `test_skill_pack.py`).

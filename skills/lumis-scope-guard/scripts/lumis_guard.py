@@ -86,7 +86,10 @@ def guard_config(project: str, non_goals: list[str]) -> dict:
     paths: list[str] = []
     keywords: list[str] = []
     matched: dict[str, list[str]] = {}
-    for ng in non_goals:
+    boundaries = [{"id": f"NG-{i}", "text": ng, "origin": "founder", "source": "CONSTITUTION.md, Article I"} for i, ng in enumerate(non_goals, 1)]
+    trigger_sources: dict[str, str] = {}  # trigger -> boundary id, so a block can say which Non-Goal it enforces
+    for b in boundaries:
+        ng = b["text"]
         low = ng.lower()
         for cap, spec in CAPABILITY_TRIGGERS.items():
             if any(m in low for m in spec["match"]):
@@ -94,13 +97,38 @@ def guard_config(project: str, non_goals: list[str]) -> dict:
                 paths += spec["paths"]
                 keywords += spec["keywords"]
                 matched.setdefault(cap, []).append(ng)
+                for t in spec["packages"] + spec["paths"] + spec["keywords"]:
+                    trigger_sources.setdefault(t.lower(), b["id"])
         for word in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{4,}", low):
             if word not in NON_GOAL_STOPWORDS and word not in keywords:
                 keywords.append(word)
+                trigger_sources.setdefault(word, b["id"])
     dedupe = lambda xs: list(dict.fromkeys(x for x in xs if x))
     return {"project": project, "generated": date.today().isoformat(), "source": "lumis-scope-guard skill",
-            "non_goals": non_goals, "capabilities": matched, "deny_packages": dedupe(packages), "deny_paths": dedupe(paths),
-            "keywords": dedupe(keywords)[:60], "drift_phrases": list(DRIFT_PHRASES), "design_non_goals": []}
+            "non_goals": non_goals, "boundaries": boundaries, "capabilities": matched, "deny_packages": dedupe(packages), "deny_paths": dedupe(paths),
+            "keywords": dedupe(keywords)[:60], "trigger_sources": trigger_sources, "drift_phrases": list(DRIFT_PHRASES), "design_non_goals": [],
+            "log": ".lumis/guard.log"}
+
+
+def explain(cfg: dict, trigger: str) -> str:
+    bid = (cfg.get("trigger_sources") or {}).get(trigger.lower())
+    for b in cfg.get("boundaries") or []:
+        if bid and b.get("id") == bid:
+            return f" → {bid} \"{b.get('text', '')}\" (set by the founder; {b.get('source', 'CONSTITUTION.md, Article I')})"
+    return ""
+
+
+def read_log(root: Path, cfg: dict) -> list[dict]:
+    target = root / str(cfg.get("log") or ".lumis/guard.log")
+    if not target.exists():
+        return []
+    out = []
+    for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
 
 
 def claude_settings(cfg: dict, existing: dict | None) -> dict:
@@ -222,13 +250,13 @@ def cmd_check(args: argparse.Namespace) -> int:
     hits: list[str] = []
     for kw in cfg.get("keywords", []):
         if kw and re.search(r"(?<![\w-])" + re.escape(kw.lower()) + r"(?![\w-])", low):
-            hits.append(f"Non-Goal keyword '{kw}'")
+            hits.append(f"Non-Goal keyword '{kw}'" + explain(cfg, kw))
     for pkg in cfg.get("deny_packages", []):
         if re.search(r"(^|[\s'\"/@=])" + re.escape(pkg.lower()) + r"([\s'\"@=:]|$)", low):
-            hits.append(f"forbidden dependency '{pkg}'")
+            hits.append(f"forbidden dependency '{pkg}'" + explain(cfg, pkg))
     for dp in cfg.get("deny_paths", []):
         if dp and dp.lower() in low:
-            hits.append(f"forbidden path '{dp}'")
+            hits.append(f"forbidden path '{dp}'" + explain(cfg, dp))
     drift = [p for p in cfg.get("drift_phrases", []) if p.lower() in low]
     print("Non-Goals in force:")
     for ng in cfg.get("non_goals", []):
@@ -252,6 +280,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     if cfg_path.exists():
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         print(f"Non-Goals: {len(cfg.get('non_goals', []))} · deny packages: {len(cfg.get('deny_packages', []))} · keywords: {len(cfg.get('keywords', []))}")
+        entries = read_log(root, cfg)
+        counts: dict[str, int] = {}
+        for e in entries:
+            counts[e.get("event", "")] = counts.get(e.get("event", ""), 0) + 1
+        print(f"Guard log ({cfg.get('log', '.lumis/guard.log')}): blocked {counts.get('blocked', 0)} · warned {counts.get('warned', 0)} · drift prompts {counts.get('drift', 0)}")
+        for e in entries[-5:]:
+            where = f" {e.get('path')}" if e.get("path") else ""
+            print(f"  {e.get('ts', '')} {e.get('event', ''):7} {e.get('tool', '')}{where}: " + "; ".join(e.get("hits", [])))
     return 0
 
 

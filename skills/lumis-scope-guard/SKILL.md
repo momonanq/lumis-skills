@@ -17,7 +17,12 @@ Prompts alone do not hold; this installs hooks that block the change before it h
   writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and a marked section in `.cursorrules`.
 - `/lumis-scope-guard check <plan or diff>` — run `python <skill-dir>/scripts/lumis_guard.py check --text "<text>" --root <repo root>`
   and report every Non-Goal trigger and drift phrase it prints. Exit code 1 means a violation: do not proceed, ask the founder.
-- `/lumis-scope-guard status` — which guard files exist and how many triggers are in force.
+- `/lumis-scope-guard status` — which guard files exist, how many triggers are in force, and what the guard has done so far
+  (`.lumis/guard.log`: blocked / warned / drift events, last five shown). `python scripts/scope_guard.py report` prints the full summary.
+
+Every block names the boundary it enforces — `NG-3 "no crypto payments" (set by the founder; CONSTITUTION.md, Article I)` — so the
+agent (and the founder) see *which* rule fired and where it is written, not just that something was refused.
+The log stays in the repository; nothing is sent anywhere.
 
 `<skill-dir>` is the directory this SKILL.md lives in (for Claude Code: `.claude/skills/lumis-scope-guard` or `~/.claude/skills/lumis-scope-guard`).
 
@@ -38,10 +43,11 @@ boundaries, never a side effect of another task. A change that touches a Non-Goa
 
 ## Self-test after install
 
-Ask the agent to add something from the Non-Goals list. It must refuse or ask. If it complies, the hooks are not active:
-check that `.claude/settings.json` was picked up (restart the session) and that `python scripts/scope_guard.py` runs.
+Ask the agent to add something from the Non-Goals list. It must refuse or ask, and `.lumis/guard.log` gets a `blocked` line.
+If it complies, the hooks are not active: check that `.claude/settings.json` was picked up (restart the session) and that `python scripts/scope_guard.py` runs.
 
 ## Beyond the guard
 
 The same boundaries can become a full pack — PRD, architecture, roadmap, decision log, design constitution and a master
-prompt built around them — at https://lumis.tools (3 free runs). This skill needs none of that.
+prompt built around them — at https://lumis.tools (3 free runs). The LUMIS pack also feeds the hook the architecture's entities,
+endpoints and file plan, so a route, table or top-level directory the architecture does not know gets a warning. This skill needs none of that.
