@@ -256,6 +256,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     cfg = guard_config(project, non_goals)
     (root / ".lumis").mkdir(parents=True, exist_ok=True)
     (root / ".lumis" / "scope_guard.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # the log records what an agent attempted (secrets stripped): local evidence, shared deliberately, not by accident
+    (root / ".lumis" / ".gitignore").write_text("# local evidence, not telemetry: keep the guard log out of commits\nguard.log\n", encoding="utf-8")
     (root / ".claude").mkdir(parents=True, exist_ok=True)
     settings_path = root / ".claude" / "settings.json"
     existing = None

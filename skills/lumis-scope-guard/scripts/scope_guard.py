@@ -25,7 +25,7 @@ so the same guard works everywhere; only the config file and the payload shape d
 
 `--agent` only picks the shape of the refusal each client renders best; the payload is recognised automatically,
 so a missing or wrong flag still blocks with exit 2. Every block and warning is appended to .lumis/guard.log
-(one JSON object per line: time, agent, event, tool, path, hits). The log stays in the repository; nothing is
+(one JSON object per line: time, agent, event, tool, path, what was attempted with obvious secrets stripped, hits). The log stays in the repository; nothing is
 sent anywhere. Edit .lumis/scope_guard.json to tune; re-run the LUMIS consilium (or Amend) to change the
 boundaries themselves.
 """
@@ -278,7 +278,23 @@ def check_architecture(cfg: dict, tool_name: str, tool_input: dict) -> list[str]
 
 
 # --- the local log: what the guard did, kept in the repository ------------------------------------------------
-def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: list[str], agent: str = "") -> None:
+SECRET_PATTERNS = [
+    (re.compile(r"(?i)\b(authorization|api[-_]?key|token|secret|password|passwd|pwd)\b(\s*[:=]\s*|\s+)\S+"), r"\1=***"),
+    (re.compile(r"(?i)\bbearer\s+\S+"), "bearer ***"),
+    (re.compile(r"\b(sk|pk|ghp|gho|xox[abps])[-_][A-Za-z0-9_\-]{8,}"), r"\1-***"),
+    (re.compile(r"\b[A-Fa-f0-9]{24,}\b"), "***"),
+]
+
+
+def redact(text: str, limit: int = 160) -> str:
+    """What was attempted, safe to keep in a file the user may commit: obvious secrets stripped, then truncated."""
+    out = " ".join(str(text or "").split())
+    for pattern, replacement in SECRET_PATTERNS:
+        out = pattern.sub(replacement, out)
+    return out[:limit] + ("…" if len(out) > limit else "")
+
+
+def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: list[str], agent: str = "", attempted: str = "") -> None:
     rel = cfg.get("log", ".lumis/guard.log")
     if not rel:
         return
@@ -288,6 +304,8 @@ def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: lis
         "agent": agent or "unknown",
         "tool": tool_name or "prompt",
         "path": str((tool_input or {}).get("file_path", ""))[:200],
+        # what the agent actually asked for: without it the log says "something was blocked" and no more
+        "attempted": redact(attempted or (tool_input or {}).get("command", "")),
         "hits": [h[:300] for h in hits][:8],
     }
     try:
@@ -329,6 +347,8 @@ def report(cfg: dict) -> int:
         where = f" {e.get('path')}" if e.get("path") else ""
         who = f"[{e.get('agent')}] " if e.get("agent") else ""
         print(f"  {e.get('ts', '')} {e.get('event', ''):7} {who}{e.get('tool', '')}{where}: " + "; ".join(e.get("hits", [])))
+        if e.get("attempted"):
+            print(f"      attempted: {e['attempted']}")
     if not entries:
         print("  nothing yet — the guard has not had to step in.")
     return 0
@@ -457,7 +477,7 @@ def main() -> int:
                 + "; ".join(asked)
                 + ". Say so and stop: do not plan it, do not start it. Only the founder can lift a boundary (LUMIS Amend)."
             )
-            log_event(cfg, "asked", "prompt", {}, asked, agent)
+            log_event(cfg, "asked", "prompt", {}, asked, agent, attempted=prompt)
         phrases = [p for p in cfg.get("drift_phrases", []) if p.lower() in prompt.lower()]
         if phrases:
             print(
@@ -466,7 +486,7 @@ def main() -> int:
                 + ". Before changing code, confirm the task is inside PRD.md scope and does not touch a Non-Goal from CONSTITUTION.md; "
                 "if it is not in scope, say so and stop."
             )
-            log_event(cfg, "drift", "prompt", {}, [f"drift phrase '{p}'" for p in phrases[:4]], agent)
+            log_event(cfg, "drift", "prompt", {}, [f"drift phrase '{p}'" for p in phrases[:4]], agent, attempted=prompt)
         return 0
     warnings: list[str] = []
     design_hits = check_design(cfg, tool_name, tool_input)
@@ -492,10 +512,10 @@ def main() -> int:
                     "⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): "
                     + "; ".join(hits)
                     + ". The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.")
-        log_event(cfg, "blocked", tool_name, tool_input, hits, agent)
+        log_event(cfg, "blocked", tool_name, tool_input, hits, agent, attempted=text_of_tool_input(tool_name, tool_input)[0])
         return 2
     if warnings:
-        log_event(cfg, "warned", tool_name, tool_input, design_hits + arch_hits, agent)
+        log_event(cfg, "warned", tool_name, tool_input, design_hits + arch_hits, agent, attempted=text_of_tool_input(tool_name, tool_input)[0])
     return 1 if warnings else 0  # 1 = non-blocking: the warning is shown, the change proceeds
 
 
