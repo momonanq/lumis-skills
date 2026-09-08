@@ -374,6 +374,7 @@ def doctor() -> int:
     if not script.exists():
         problems.append("the hook script itself is missing")
     cfg_path = root / ".lumis" / "scope_guard.json"
+    cfg: dict = {}
     if cfg_path.exists():
         try:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -426,6 +427,28 @@ def doctor() -> int:
         print(f"  ✓ .lumis/guard.log — {len(events)} events so far, from: {', '.join(agents)}")
     else:
         print("  – .lumis/guard.log — empty: no agent has hit a boundary here yet (or none has run)")
+    # a forbidden path that already exists means the boundary was crossed before the guard arrived, or it is stale:
+    # either way the founder should decide through Amend, never by the hook going quiet about it
+    present = [p for p in cfg.get("deny_paths", []) if p and (root / p.strip("/")).exists()]
+    for p in present:
+        print(f"  ✗ forbidden path '{p}' already exists in the repository")
+        problems.append(f"forbidden path '{p}' already exists — crossed before the guard was installed, or a stale boundary; decide through Amend")
+    # which boundaries have actually been touched: a fact for the Amend decision, not a verdict.
+    # zero events is not a dead boundary — it may simply be one nobody has tried to cross
+    boundaries = cfg.get("boundaries") or []
+    if boundaries and events:
+        per: dict[str, int] = {b.get("id", ""): 0 for b in boundaries}
+        for e in events:
+            for hit in e.get("hits", []):
+                m = re.search(r"\bNG-(\d+)\b", str(hit))
+                if m and f"NG-{m.group(1)}" in per:
+                    per[f"NG-{m.group(1)}"] += 1
+        quiet = [b for b in boundaries if per.get(b.get("id", ""), 0) == 0]
+        touched = [(b.get("id"), per[b.get("id", "")]) for b in boundaries if per.get(b.get("id", ""), 0)]
+        if touched:
+            print("  · boundaries touched so far: " + ", ".join(f"{i} ×{n}" for i, n in touched))
+        if quiet:
+            print("  · never touched: " + ", ".join(str(b.get("id")) for b in quiet) + " — untested, not dead; nobody has tried to cross them")
     print()
     if problems:
         print("Problems:")
