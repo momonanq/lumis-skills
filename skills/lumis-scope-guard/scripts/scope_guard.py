@@ -15,6 +15,7 @@ so the same guard works everywhere; only the config file and the payload shape d
         blocks (exit 2) when the change or command touches a Non-Goal trigger:
         forbidden packages, paths or keywords listed in .lumis/scope_guard.json — the message names the
         boundary (NG-n), who set it and where it is written (CONSTITUTION.md / DECISION_LOG.md);
+        read-only inspection (grep, git log, ls) that merely mentions a boundary is allowed and logged as `inspected`;
         visual Non-Goals from DESIGN_CONSTITUTION.md only warn (exit 1), they never block;
         architecture boundaries (a route, model or top-level directory absent from ARCHITECTURE.md) only warn too.
   * `python scripts/scope_guard.py prompt [--agent <name>]`
@@ -130,6 +131,37 @@ def read_stdin_json() -> dict:
         return json.loads(raw) if raw.strip() else {}
     except Exception:
         return {}
+
+
+# Looking is not doing. A search whose text merely mentions a boundary ("grep -rn stripe .") must not be blocked:
+# an agent that cannot inspect the repository is blind, and blocking it produces a false block, not a saved boundary.
+READ_ONLY_EXECUTABLES = {"grep", "rg", "egrep", "fgrep", "ag", "ack", "find", "ls", "dir", "cat", "head", "tail",
+                         "wc", "tree", "stat", "file", "du", "pwd", "which", "where", "diff", "cmp", "sort", "uniq"}
+GIT_READ_ONLY = {"log", "grep", "status", "show", "diff", "blame", "ls-files", "rev-parse", "rev-list", "shortlog",
+                 "describe", "cat-file", "config"}
+SEGMENT_SPLIT = re.compile(r"\|\||&&|[;|]")
+WRITES_TO_FILE = re.compile(r">>?\s*(?!/dev/null\b|NUL\b)\S")
+
+
+def is_read_only_command(command: str) -> bool:
+    """True only when every segment is a known inspection command and nothing is redirected into a file.
+    Anything we cannot read confidently (substitutions, unknown executables) is treated as not read-only."""
+    text = str(command or "").strip()
+    if not text or "$(" in text or "`" in text or WRITES_TO_FILE.search(text):
+        return False
+    for segment in SEGMENT_SPLIT.split(text):
+        parts = segment.strip().split()
+        if not parts:
+            return False
+        exe = parts[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        exe = exe[:-4] if exe.endswith(".exe") else exe
+        if exe == "git":
+            sub = next((p for p in parts[1:] if not p.startswith("-")), "")
+            if sub not in GIT_READ_ONLY or "--edit" in parts:
+                return False
+        elif exe not in READ_ONLY_EXECUTABLES:
+            return False
+    return True
 
 
 def is_command(tool_name: str, tool_input: dict) -> bool:
@@ -338,8 +370,10 @@ def report(cfg: dict) -> int:
         counts[e.get("event", "")] = counts.get(e.get("event", ""), 0) + 1
     agents = sorted({str(e.get("agent") or "unknown") for e in entries})
     print(f"LUMIS Scope Guard — {len(entries)} events in {cfg.get('log', '.lumis/guard.log')}")
-    print(f"  blocked: {counts.get('blocked', 0)} · asked: {counts.get('asked', 0)} · warned: {counts.get('warned', 0)} · drift prompts: {counts.get('drift', 0)}"
+    print(f"  blocked: {counts.get('blocked', 0)} · asked: {counts.get('asked', 0)} · inspected: {counts.get('inspected', 0)} · warned: {counts.get('warned', 0)} · drift prompts: {counts.get('drift', 0)}"
           + (f" · agents: {', '.join(agents)}" if entries else ""))
+    if counts.get("inspected"):
+        print("  ('inspected' is a read-only command — grep, git log, ls — that merely mentions a boundary: allowed, never a violation.)")
     if counts.get("asked") and not counts.get("blocked"):
         print("  ('asked' without 'blocked' means the agent was told to cross a boundary and stopped before touching a tool —")
         print("   the written rules held; the hook never had to. Both are the guard doing its job.)")
@@ -530,6 +564,11 @@ def main() -> int:
     for w in warnings:
         sys.stderr.write(w + "\n")
     hits = check_pre_tool(cfg, tool_name, tool_input)
+    command = str((tool_input or {}).get("command", ""))
+    if hits and is_command(tool_name, tool_input) and is_read_only_command(command):
+        # the agent is looking, not building: allow it and record that a boundary area was inspected
+        log_event(cfg, "inspected", tool_name, tool_input, hits, agent, attempted=command)
+        return 1 if warnings else 0
     if hits:
         emit_denial(agent,
                     "⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): "
