@@ -68,6 +68,10 @@ DRIFT_PHRASES = (
     "на всякий случай", "на будущее", "временный костыль", "временное решение", "перепишу всё", "перепишем с нуля",
     "было бы неплохо", "небольшая доработка", "заодно поправлю", "мелочь, но",
 )
+GUARD_SELF_PATHS = (".lumis/scope_guard.json", ".lumis/guard.log", ".lumis/guard.manifest.json",
+                    "scripts/scope_guard.py", ".claude/settings.json", ".cursor/hooks.json",
+                    ".codex/hooks.json", ".windsurf/hooks.json", ".github/hooks/lumis-scope-guard.json",
+                    "CONSTITUTION.md")
 MARK_START = "# --- LUMIS scope guard (generated; edit .lumis/scope_guard.json instead) ---"
 MARK_END = "# --- end LUMIS scope guard ---"
 MD_START = "<!-- LUMIS scope guard (generated; edit .lumis/scope_guard.json instead) -->"
@@ -160,6 +164,8 @@ def claude_settings(cfg: dict, existing: dict | None) -> dict:
         deny += [f"Bash(npm install {pkg}*)", f"Bash(npm i {pkg}*)", f"Bash(pnpm add {pkg}*)", f"Bash(yarn add {pkg}*)", f"Bash(pip install {pkg}*)", f"Bash(uv add {pkg}*)"]
     for path in cfg.get("deny_paths", []):
         deny += [f"Edit({path}**)", f"Write({path}**)"]
+    for own in GUARD_SELF_PATHS:  # the guard's own files: refused by the client before the hook even runs
+        deny += [f"Edit({own})", f"Write({own})"]
     pre = {"matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{"type": "command", "command": "python scripts/scope_guard.py pre-tool"}]}
     prompt = {"hooks": [{"type": "command", "command": "python scripts/scope_guard.py prompt"}]}
     settings = dict(existing or {})
@@ -293,6 +299,21 @@ def cmd_init(args: argparse.Namespace) -> int:
     const_path.write_text(constitution(project, non_goals, invariants, stack), encoding="utf-8")
     upsert_block(root / ".cursorrules", cursorrules_section(project, non_goals, invariants, stack))
     upsert_block(root / "CLAUDE.md", claude_md_section(project, non_goals, invariants, stack), MD_START, MD_END)
+    # fingerprints of the guard's own files, read back from disk so newline handling cannot skew them
+    import hashlib
+    from datetime import datetime, timezone
+    tracked = {}
+    for rel in GUARD_SELF_PATHS:
+        target = root / rel
+        if target.is_file() and rel not in (".lumis/guard.log", ".lumis/guard.manifest.json"):
+            tracked[rel] = hashlib.sha256(target.read_bytes()).hexdigest()[:16]
+    (root / ".lumis" / "guard.manifest.json").write_text(json.dumps({
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "algorithm": "sha256/16",
+        "note": "Written at install and by LUMIS Amend. `scope_guard.py doctor` compares it; a mismatch means the "
+                "guard was edited outside Amend. This records tampering, it cannot prevent it.",
+        "files": tracked,
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"LUMIS scope guard installed in {root}")
     print(f"  Non-Goals: {len(non_goals)} · invariants: {len(invariants)} · deny packages: {len(cfg['deny_packages'])} · deny paths: {len(cfg['deny_paths'])} · keywords: {len(cfg['keywords'])}")
     print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section), CLAUDE.md (section)")
@@ -337,7 +358,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
-    for rel in (".lumis/scope_guard.json", ".claude/settings.json", "scripts/scope_guard.py", "CONSTITUTION.md", ".cursorrules", "CLAUDE.md",
+    for rel in (".lumis/scope_guard.json", ".claude/settings.json", "scripts/scope_guard.py", "CONSTITUTION.md", ".cursorrules", "CLAUDE.md", ".lumis/guard.manifest.json",
                 ".cursor/hooks.json", ".codex/hooks.json", ".windsurf/hooks.json", ".github/hooks/lumis-scope-guard.json"):
         print(("✓ " if (root / rel).exists() else "✗ ") + rel)
     cfg_path = root / ".lumis" / "scope_guard.json"

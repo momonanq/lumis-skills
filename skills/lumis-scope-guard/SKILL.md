@@ -46,6 +46,20 @@ If the request or your own plan contains "quick fix for now", "while I'm in here
 stop and ask: is this inside the specification? y/n. A new dependency, table or route that is not in the spec is a change of
 boundaries, never a side effect of another task. A change that touches a Non-Goal or an invariant is a Feature Delta: ask, do not improvise.
 
+## The guard protects itself
+
+A rule the agent is asked to respect is a promise; a refused write is a mechanism. The hook refuses any tool call
+that would rewrite its own files — `scripts/scope_guard.py`, the five hook configs, `.lumis/scope_guard.json`,
+`CONSTITUTION.md` — and logs it as `tamper`. The client's own deny rules block the same paths before the hook runs.
+Reading them is always allowed; `.cursorrules`, `CLAUDE.md` and `AGENTS.md` are warned about, not blocked, because
+you keep your own notes there.
+
+This is **not** a security boundary: a process with shell access still reaches the files. What it guarantees is
+that no rewrite happens quietly through a tool call. `.lumis/guard.manifest.json` fingerprints the guard at install,
+`doctor` reports any file changed since, and `write-manifest` re-baselines after a deliberate change or an Amend.
+For a boundary the agent cannot reach at all, make the files read-only for the account the agent runs as
+(`icacls scripts\\scope_guard.py /deny "%USERNAME%:(W)"` on Windows, `chmod a-w` plus a separate owner on Linux/macOS).
+
 ## Two layers (and what each one records)
 
 1. **The rules the agent reads** (`CONSTITUTION.md`, `CLAUDE.md`, `.cursorrules`). A well-behaved agent refuses here, before any tool call.
