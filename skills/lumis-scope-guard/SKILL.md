@@ -50,7 +50,9 @@ boundaries, never a side effect of another task. A change that touches a Non-Goa
 
 A rule the agent is asked to respect is a promise; a refused write is a mechanism. The hook refuses any tool call
 that would rewrite its own files — `scripts/scope_guard.py`, the five hook configs, `.lumis/scope_guard.json`,
-`CONSTITUTION.md` — and logs it as `tamper`. The client's own deny rules block the same paths before the hook runs.
+`CONSTITUTION.md`, and the directories that hold them (`rm -rf .lumis`, `mv scripts`, `tar -C scripts`), seen through
+`cd`, `./`, `x/../` and later lines of a command — and logs it as `tamper`. An opaque script (`python fix.py`) or an
+encoded command is not readable from the call text and is not caught; the guard does not claim otherwise. The client's own deny rules block the same paths before the hook runs.
 Reading them is always allowed; `.cursorrules`, `CLAUDE.md` and `AGENTS.md` are warned about, not blocked, because
 you keep your own notes there.
 

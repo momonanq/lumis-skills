@@ -4,8 +4,9 @@ no model. Which are refused (exit 2), which get through. The test repository is 
 
     python examples/tamper_cases.py            # from the root of the lumis-skills checkout
 
-Published as the reproduction behind the 2026-09-11 numbers (40 cases, 29 refused, 11 passed); your numbers may differ
-as the hook changes. Standard library only."""
+Published as the reproduction behind the numbers: 2026-09-11 — 40 cases, 29 refused, 11 passed; 2026-09-14, after the
+directory and path-normalisation fix — 38 refused, 2 passed (an opaque script and a base64 command, which a text hook
+cannot read). Your numbers may differ as the hook changes. Standard library only."""
 import json
 import shutil
 import subprocess

@@ -12,7 +12,8 @@ npx skills add momonanq/lumis-skills --skill lumis-scope-guard --global
 2. The agent tries to step over one of them. The hook stops the tool call before it runs and names the boundary and who set it. One script, five clients: Claude Code, Cursor, Codex CLI, Windsurf, Copilot in VS Code.
 3. `python scripts/scope_guard.py report` shows what was blocked, what was merely asked for, what was warned, and which agent tried. The log stays in your repo. Nothing leaves it.
 
-The guard also refuses tool calls that would rewrite the guard itself (its script, the five configs, the constitution) and
+The guard also refuses tool calls that would rewrite the guard itself (its script, the five configs, the constitution,
+the directories that hold them — also behind `cd`, `./`, `x/../` or on a later line of the command) and
 records them as `tamper`; `doctor` compares fingerprints taken at install, so an edit made outside those tools is visible.
 That is a mechanism against a rewrite through the agent, not a security boundary — for the latter, make the files
 read-only for the account the agent runs as.
