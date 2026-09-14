@@ -23,10 +23,15 @@ Copilot in VS Code › Bash: pip install stripe   (.github/hooks/lumis-scope-gua
 
 $ python scripts/scope_guard.py report
   LUMIS Scope Guard — 5 events in .lumis/guard.log
-    blocked: 5 · warned: 0 · drift prompts: 0 · agents: claude, codex, copilot, cursor, windsurf
-    2026-09-07T14:19:49+00:00 blocked [claude] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
-    2026-09-07T14:19:49+00:00 blocked [cursor] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
-    2026-09-07T14:19:49+00:00 blocked [codex] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
-    2026-09-07T14:19:49+00:00 blocked [windsurf] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
-    2026-09-07T14:19:49+00:00 blocked [copilot] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+    blocked: 5 · asked: 0 · inspected: 0 · warned: 0 · drift prompts: 0 · agents: claude, codex, copilot, cursor, windsurf
+    2026-09-09T10:16:02+00:00 blocked [claude] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+        attempted: pip install stripe
+    2026-09-09T10:16:02+00:00 blocked [cursor] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+        attempted: pip install stripe
+    2026-09-09T10:16:02+00:00 blocked [codex] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+        attempted: pip install stripe
+    2026-09-09T10:16:02+00:00 blocked [windsurf] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+        attempted: pip install stripe
+    2026-09-09T10:16:02+00:00 blocked [copilot] Bash: forbidden dependency 'stripe', Non-Goal keyword 'stripe' → NG-1 "No rent payment collection, insurance or financial guarantees" (set by the founder; CONSTITUTION.md, Article I)
+        attempted: pip install stripe
 

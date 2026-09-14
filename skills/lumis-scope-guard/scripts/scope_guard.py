@@ -445,12 +445,13 @@ def read_log(cfg: dict) -> list[dict]:
 
 def report(cfg: dict) -> int:
     entries = read_log(cfg)
-    counts = {"blocked": 0, "warned": 0, "drift": 0}
+    counts = {"blocked": 0, "warned": 0, "drift": 0, "tamper": 0}
     for e in entries:
         counts[e.get("event", "")] = counts.get(e.get("event", ""), 0) + 1
     agents = sorted({str(e.get("agent") or "unknown") for e in entries})
     print(f"LUMIS Scope Guard — {len(entries)} events in {cfg.get('log', '.lumis/guard.log')}")
     print(f"  blocked: {counts.get('blocked', 0)} · asked: {counts.get('asked', 0)} · inspected: {counts.get('inspected', 0)} · warned: {counts.get('warned', 0)} · drift prompts: {counts.get('drift', 0)}"
+          + (f" · tamper: {counts.get('tamper', 0)}" if counts.get("tamper") else "")
           + (f" · agents: {', '.join(agents)}" if entries else ""))
     if counts.get("inspected"):
         print("  ('inspected' is a read-only command — grep, git log, ls — that merely mentions a boundary: allowed, never a violation.)")
