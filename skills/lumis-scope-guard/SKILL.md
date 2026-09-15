@@ -51,7 +51,10 @@ boundaries, never a side effect of another task. A change that touches a Non-Goa
 A rule the agent is asked to respect is a promise; a refused write is a mechanism. The hook refuses any tool call
 that would rewrite its own files — `scripts/scope_guard.py`, the five hook configs, `.lumis/scope_guard.json`,
 `CONSTITUTION.md`, and the directories that hold them (`rm -rf .lumis`, `mv scripts`, `tar -C scripts`), seen through
-`cd`, `./`, `x/../` and later lines of a command — and logs it as `tamper`. An opaque script (`python fix.py`) or an
+`cd`, `./`, `x/../`, later lines of a command, a `find … -exec` whose filter reaches them, an existing symlink to them, and a
+whole-tree git rewind (`stash`, `reset --hard`, `revert`, `checkout <ref>`) when git itself says the guard's files would
+change (if git is not on the hook's PATH, a rewind is not refused) — and logs it as `tamper`. `doctor` also reports a hook
+that is a link or is not where it was installed. An opaque script (`python fix.py`) or an
 encoded command is not readable from the call text and is not caught; the guard does not claim otherwise. The client's own deny rules block the same paths before the hook runs.
 Reading them is always allowed; `.cursorrules`, `CLAUDE.md` and `AGENTS.md` are warned about, not blocked, because
 you keep your own notes there.

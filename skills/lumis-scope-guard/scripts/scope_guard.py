@@ -40,6 +40,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -163,6 +164,15 @@ def is_read_only_command(command: str) -> bool:
             sub = next((p for p in parts[1:] if not p.startswith("-")), "")
             if sub not in GIT_READ_ONLY or "--edit" in parts:
                 return False
+        elif exe == "find":
+            # `find` reads — until -exec/-delete hands what it found to a program that writes (u/northbridgedev, case 41)
+            low = [p.lower() for p in parts[1:]]
+            if "-delete" in low:
+                return False
+            for i, p in enumerate(low):
+                if p in ("-exec", "-execdir", "-ok", "-okdir") and i + 1 < len(low):
+                    if low[i + 1].rsplit("/", 1)[-1] not in READ_ONLY_EXECUTABLES:
+                        return False
         elif exe not in READ_ONLY_EXECUTABLES:
             return False
     return True
@@ -189,6 +199,11 @@ GUARD_DIRS = (".lumis", "scripts", ".claude", ".cursor", ".codex", ".windsurf", 
 DIR_MUTATORS = {"rm", "rmdir", "rd", "del", "mv", "move", "ren", "rename", "cp", "xcopy", "robocopy", "rsync", "tar",
                 "unzip", "7z", "chmod", "chown", "chattr", "ln", "truncate", "shred", "unlink"}
 GIT_MUTATORS = {"rm", "mv", "checkout", "restore", "clean", "reset"}
+# programs a `find -exec` can run against whatever it finds; with a filter that reaches a guard file, that is a rewrite
+FIND_MUTATORS = DIR_MUTATORS | {"sed", "perl", "tee", "python", "python3", "sh", "bash", "xargs"}
+GUARD_BASENAMES = tuple(sorted({f.rsplit("/", 1)[-1] for f in GUARD_FILES}))
+# whole-tree git rewinds: they rewrite the guard's files when git says those files differ
+GIT_REWINDS = {"stash", "reset", "revert", "checkout", "switch", "restore"}
 # running the guard is not rewriting it: `python scripts/scope_guard.py report` is the documented way to read the log
 GUARD_SELF_RUN = re.compile(r"^\s*(?:python3?|py)(?:\s+-X\s+utf8)?\s+(?:\./)?scripts/scope_guard\.py\s+(?:pre-tool|prompt|report|doctor)\b[^>|;&\n]*$", re.I)
 
@@ -296,10 +311,123 @@ def _mentions_guard_file(text: str, names: tuple[str, ...]) -> list[str]:
     return [name for name in names if name.lower() in low]
 
 
+def _resolves_to_guard(token: str, root: Path | None = None) -> str | None:
+    """The guard file a path really is, through symlinks: `sed -i … /tmp/x` where /tmp/x → scripts/scope_guard.py is an
+    edit of the guard (u/northbridgedev, case 43). Only paths that exist are resolved; nothing is created."""
+    raw = str(token or "").strip().strip("'\"`")
+    if not raw or raw.startswith("-") or len(raw) > 512:
+        return None
+    try:
+        base = root or project_root()
+        candidate = Path(raw) if os.path.isabs(raw) else base / raw
+        if not os.path.lexists(candidate):
+            return None
+        real = os.path.realpath(candidate)
+        for name in GUARD_FILES:
+            target = base / name
+            if os.path.lexists(target) and os.path.realpath(target) == real:
+                return name
+    except Exception:
+        return None
+    return None
+
+
+def _find_reaches_guard(args: list[str]) -> str | None:
+    """`find <start> -name <pattern> -exec <mutator> {} +` / `-delete`: refused when the filter can match a guard file
+    and the action rewrites. `find . -name '*.pyc' -delete` passes; `find . -name '*.py' -exec sed -i …` does not."""
+    low = [a.lower() for a in args]
+    acts = {"-exec", "-execdir", "-ok", "-okdir", "-delete"}
+    if not any(a in acts for a in low):
+        return None
+    mutating = "-delete" in low
+    for i, a in enumerate(low):
+        if a in ("-exec", "-execdir", "-ok", "-okdir") and i + 1 < len(low):
+            prog = low[i + 1].rsplit("/", 1)[-1]
+            if prog in FIND_MUTATORS:
+                mutating = True
+    if not mutating:
+        return None
+    starts = [a for a in low[: next((i for i, a in enumerate(low) if a.startswith("-")), len(low))]] or ["."]
+    patterns = [low[i + 1] for i, a in enumerate(low) if a in ("-name", "-iname", "-path", "-ipath", "-wholename", "-regex") and i + 1 < len(low)]
+    import fnmatch
+    for start in starts:
+        st = start.rstrip("/")
+        covers_guard_dir = st in (".", "/", "") or any(st == d or d.startswith(st + "/") or st.startswith(d + "/") or st == d.split("/")[0] for d in GUARD_DIRS)
+        if not covers_guard_dir:
+            continue
+        if not patterns:
+            return f"find over {start} with a rewriting action reaches the guard's files"
+        for pat in patterns:
+            for f in GUARD_FILES:
+                base = f.rsplit("/", 1)[-1].lower()
+                if fnmatch.fnmatch(base, pat) or fnmatch.fnmatch(f.lower(), pat) or fnmatch.fnmatch("./" + f.lower(), pat):
+                    return f"find -name {pat} reaches {f}"
+    return None
+
+
+def _git_rewind_touches_guard(exe: str, args: list[str], raw_parts: list[str]) -> str | None:
+    """`git stash`, `git reset --hard`, `git revert`, a whole-tree `git checkout <ref>`: a rewind of the tree rewinds
+    the guard's files with it. Refused only when git itself says those files would change; a rewind that leaves the
+    guard as it is passes. (u/northbridgedev, cases 44–46.)"""
+    if exe != "git" or not args:
+        return None
+    sub = next((a for a in args if not a.startswith("-")), "")
+    if sub not in GIT_REWINDS:
+        return None
+    if sub == "stash" and any(a in ("list", "show", "drop", "clear", "branch") for a in args[1:3]):
+        return None
+    rest = [a for a in raw_parts[2:]]
+    has_pathspec = "--" in rest
+    paths = [p for p in rest[rest.index("--") + 1:]] if has_pathspec else []
+    if has_pathspec and paths:
+        # a rewind limited to paths that cannot hold the guard is not a rewind of the guard
+        covers = [p for p in paths if _clean_path(p) in (".", "") or any(_clean_path(p).rstrip("/") == d or _clean_path(p).startswith(d + "/") or d.startswith(_clean_path(p).rstrip("/") + "/") for d in GUARD_DIRS) or _clean_path(p) in [f.lower() for f in GUARD_FILES]]
+        if not covers:
+            return None
+    if sub in ("checkout", "switch", "restore") and has_pathspec:
+        return None  # `git checkout <ref> -- <paths>` is the directory/file rule's business, handled elsewhere
+    if sub in ("reset",) and not any(a in ("--hard", "--merge") for a in args):
+        return None  # a soft/mixed reset leaves the working tree alone
+    try:
+        root = project_root()
+        guard = [f for f in GUARD_FILES if (root / f).exists()]
+        if not guard:
+            return None
+
+        def git(*a: str) -> str:
+            res = subprocess.run(["git", *a], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8)
+            if res.returncode != 0:
+                raise RuntimeError(res.stderr.strip()[:200])
+            return res.stdout
+
+        changed: list[str] = []
+        if sub == "stash" or (sub in ("reset", "checkout", "switch")):
+            dirty = git("status", "--porcelain", "--", *guard)
+            changed += [line[3:].strip() for line in dirty.splitlines() if line.strip()]
+        ref = next((a for a in args[1:] if not a.startswith("-") and a not in ("push", "save")), "")
+        if sub in ("reset", "checkout", "switch") and ref:
+            changed += [l.strip() for l in git("diff", "--name-only", ref, "HEAD", "--", *guard).splitlines() if l.strip()]
+        elif sub == "revert":
+            target = ref or "HEAD"
+            changed += [l.strip() for l in git("diff", "--name-only", f"{target}~1", target, "--", *guard).splitlines() if l.strip()]
+        elif sub == "restore" and not has_pathspec:
+            changed += [line[3:].strip() for line in git("status", "--porcelain", "--", *guard).splitlines() if line.strip()]
+        changed = sorted(set(changed))
+        if changed:
+            return f"git {sub} would rewind the guard's files: {', '.join(changed)} (commit the guard change first, or rewind with paths that exclude it)"
+    except Exception:
+        return None  # not a repository, git missing, or a ref that does not exist: the command itself would fail
+    return None
+
+
 def _guard_targets_of_command(text: str) -> list[str]:
-    """Guard files and directories a shell command would rewrite, seen through `cd`, `./` and `x/../`."""
+    """Guard files and directories a shell command would rewrite, seen through `cd`, `./`, `x/../`, symlinks,
+    `find -exec` and whole-tree git rewinds."""
     hits: list[str] = []
-    for exe, args, _prefix in command_segments(text):
+    segments = command_segments(text)
+    raw_segments = [seg.strip().split() for seg in SEGMENT_SPLIT.split(str(text or "")) if seg.strip()]
+    raw_segments = [p for p in raw_segments if (p[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower().removesuffix(".exe")) != "cd"]
+    for idx, (exe, args, _prefix) in enumerate(segments):
         mutates_dirs = exe in DIR_MUTATORS or (exe == "git" and any(a in GIT_MUTATORS for a in args[:2]))
         for a in args:
             for name in GUARD_FILES:
@@ -309,6 +437,19 @@ def _guard_targets_of_command(text: str) -> list[str]:
                 for d in GUARD_DIRS:
                     if a.rstrip("/") == d and f"directory {d}/" not in hits:
                         hits.append(f"directory {d}/")
+            if exe not in READ_ONLY_EXECUTABLES:
+                linked = _resolves_to_guard(a)
+                if linked and f"{linked} (through a link)" not in hits and linked not in hits:
+                    hits.append(f"{linked} (through a link)")
+        raw = raw_segments[idx] if idx < len(raw_segments) else []
+        raw_args = [t.strip().strip("'\"`") for t in raw[1:]]  # flags included: the cleaned args drop anything that starts with '-'
+        if exe == "find":
+            reach = _find_reaches_guard(raw_args)
+            if reach and reach not in hits:
+                hits.append(reach)
+        rewind = _git_rewind_touches_guard(exe, [a.lower() for a in raw_args], raw)
+        if rewind and rewind not in hits:
+            hits.append(rewind)
     return hits
 
 
@@ -325,7 +466,11 @@ def check_tamper(tool_name: str, tool_input: dict) -> tuple[list[str], list[str]
         return files, _mentions_guard_file(text, GUARD_TEXT_FILES)
     if not path:
         return [], []
-    return _mentions_guard_file(_clean_path(path), GUARD_FILES), _mentions_guard_file(_clean_path(path), GUARD_TEXT_FILES)
+    files = _mentions_guard_file(_clean_path(path), GUARD_FILES)
+    linked = _resolves_to_guard(path)
+    if linked and linked not in files:
+        files.append(f"{linked} (through a link)")
+    return files, _mentions_guard_file(_clean_path(path), GUARD_TEXT_FILES)
 
 
 def is_command(tool_name: str, tool_input: dict) -> bool:
@@ -620,6 +765,14 @@ def doctor() -> int:
         print(("  ✓ " if found else "  ✗ ") + f"interpreter '{exe}'" + (f" → {found}" if found else " is not on PATH — the hook would fail to start"))
         if not found:
             problems.append(f"'{exe}' is not on PATH; the agent cannot run the hook")
+    # a link in place of the guard, or a guard living somewhere else, is a rewrite waiting to happen
+    for rel in MANIFEST_FILES:
+        p = root / rel
+        if not os.path.lexists(p):
+            continue
+        if p.is_symlink() or os.path.realpath(p) != os.path.realpath(root.resolve() / rel):
+            print(f"  ✗ {rel} is a link or is not where it was installed → {os.path.realpath(p)}")
+            problems.append(f"{rel} is not a plain file at its installed path")
     same, drifted, has_manifest = verify_manifest(root)
     if not has_manifest:
         print(f"  – {MANIFEST} — absent: install or Amend writes it; without it a silent edit of the guard leaves no trace")
