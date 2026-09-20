@@ -62,6 +62,13 @@ you keep your own notes there.
 This is **not** a security boundary: a process with shell access still reaches the files. What it guarantees is
 that no rewrite happens quietly through a tool call. `.lumis/guard.manifest.json` fingerprints the guard at install,
 `doctor` reports any file changed since, and `write-manifest` re-baselines after a deliberate change or an Amend.
+The manifest sits in the repository, so one edit could rewrite the hook and its fingerprint together. A copy of the
+fingerprints is therefore kept outside the repository, in `~/.lumis/baselines/<repo-id>/manifest.json` (written at
+`init`, by `write-manifest`, or by the first hook call after a ZIP install; `LUMIS_HOME` moves it,
+`LUMIS_NO_BASELINE=1` switches it off; nothing leaves the machine). `doctor` compares three sides — the files, the
+manifest in the repository, the copy outside — and names the side that differs. The hook refuses writes to that
+folder and refuses `write-manifest` to the agent: re-baselining is yours. A process that can write to your home
+folder can still rewrite the copy; this raises the cost of a quiet rewrite, it does not make one impossible.
 For a boundary the agent cannot reach at all, make the files read-only for the account the agent runs as
 (`icacls scripts\\scope_guard.py /deny "%USERNAME%:(W)"` on Windows, `chmod a-w` plus a separate owner on Linux/macOS).
 
@@ -82,5 +89,5 @@ If it complies, the hooks are not active: check that your agent's config was pic
 ## Beyond the guard
 
 The same boundaries can become a full pack — PRD, architecture, roadmap, decision log, design constitution and a master
-prompt built around them — at https://lumis.tools (3 free runs). The LUMIS pack also feeds the hook the architecture's entities,
+prompt built around them — at https://lumis.tools/?utm_source=github&utm_medium=skill (3 free runs). The LUMIS pack also feeds the hook the architecture's entities,
 endpoints and file plan, so a route, table or top-level directory the architecture does not know gets a warning. This skill needs none of that.

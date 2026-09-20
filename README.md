@@ -8,7 +8,7 @@
 npx skills add momonanq/lumis-skills --skill lumis-scope-guard --global
 ```
 
-1. Write ten lines of what your project will NOT do. Or paste them at https://lumis.tools/guard and get the pack without an account.
+1. Write ten lines of what your project will NOT do. Or paste them at https://lumis.tools/guard?utm_source=github&utm_medium=readme and get the pack without an account.
 2. The agent tries to step over one of them. The hook stops the tool call before it runs and names the boundary and who set it. One script, five clients: Claude Code, Cursor, Codex CLI, Windsurf, Copilot in VS Code.
 3. `python scripts/scope_guard.py report` shows what was blocked, what was merely asked for, what was warned, and which agent tried. The log stays in your repo. Nothing leaves it.
 
@@ -33,7 +33,7 @@ Copy `skills/lumis-scope-guard/` into `.claude/skills/` (project) or `~/.claude/
 
 | skill | what it does |
 |---|---|
-| `lumis-scope-guard` | Non-Goals → enforceable boundaries: hook configs for five agents, `CONSTITUTION.md`, sections in `.cursorrules` and `CLAUDE.md`, a drift check for any plan. Every block names the boundary it enforces (`NG-n`, who set it, where it is written); every event lands in `.lumis/guard.log` inside the repo — `status` and `report` summarise it, `doctor` checks the wiring. Stdlib Python, no model, no account, no telemetry. Same engine as https://lumis.tools/guard. |
+| `lumis-scope-guard` | Non-Goals → enforceable boundaries: hook configs for five agents, `CONSTITUTION.md`, sections in `.cursorrules` and `CLAUDE.md`, a drift check for any plan. Every block names the boundary it enforces (`NG-n`, who set it, where it is written); every event lands in `.lumis/guard.log` inside the repo — `status` and `report` summarise it, `doctor` checks the wiring. Stdlib Python, no model, no account, no telemetry. Same engine as https://lumis.tools/guard?utm_source=github&utm_medium=readme. |
 
 ## What the pack contains
 

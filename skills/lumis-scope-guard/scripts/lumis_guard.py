@@ -138,23 +138,41 @@ def read_log(root: Path, cfg: dict) -> list[dict]:
     return out
 
 
+HOOK_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__.*"  # an MCP server writes files too
+
+
+def hook_command(mode: str, agent: str = "", hook_path: str = "scripts/scope_guard.py", windows: bool = False) -> str:
+    """No interpreter exists on every machine: a stock macOS or Debian box has no bare `python` (the hook then never
+    starts and the client treats it as a non-blocking error), Windows has no `python3`. The POSIX line asks which one
+    is there; the Windows/PowerShell line, where a client offers one, keeps `python`."""
+    tail = f"{hook_path} {mode}" + (f" --agent {agent}" if agent else "")
+    if windows:
+        return f"python {tail}"
+    return f"command -v python >/dev/null 2>&1 && exec python {tail} || exec python3 {tail}"
+
+
 def agent_hook_files(hook_path: str = "scripts/scope_guard.py") -> dict[str, dict]:
     """Hook configs for the agents that can stop a tool call before it runs. All of them deny on exit code 2,
     so one script serves Cursor, Codex, Windsurf and Copilot; Claude Code is configured in .claude/settings.json."""
-    py = f"python {hook_path}"
+    pre = hook_command("pre-tool", "cursor", hook_path)
+    ws = {"command": hook_command("pre-tool", "windsurf", hook_path),
+          "powershell": hook_command("pre-tool", "windsurf", hook_path, windows=True), "show_output": True}
     return {
         ".cursor/hooks.json": {"hooks": {
-            "preToolUse": [{"command": f"{py} pre-tool --agent cursor"}],
-            "beforeShellExecution": [{"command": f"{py} pre-tool --agent cursor"}],
-            "beforeSubmitPrompt": [{"command": f"{py} prompt --agent cursor"}],
+            "preToolUse": [{"command": pre}],
+            "beforeShellExecution": [{"command": pre}],
+            "beforeMCPExecution": [{"command": pre}],
+            "beforeSubmitPrompt": [{"command": hook_command("prompt", "cursor", hook_path)}],
         }},
-        ".codex/hooks.json": {"hooks": {"PreToolUse": [{"command": f"{py} pre-tool --agent codex"}]}},
+        ".codex/hooks.json": {"hooks": {"PreToolUse": [{"command": hook_command("pre-tool", "codex", hook_path)}]}},
         ".windsurf/hooks.json": {"hooks": {
-            "pre_run_command": [{"command": f"python3 {hook_path} pre-tool --agent windsurf", "powershell": f"{py} pre-tool --agent windsurf", "show_output": True}],
-            "pre_write_code": [{"command": f"python3 {hook_path} pre-tool --agent windsurf", "powershell": f"{py} pre-tool --agent windsurf", "show_output": True}],
-            "pre_user_prompt": [{"command": f"python3 {hook_path} prompt --agent windsurf", "powershell": f"{py} prompt --agent windsurf", "show_output": True}],
+            "pre_run_command": [dict(ws)],
+            "pre_write_code": [dict(ws)],
+            "pre_mcp_tool_use": [dict(ws)],
+            "pre_user_prompt": [{"command": hook_command("prompt", "windsurf", hook_path),
+                                 "powershell": hook_command("prompt", "windsurf", hook_path, windows=True), "show_output": True}],
         }},
-        ".github/hooks/lumis-scope-guard.json": {"hooks": {"PreToolUse": [{"type": "command", "command": f"{py} pre-tool --agent copilot", "timeout": 15}]}},
+        ".github/hooks/lumis-scope-guard.json": {"hooks": {"PreToolUse": [{"type": "command", "command": hook_command("pre-tool", "copilot", hook_path), "timeout": 15}]}},
     }
 
 
@@ -166,8 +184,8 @@ def claude_settings(cfg: dict, existing: dict | None) -> dict:
         deny += [f"Edit({path}**)", f"Write({path}**)"]
     for own in GUARD_SELF_PATHS:  # the guard's own files: refused by the client before the hook even runs
         deny += [f"Edit({own})", f"Write({own})"]
-    pre = {"matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{"type": "command", "command": "python scripts/scope_guard.py pre-tool"}]}
-    prompt = {"hooks": [{"type": "command", "command": "python scripts/scope_guard.py prompt"}]}
+    pre = {"matcher": HOOK_MATCHER, "hooks": [{"type": "command", "command": hook_command("pre-tool")}]}
+    prompt = {"hooks": [{"type": "command", "command": hook_command("prompt")}]}
     settings = dict(existing or {})
     perms = dict(settings.get("permissions") or {})
     perms["deny"] = list(dict.fromkeys(list(perms.get("deny") or []) + deny))
@@ -314,7 +332,16 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "guard was edited outside Amend. This records tampering, it cannot prevent it.",
         "files": tracked,
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # the same fingerprints, copied outside the repository by the installed hook (~/.lumis/baselines/<repo-id>/):
+    # one edit of the repository can rewrite the hook and its manifest together, it cannot reach this copy
+    import os
+    import subprocess
+    outside = subprocess.run([sys.executable, "-X", "utf8", str(root / "scripts" / "scope_guard.py"), "write-manifest"], cwd=root,
+                             env={**os.environ, "CLAUDE_PROJECT_DIR": str(root)}, capture_output=True, text=True, encoding="utf-8")
     print(f"LUMIS scope guard installed in {root}")
+    for line in (outside.stdout or "").splitlines():
+        if line.startswith("baseline outside the repository"):
+            print("  " + line)
     print(f"  Non-Goals: {len(non_goals)} · invariants: {len(invariants)} · deny packages: {len(cfg['deny_packages'])} · deny paths: {len(cfg['deny_paths'])} · keywords: {len(cfg['keywords'])}")
     print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section), CLAUDE.md (section)")
     print("  Agents: Claude Code (.claude/settings.json), Cursor (.cursor/hooks.json), Codex (.codex/hooks.json), Windsurf (.windsurf/hooks.json), Copilot (.github/hooks/lumis-scope-guard.json)")
