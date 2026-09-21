@@ -10,6 +10,9 @@ merged into an existing file), scripts/scope_guard.py (the hook), CONSTITUTION.m
 hook configs for Cursor / Codex / Windsurf / Copilot,
 and LUMIS sections in .cursorrules and CLAUDE.md (existing content kept). `check` reports Non-Goal triggers and drift phrases in a text. No network, no model.
 Same engine as https://lumis.tools/guard.
+
+Needs `scope_guard.py` in this same folder: the hook it installs is also where the boundary→markers derivation
+and the capability lexicon live, so there is one copy of them rather than two.
 """
 from __future__ import annotations
 
@@ -28,36 +31,38 @@ for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to a legacy
 
 HERE = Path(__file__).resolve().parent
 
-CAPABILITY_TRIGGERS = {
-    "crypto": {"match": ["crypto", "web3", "blockchain", "крипт", "блокчейн", "токен", "smart contract", "смарт-контракт"],
-               "packages": ["web3", "ethers", "solana", "wagmi", "viem", "bitcoinlib", "hardhat", "truffle"], "paths": ["contracts/", "web3/"],
-               "keywords": ["web3", "solidity", "ethereum", "metamask", "erc20", "smart contract", "wallet connect"]},
-    "microservices": {"match": ["microservice", "микросервис", "kafka", "rabbitmq"],
-                      "packages": ["kafka-python", "aiokafka", "pika", "celery", "grpcio", "nameko"], "paths": ["services/"],
-                      "keywords": ["kafka", "rabbitmq", "grpc", "consul", "istio", "service mesh"]},
-    "native_mobile": {"match": ["ios", "android", "native mobile", "мобильн", "flutter", "react native"],
-                      "packages": ["react-native", "expo", "flutter", "capacitor", "cordova"], "paths": ["ios/", "android/"],
-                      "keywords": ["react native", "swiftui", "kotlin", "xcode", "android studio"]},
-    "open_banking": {"match": ["open banking", "банковск", "core ledger", "psd2"],
-                     "packages": ["plaid", "tink", "truelayer"], "paths": [], "keywords": ["open banking", "psd2", "plaid", "core ledger"]},
-    "payments": {"match": ["payment", "платеж", "платёж", "billing", "эквайринг", "stripe"],
-                 "packages": ["stripe", "braintree", "adyen", "paypal-checkout"], "paths": ["billing/"], "keywords": ["stripe", "paypal", "braintree", "adyen"]},
-    "complex_auth": {"match": ["saml", "sso", "ldap", "enterprise auth", "kerberos"],
-                     "packages": ["python3-saml", "ldap3", "keycloak"], "paths": [], "keywords": ["saml", "ldap", "kerberos", "keycloak"]},
-    "websockets": {"match": ["websocket", "вебсокет", "realtime", "real-time"],
-                   "packages": ["socket.io", "ws", "websockets", "socketio"], "paths": [], "keywords": ["websocket", "socket.io"]},
-    "email": {"match": ["email sending", "рассылк", "newsletter", "smtp"],
-              "packages": ["nodemailer", "sendgrid", "resend", "mailgun"], "paths": [], "keywords": ["smtp", "sendgrid", "mailgun"]},
-    "multi_tenancy": {"match": ["multi-tenan", "multitenan", "мультитенант", "team accounts", "organizations", "командн"],
-                      "packages": [], "paths": ["tenants/", "organizations/"], "keywords": ["tenant_id", "organization_id", "workspace_id", "rbac"]},
-    "marketplace": {"match": ["marketplace", "маркетплейс", "plugin store", "adapter sdk"],
-                    "packages": [], "paths": ["marketplace/", "plugins/"], "keywords": ["marketplace", "plugin registry", "adapter sdk"]},
-    "llm_grading": {"match": ["llm grading", "llm-оцен", "llm оцен", "ai grading", "auto-grade", "оценка ответов"],
-                    "packages": [], "paths": [], "keywords": ["grade_with_llm", "llm_score", "ai_grader"]},
-}
-NON_GOAL_STOPWORDS = {"the", "and", "for", "with", "without", "only", "stage", "mvp", "support", "feature", "features", "integration",
-                      "без", "или", "для", "нет", "только", "этапе", "поддержка", "функционал", "интеграция", "приложения", "приложение", "native", "нативные",
-                      "never", "no", "not", "any", "this", "that", "release", "phase", "later", "future"}
+# --- the derivation lives in the hook, not here -------------------------------------------------------------
+# The capability lexicon and the boundary→markers rules used to be copied into this file, which made three
+# copies of the same word lists: the product's (`lumis/core/boundary_markers.py`), the hook's and this one. They
+# now live in `scope_guard.py`, the file sitting next to this one — the hook needs them for `rebuild-markers`,
+# and a generated pack ships the hook alone, so the hook is the only place both installers can reach.
+#
+# Loaded by path, not through `sys.path`: `test_skill_pack.py` loads *this* file by spec inside a pytest process,
+# where a bare `import scope_guard` would bind to whatever `sys.modules` already holds. `scope_guard.py` is safe
+# to import — its only import-time effect is the stdout/stderr reconfigure this file already does itself, and its
+# `main()` is behind `if __name__ == "__main__"`.
+import importlib.util as _importlib_util
+
+_spec = _importlib_util.spec_from_file_location("lumis_scope_guard_core", HERE / "scope_guard.py")
+if _spec is None or _spec.loader is None:  # pragma: no cover - only when the skill folder is broken
+    raise SystemExit(f"scope_guard.py is missing next to {Path(__file__).name}: reinstall the skill.")
+guard = _importlib_util.module_from_spec(_spec)
+_spec.loader.exec_module(guard)
+
+CAPABILITY_TRIGGERS = guard.CAPABILITY_TRIGGERS
+FUNCTION_WORDS = guard.FUNCTION_WORDS
+GENERIC_ARCHITECTURAL_STOPWORDS = guard.GENERIC_ARCHITECTURAL_STOPWORDS
+COMMON_CODE_WORDS = guard.COMMON_CODE_WORDS
+TECHNOLOGY_WORDS = guard.TECHNOLOGY_WORDS
+SHORT_BOUNDARY_WORDS = guard.SHORT_BOUNDARY_WORDS
+MARKERS_PER_BOUNDARY = guard.MARKERS_PER_BOUNDARY
+WARN_MARKERS_PER_BOUNDARY = guard.WARN_MARKERS_PER_BOUNDARY
+normalize = guard.normalize
+glue_technologies = guard.glue_technologies
+prescribes = guard.prescribes
+stack_vocabulary = guard.stack_vocabulary
+markers_for = guard.markers_for
+
 DRIFT_PHRASES = (
     "quick fix for now", "for now", "while i'm in here", "while i am in here", "since i already touched",
     "might as well", "we might as well", "let's also", "lets also", "also add", "bonus:", "nice to have",
@@ -88,13 +93,19 @@ def split_items(text: str) -> list[str]:
     return out[:25]
 
 
-def guard_config(project: str, non_goals: list[str]) -> dict:
+def guard_config(project: str, non_goals: list[str], stack: str = "") -> dict:
+    """Triggers for the hook. Two classes leave here: `keywords` stop a tool call (exit 2) — the curated concept
+    lexicon, phrases, and the words of a short boundary; `warn_keywords` only warn (exit 1) — a lone word out of a
+    long sentence, a possible match for a human to judge. A hook reading a config without the second key behaves
+    exactly as it always did."""
     packages: list[str] = []
     paths: list[str] = []
     keywords: list[str] = []
+    warn_keywords: list[str] = []
     matched: dict[str, list[str]] = {}
     boundaries = [{"id": f"NG-{i}", "text": ng, "origin": "founder", "source": "CONSTITUTION.md, Article I"} for i, ng in enumerate(non_goals, 1)]
     trigger_sources: dict[str, str] = {}  # trigger -> boundary id, so a block can say which Non-Goal it enforces
+    vocabulary = stack_vocabulary(stack)
     for b in boundaries:
         ng = b["text"]
         low = ng.lower()
@@ -106,14 +117,21 @@ def guard_config(project: str, non_goals: list[str]) -> dict:
                 matched.setdefault(cap, []).append(ng)
                 for t in spec["packages"] + spec["paths"] + spec["keywords"]:
                     trigger_sources.setdefault(t.lower(), b["id"])
-        for word in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{4,}", low):
-            if word not in NON_GOAL_STOPWORDS and word not in keywords:
-                keywords.append(word)
-                trigger_sources.setdefault(word, b["id"])
+        blocking, warning = markers_for(ng, vocabulary)
+        for text in blocking:
+            keywords.append(text)
+            trigger_sources.setdefault(text, b["id"])
+        for text in warning:
+            warn_keywords.append(text)
+            trigger_sources.setdefault(text, b["id"])
     dedupe = lambda xs: list(dict.fromkeys(x for x in xs if x))
+    blocking_keywords = dedupe(keywords)[:320]
+    # a marker that blocks is never also a warning: the stronger verdict wins, one trigger keeps one meaning
+    warn_only = [w for w in dedupe(warn_keywords) if w not in set(blocking_keywords)][:240]
     return {"project": project, "generated": date.today().isoformat(), "source": "lumis-scope-guard skill",
             "non_goals": non_goals, "boundaries": boundaries, "capabilities": matched, "deny_packages": dedupe(packages), "deny_paths": dedupe(paths),
-            "keywords": dedupe(keywords)[:60], "trigger_sources": trigger_sources, "drift_phrases": list(DRIFT_PHRASES), "design_non_goals": [],
+            "keywords": blocking_keywords, "warn_keywords": warn_only,
+            "trigger_sources": trigger_sources, "drift_phrases": list(DRIFT_PHRASES), "design_non_goals": [],
             "log": ".lumis/guard.log"}
 
 
@@ -277,7 +295,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     invariants = split_items(args.invariants or "")
     stack = (args.stack or "").strip()[:200]
     project = (args.project or root.name).strip()[:60]
-    cfg = guard_config(project, non_goals)
+    cfg = guard_config(project, non_goals, stack)
     (root / ".lumis").mkdir(parents=True, exist_ok=True)
     (root / ".lumis" / "scope_guard.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     # the log records what an agent attempted (secrets stripped): local evidence, shared deliberately, not by accident
@@ -342,7 +360,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     for line in (outside.stdout or "").splitlines():
         if line.startswith("baseline outside the repository"):
             print("  " + line)
-    print(f"  Non-Goals: {len(non_goals)} · invariants: {len(invariants)} · deny packages: {len(cfg['deny_packages'])} · deny paths: {len(cfg['deny_paths'])} · keywords: {len(cfg['keywords'])}")
+    print(f"  Non-Goals: {len(non_goals)} · invariants: {len(invariants)} · deny packages: {len(cfg['deny_packages'])} · deny paths: {len(cfg['deny_paths'])} · keywords: {len(cfg['keywords'])} · warn-only markers: {len(cfg['warn_keywords'])}")
     print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section), CLAUDE.md (section)")
     print("  Agents: Claude Code (.claude/settings.json), Cursor (.cursor/hooks.json), Codex (.codex/hooks.json), Windsurf (.windsurf/hooks.json), Copilot (.github/hooks/lumis-scope-guard.json)")
     print("  Self-test: ask the agent to add something from the Non-Goals list — it must refuse or ask.")
@@ -358,9 +376,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     text = args.text or sys.stdin.read()
     low = text.lower()
+
+    def matches(trigger: str) -> bool:
+        """The same spelling tolerance the hook has: the phrase `push notifications` also finds
+        `push_notifications`, `push-notifications`, `PushNotifications` and `send_push_notifications`
+        (the text is lower-cased first). A single word keeps the strict word boundary."""
+        words = trigger.lower().split()
+        if len(words) > 1:
+            body = r"[\s._\-/]*".join(re.escape(w) for w in words)
+            return bool(re.search(r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])", low))
+        return bool(re.search(r"(?<![\w-])" + re.escape(words[0]) + r"(?![\w-])", low))
+
     hits: list[str] = []
     for kw in cfg.get("keywords", []):
-        if kw and re.search(r"(?<![\w-])" + re.escape(kw.lower()) + r"(?![\w-])", low):
+        if kw and matches(kw):
             hits.append(f"Non-Goal keyword '{kw}'" + explain(cfg, kw))
     for pkg in cfg.get("deny_packages", []):
         if re.search(r"(^|[\s'\"/@=])" + re.escape(pkg.lower()) + r"([\s'\"@=:]|$)", low):
@@ -368,6 +397,9 @@ def cmd_check(args: argparse.Namespace) -> int:
     for dp in cfg.get("deny_paths", []):
         if dp and dp.lower() in low:
             hits.append(f"forbidden path '{dp}'" + explain(cfg, dp))
+    # warn-only markers: a single word out of a long Non-Goal sentence. Reported, never counted as a violation,
+    # and never part of the exit code — the founder judges, the tool does not.
+    possible = [f"possible match with '{kw}'" + explain(cfg, kw) for kw in cfg.get("warn_keywords", []) or [] if kw and matches(kw)]
     drift = [p for p in cfg.get("drift_phrases", []) if p.lower() in low]
     print("Non-Goals in force:")
     for ng in cfg.get("non_goals", []):
@@ -376,9 +408,13 @@ def cmd_check(args: argparse.Namespace) -> int:
         print("\n⛔ Scope violations:")
         for h in sorted(set(hits)):
             print(f"  - {h}")
+    if possible:
+        print("\n🔎 Possible matches — for you to judge, not violations:")
+        for h in sorted(set(possible)):
+            print(f"  - {h}")
     if drift:
         print("\n⚠️ Drift phrases: " + ", ".join(f"'{p}'" for p in drift[:6]) + " — confirm the task is in scope (y/n) before changing code.")
-    if not hits and not drift:
+    if not hits and not drift and not possible:
         print("\n✅ No Non-Goal triggers or drift phrases found.")
     return 1 if hits else 0
 
@@ -391,12 +427,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     cfg_path = root / ".lumis" / "scope_guard.json"
     if cfg_path.exists():
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        print(f"Non-Goals: {len(cfg.get('non_goals', []))} · deny packages: {len(cfg.get('deny_packages', []))} · keywords: {len(cfg.get('keywords', []))}")
+        print(f"Non-Goals: {len(cfg.get('non_goals', []))} · deny packages: {len(cfg.get('deny_packages', []))} · keywords: {len(cfg.get('keywords', []))}"
+              f" · warn-only markers: {len(cfg.get('warn_keywords') or [])}")
         entries = read_log(root, cfg)
         counts: dict[str, int] = {}
         for e in entries:
             counts[e.get("event", "")] = counts.get(e.get("event", ""), 0) + 1
-        print(f"Guard log ({cfg.get('log', '.lumis/guard.log')}): blocked {counts.get('blocked', 0)} · warned {counts.get('warned', 0)} · drift prompts {counts.get('drift', 0)}")
+        print(f"Guard log ({cfg.get('log', '.lumis/guard.log')}): blocked {counts.get('blocked', 0)} · warned {counts.get('warned', 0)}"
+              f" · possible {counts.get('possible', 0)} · drift prompts {counts.get('drift', 0)}")
         for e in entries[-5:]:
             where = f" {e.get('path')}" if e.get("path") else ""
             print(f"  {e.get('ts', '')} {e.get('event', ''):7} {e.get('tool', '')}{where}: " + "; ".join(e.get("hits", [])))

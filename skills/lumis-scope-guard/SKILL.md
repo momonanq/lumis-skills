@@ -25,6 +25,12 @@ Prompts alone do not hold; this installs hooks that block the change before it h
 - `/lumis-scope-guard status` — which guard files exist, how many triggers are in force, and what the guard has done so far
   (`.lumis/guard.log`: blocked / warned / drift events, last five shown). `python scripts/scope_guard.py report` prints the full summary.
 
+If a boundary was reworded, or the config was written by an older version and arms ordinary words (`python`, `public`,
+`production`), the founder runs `python scripts/scope_guard.py rebuild-markers --dry-run` from the repository: it re-derives
+`keywords` and `warn_keywords` from the boundaries the config already carries, prints the diff per boundary and writes nothing;
+without `--dry-run` it writes and re-baselines the manifest. Everything else — the architecture inventory, the deny lists, and any
+marker listed under `pinned_keywords` — is kept. It is the founder's command: the hook refuses it to the agent, `--dry-run` included.
+
 Every block names the boundary it enforces — `NG-3 "no crypto payments" (set by the founder; CONSTITUTION.md, Article I)` — so the
 agent (and the founder) see *which* rule fired and where it is written, not just that something was refused.
 The log stays in the repository; nothing is sent anywhere.
