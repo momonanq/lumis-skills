@@ -30,6 +30,8 @@ so the same guard works everywhere; only the config file and the payload shape d
         adds a warning to the context when the prompt contains a drift phrase
         ("quick fix for now", "while I'm in here", ...) — the agent must confirm the task is in scope.
   * `python scripts/scope_guard.py report`   -> what the guard blocked and warned about so far (.lumis/guard.log)
+  * `python scripts/scope_guard.py request --reason "…"` -> the last refusal as a request file for the founder
+        (.lumis/requests/, the exact payload and the boundary named; paste-ready for LUMIS Amend)
   * `python scripts/scope_guard.py doctor`   -> is the guard wired up here: files, configs, interpreter on PATH,
         and are the guard's own files still the ones that were installed (.lumis/guard.manifest.json, and the
         copy of it outside the repository: ~/.lumis/baselines/<repo-id>/manifest.json)
@@ -246,7 +248,7 @@ LISTING_EXECUTABLES = {"ls", "dir", "get-childitem", "gci"}
 # The separator is either slash: on Windows, where these agents mostly run, PowerShell tab-completion produces
 # `.\scripts\scope_guard.py`, and the two documented read-only commands were refused to the agent for the spelling
 # alone (review 2026-09-21). Everything else in this file already normalises backslashes; this pattern did not.
-GUARD_SELF_RUN = re.compile(r"^\s*(?:python3?|py)(?:\s+-X\s+utf8)?\s+(?:\.[\\/])?scripts[\\/]scope_guard\.py\s+(?:pre-tool|prompt|report|doctor)\b[^>|;&\n]*$", re.I)
+GUARD_SELF_RUN = re.compile(r"^\s*(?:python3?|py)(?:\s+-X\s+utf8)?\s+(?:\.[\\/])?scripts[\\/]scope_guard\.py\s+(?:pre-tool|prompt|report|doctor|request)\b[^>|;&\n]*$", re.I)
 
 
 MANIFEST = ".lumis/guard.manifest.json"
@@ -817,6 +819,44 @@ def _guard_targets_of_command(text: str, depth: int = 0) -> list[str]:
     return hits
 
 
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+_MESSAGE_ARG = re.compile(r"(\s(?:-m|-am|--message)(?:\s+|=))(\"(?:[^\"\\]|\\.)*\"|'[^']*')")
+
+
+def _write_target_of_line(line: str) -> str:
+    """Where a shell line sends its data: the redirect target, or what `tee` writes."""
+    m = re.search(r">>?\s*([^\s|;&]+)", line) or re.search(r"\btee\b\s+(?:-a\s+)?([^\s|;&]+)", line)
+    return m.group(1).strip("'\"") if m else ""
+
+
+def _command_without_data(text: str) -> str:
+    """The command minus the data it carries into a document: a heredoc body written to a prose file, a commit
+    message. A note in DECISION_LOG.md that names CONSTITUTION.md is a note about the guard, not a change to it —
+    the founder's agent was refused three times in a row for exactly that (field report 2026-09-22). A heredoc fed
+    to an interpreter, or written anywhere but a prose file, keeps its body: that is a script, and a script is read
+    as a command."""
+    raw = str(text or "")
+    if "<<" not in raw and "-m" not in raw and "--message" not in raw:
+        return raw
+    lines = raw.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = _HEREDOC.search(line)
+        target = _write_target_of_line(line) if m else ""
+        if m and target and is_prose_path(target) and not _mentions_guard_file(_clean_path(target), GUARD_FILES):
+            out.append(line)
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != m.group(2):
+                j += 1
+            i = j + 1  # the body and its terminator: data, not commands
+            continue
+        out.append(line)
+        i += 1
+    return _MESSAGE_ARG.sub(lambda mm: mm.group(1) + '""', "\n".join(out))
+
+
 def _only_guard_self_run(text: str) -> bool:
     """`cd repo && python scripts/scope_guard.py doctor`: running the guard the documented way, with nothing around it
     but a look (`cd`, `ls`, `pwd`). A redirect, a substitution or any other segment makes it a command like any other.
@@ -837,13 +877,16 @@ def check_tamper(tool_name: str, tool_input: dict) -> tuple[list[str], list[str]
     if is_command(tool_name, tool_input):
         if is_read_only_command(text) or _only_guard_self_run(text):
             return [], []
-        files = _mentions_guard_file(text, GUARD_FILES)
-        for hit in _guard_targets_of_command(text):
-            if hit not in files:
-                files.append(hit)
-        if _touches_baseline(text):
+        command = _command_without_data(text)
+        files = list(_guard_targets_of_command(command))
+        for name in _mentions_guard_file(command, GUARD_FILES):
+            # named in the text but not a target the parser can see: the refusal says so, so the agent knows whether
+            # to reword a note or to stop (the field report: «three rounds to find out which»)
+            if not any(name in hit for hit in files):
+                files.append(f"{name} (named in the command text)")
+        if _touches_baseline(command):
             files.append("the guard's baseline outside the repository (~/.lumis)")
-        return files, _mentions_guard_file(text, GUARD_TEXT_FILES)
+        return files, _mentions_guard_file(command, GUARD_TEXT_FILES)
     if not path:
         return [], []
     files = _mentions_guard_file(_clean_path(path), GUARD_FILES)
@@ -1329,6 +1372,27 @@ def check_architecture(cfg: dict, tool_name: str, tool_input: dict) -> list[str]
 
 
 # --- the local log: what the guard did, kept in the repository ------------------------------------------------
+# What a leaked credential looks like in a tool payload. A warning, never a block: the agent may be writing a
+# fixture on purpose, but the founder's agent checked for this by hand before every push (field report 2026-09-22).
+SECRET_LEAKS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("a JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("a connection string with a password", re.compile(r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:/@]+:[^\s@]+@", re.I)),
+    ("an API token", re.compile(r"\b(?:sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[abpr]-[A-Za-z0-9-]{10,})")),
+]
+
+
+def secret_leaks(text: str, path: str = "") -> list[str]:
+    """The kinds of credential a payload carries. Documents, tests and *.example files are where placeholders live."""
+    low = _clean_path(path)
+    if low and (is_prose_path(low) or low.endswith((".example", ".sample", ".template"))):
+        return []
+    found = [kind for kind, rx in SECRET_LEAKS if rx.search(str(text or ""))]
+    if any(w in str(text or "").lower() for w in ("example.com", "placeholder", "changeme", "xxxxxxxx", "your_")):
+        return [] if len(found) < 2 else found
+    return found
+
+
 SECRET_PATTERNS = [
     (re.compile(r"(?i)\b(authorization|api[-_]?key|token|secret|password|passwd|pwd)\b(\s*[:=]\s*|\s+)\S+"), r"\1=***"),
     (re.compile(r"(?i)\bbearer\s+\S+"), "bearer ***"),
@@ -1356,9 +1420,12 @@ def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: lis
         "tool": tool_name or "prompt",
         "path": text_of_tool_input(tool_name, tool_input)[1][:200],
         # what the agent actually asked for: without it the log says "something was blocked" and no more
-        "attempted": redact(attempted or (tool_input or {}).get("command", "")),
-        "hits": [h[:300] for h in hits][:8],
+        # a refusal keeps more of the payload: the token that matched is usually past the first line of a heredoc
+        "attempted": redact(attempted or (tool_input or {}).get("command", ""), limit=600 if event in ("blocked", "tamper") else 160),
+        "hits": [h[:300] for h in hits if str(h).strip()][:8],
     }
+    if event in ("warned", "possible") and not entry["hits"]:
+        return  # a warning with no reason teaches the agent to skip the whole category (field report 2026-09-22)
     try:
         target = project_root() / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1382,17 +1449,83 @@ def read_log(cfg: dict) -> list[dict]:
     return out
 
 
+def fingerprints() -> str:
+    """Which hook and which config are speaking: without them «did the rules change?» can only be answered by trying
+    the refused edit again (field report 2026-09-22)."""
+    try:
+        hook = file_digest(Path(__file__))[:8]
+    except Exception:
+        hook = "?"
+    try:
+        config = file_digest(project_root() / ".lumis" / "scope_guard.json")[:8]
+    except Exception:
+        config = "absent"
+    return f"hook {hook} · config {config}"
+
+
+def write_request(reason: str) -> int:
+    """`scope_guard.py request --reason "…"`: the last refusal, written into .lumis/requests/<ts>-<slug>.md with the
+    exact payload the guard recorded, the boundary it named, and the agent's reason — a file, so it survives the
+    agent's context being compacted, and paste-ready for LUMIS Amend. The founder's agent wrote such a file by hand,
+    twice, because the first copy had drifted from the file by the time a decision came (field report 2026-09-22)."""
+    root = project_root()
+    events = [e for e in read_log({"log": ".lumis/guard.log"}) if e.get("event") in ("blocked", "tamper")]
+    if not events:
+        print("no refusal on record: nothing to request")
+        return 1
+    last = events[-1]
+    slug = re.sub(r"[^a-z0-9]+", "-", (reason or "request").lower()).strip("-")[:40] or "request"
+    stamp = re.sub(r"[^0-9T]", "", str(last.get("ts", ""))[:19]) or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    target = root / ".lumis" / "requests" / f"{stamp}-{slug}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    hits = last.get("hits") or []
+    kind = "the guard's own files" if last.get("event") == "tamper" else "a Non-Goal"
+    amend_lines = [f"- Consider lifting or narrowing the boundary behind: {h}" for h in hits if "NG-" in str(h)] or [
+        "- The refusal concerned the guard's own files: if the change was meant, run Amend or edit the boundary yourself; the agent must not."]
+    body = "\n".join([
+        f"# Request to the founder: {reason or '(no reason given)'}",
+        "",
+        f"- refused at: {last.get('ts', '')} · agent: {last.get('agent', 'unknown')} · tool: {last.get('tool', '')}"
+        + (f" · path: {last.get('path')}" if last.get("path") else ""),
+        f"- what the guard named ({kind}):",
+        *[f"  - {h}" for h in hits],
+        "",
+        "## What was attempted (as the guard recorded it, secrets stripped)",
+        "",
+        "```",
+        str(last.get("attempted", "")),
+        "```",
+        "",
+        "## Why the agent asks",
+        "",
+        reason or "(no reason given)",
+        "",
+        "## For LUMIS Amend (paste into «Указания архитектору» / the amendment notes)",
+        "",
+        *amend_lines,
+        "",
+        f"_written by scripts/scope_guard.py request · {fingerprints()}_",
+        "",
+    ])
+    target.write_text(body, encoding="utf-8")
+    print(f"request written: {target.relative_to(root)}")
+    print("  hand it to the founder; the guard does not lift anything on its own")
+    return 0
+
+
 def report(cfg: dict) -> int:
     entries = read_log(cfg)
     counts = {"blocked": 0, "warned": 0, "possible": 0, "drift": 0, "tamper": 0}
     for e in entries:
         counts[e.get("event", "")] = counts.get(e.get("event", ""), 0) + 1
     agents = sorted({str(e.get("agent") or "unknown") for e in entries})
-    print(f"LUMIS Scope Guard — {len(entries)} events in {cfg.get('log', '.lumis/guard.log')}")
-    print(f"  blocked: {counts.get('blocked', 0)} · asked: {counts.get('asked', 0)} · inspected: {counts.get('inspected', 0)} · warned: {counts.get('warned', 0)} · drift prompts: {counts.get('drift', 0)}"
+    stopped = counts.get("blocked", 0) + counts.get("tamper", 0)
+    print(f"LUMIS Scope Guard — {len(entries)} events in {cfg.get('log', '.lumis/guard.log')} · {fingerprints()}")
+    # «blocked: 0» beside eighteen tamper refusals read as «the guard never stepped in» (field report 2026-09-22)
+    print(f"  stopped: {stopped} (blocked: {counts.get('blocked', 0)} · tamper: {counts.get('tamper', 0)})"
+          f" · asked: {counts.get('asked', 0)} · inspected: {counts.get('inspected', 0)} · warned: {counts.get('warned', 0)} · drift prompts: {counts.get('drift', 0)}"
           + (f" · possible: {counts.get('possible', 0)}" if counts.get("possible") else "")
           + (f" · noted: {counts.get('noted', 0)}" if counts.get("noted") else "")
-          + (f" · tamper: {counts.get('tamper', 0)}" if counts.get("tamper") else "")
           + (f" · agents: {', '.join(agents)}" if entries else ""))
     if counts.get("possible"):
         print("  ('possible' is a single word out of a long Non-Goal sentence that turned up in a change: a match for you")
@@ -1431,7 +1564,7 @@ def doctor() -> int:
     It cannot prove your client loaded the config — only the client can, by refusing. Run the self-test after this."""
     root = project_root()
     problems: list[str] = []
-    print(f"LUMIS Scope Guard — checking {root}")
+    print(f"LUMIS Scope Guard — checking {root} · {fingerprints()}")
     script = root / "scripts" / "scope_guard.py"
     print(("  ✓ " if script.exists() else "  ✗ ") + "scripts/scope_guard.py")
     if not script.exists():
@@ -1879,6 +2012,15 @@ def main() -> int:
     cfg = load_config()
     if mode == "report":
         return report(cfg)
+    if mode == "request":
+        argv = sys.argv[1:]
+        reason = ""
+        for i, arg in enumerate(argv):
+            if arg == "--reason" and i + 1 < len(argv):
+                reason = argv[i + 1]
+            elif arg.startswith("--reason="):
+                reason = arg.split("=", 1)[1]
+        return write_request(reason.strip())
     if mode == "doctor":
         return doctor()
     if mode == "write-manifest":  # after an Amend, or when the founder edited the guard on purpose
@@ -1953,6 +2095,11 @@ def main() -> int:
                     "not by editing the hook, its config or the constitution. Ask the founder instead of working around it.")
         log_event(cfg, "tamper", tool_name, tool_input, [f"write to {f}" for f in tampered], agent, attempted=attempted_text or command)
         return 2
+    leaks = secret_leaks(attempted_text or command, tool_path)
+    if leaks:
+        warnings.append("🔑 LUMIS Scope Guard: this change carries what looks like " + " and ".join(leaks)
+                        + ". Check it before it lands in the repository; a fixture belongs in a *.example file or a test.")
+        log_event(cfg, "warned", tool_name, tool_input, [f"possible secret: {k}" for k in leaks], agent, attempted="")
     if touched_rules:
         warnings.append("📄 LUMIS: this change rewrites the rules the agent reads (" + ", ".join(touched_rules)
                         + "). Keep your own notes, but the LUMIS section is regenerated by Amend — edits to it are lost and the boundaries stay.")

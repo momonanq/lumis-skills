@@ -68,6 +68,10 @@ you keep your own notes there.
 This is **not** a security boundary: a process with shell access still reaches the files. What it guarantees is
 that no rewrite happens quietly through a tool call. `.lumis/guard.manifest.json` fingerprints the guard at install,
 `doctor` reports any file changed since, and `write-manifest` re-baselines after a deliberate change or an Amend.
+When the guard refuses something the agent believes is right, `python scripts/scope_guard.py request --reason "…"` writes the
+last refusal — the exact payload, the boundary named, the reason — into `.lumis/requests/` as a file for the founder, paste-ready
+for LUMIS Amend. The guard lifts nothing on its own. A payload that looks like a private key, a JWT, a connection string with a
+password or an API token gets a warning (never a block); documents, tests and `*.example` files are exempt.
 The manifest sits in the repository, so one edit could rewrite the hook and its fingerprint together. A copy of the
 fingerprints is therefore kept outside the repository, in `~/.lumis/baselines/<repo-id>/manifest.json` (written at
 `init`, by `write-manifest`, or by the first hook call after a ZIP install; `LUMIS_HOME` moves it,
