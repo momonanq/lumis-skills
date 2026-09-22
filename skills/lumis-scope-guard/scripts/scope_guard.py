@@ -467,8 +467,13 @@ def command_segments(text: str) -> list[tuple[str, list[str], str]]:
 
 
 def _mentions_guard_file(text: str, names: tuple[str, ...]) -> list[str]:
+    """Guard file names the text names as a path: whole, or as the tail of one. A name glued to letters, digits, `_`,
+    `-` or `.` in front of it is another file — `DESIGN_CONSTITUTION.md`, `my.cursorrules` — not the guard's. A plain
+    substring test refused the founder's agent an edit of DESIGN_CONSTITUTION.md as a rewrite of CONSTITUTION.md
+    (field report 2026-09-22)."""
     low = _clean_text(text)
-    return [name for name in names if name.lower() in low]
+    return [name for name in names
+            if re.search(r"(?<![A-Za-z0-9_.\-])" + re.escape(name.lower()) + r"(?![A-Za-z0-9_\-])", low)]
 
 
 def _resolves_to_guard(token: str, root: Path | None = None) -> str | None:
@@ -812,13 +817,25 @@ def _guard_targets_of_command(text: str, depth: int = 0) -> list[str]:
     return hits
 
 
+def _only_guard_self_run(text: str) -> bool:
+    """`cd repo && python scripts/scope_guard.py doctor`: running the guard the documented way, with nothing around it
+    but a look (`cd`, `ls`, `pwd`). A redirect, a substitution or any other segment makes it a command like any other.
+    The founder's agent could not run `doctor` from outside the project (field report 2026-09-22)."""
+    raw = str(text or "")
+    if not raw.strip() or "$(" in raw or "`" in raw or WRITES_TO_FILE.search(raw):
+        return False
+    segments = [seg for seg in SEGMENT_SPLIT.split(raw) if seg.strip()]
+    return (any(GUARD_SELF_RUN.match(seg) for seg in segments)
+            and all(GUARD_SELF_RUN.match(seg) or is_read_only_command(seg) for seg in segments))
+
+
 def check_tamper(tool_name: str, tool_input: dict) -> tuple[list[str], list[str]]:
     """(files or directories the call would rewrite, guard text files it would touch). Reading them is always fine."""
     text, path = text_of_tool_input(tool_name, tool_input)
     if is_read_only_tool(tool_name, tool_input):
         return [], []
     if is_command(tool_name, tool_input):
-        if is_read_only_command(text) or GUARD_SELF_RUN.match(str(text or "")):
+        if is_read_only_command(text) or _only_guard_self_run(text):
             return [], []
         files = _mentions_guard_file(text, GUARD_FILES)
         for hit in _guard_targets_of_command(text):
