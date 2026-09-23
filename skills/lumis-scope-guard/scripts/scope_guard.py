@@ -25,10 +25,13 @@ so the same guard works everywhere; only the config file and the payload shape d
         visual Non-Goals from DESIGN_CONSTITUTION.md only warn (exit 1), they never block;
         architecture boundaries (a route, model or top-level directory absent from ARCHITECTURE.md) only warn too;
         `warn_keywords` — a single word out of a long Non-Goal sentence — only warn as well (exit 1, logged as
-        `possible`): the word names the boundary it came from and leaves the judgement to you.
+        `possible`): the word names the boundary it came from and leaves the judgement to you;
+        three boundary classes the founder decides on — a new dependency, a push or deploy that leaves the machine,
+        a write outside the project — are held for approval (`"classes"` in the config: allow | ask | block,
+        logged as `held`); with `"mode": "observe"` nothing is refused except a change to the guard itself.
   * `python scripts/scope_guard.py prompt [--agent <name>]`
-        adds a warning to the context when the prompt contains a drift phrase
-        ("quick fix for now", "while I'm in here", ...) — the agent must confirm the task is in scope.
+        adds a note to the context when the prompt names a boundary (a package, a path or a phrase — never a lone
+        word) or contains a drift phrase ("quick fix for now", "while I'm in here", ...): advice, it never stops.
   * `python scripts/scope_guard.py report`   -> what the guard blocked and warned about so far (.lumis/guard.log)
   * `python scripts/scope_guard.py request --reason "…"` -> the last refusal as a request file for the founder
         (.lumis/requests/, the exact payload and the boundary named; paste-ready for LUMIS Amend)
@@ -42,6 +45,8 @@ so the same guard works everywhere; only the config file and the payload shape d
         inventory, the deny lists, `pinned_keywords` and everything else are kept. `--dry-run` prints the diff and
         writes nothing; the real run saves the file as it was to `.lumis/scope_guard.prev.json` and re-baselines
         the manifest afterwards. Yours to run: the hook refuses it to the agent, `--dry-run` included.
+  * `python scripts/scope_guard.py observe on|off` -> switch the guard to recording only (`on`) or back to refusing
+        (`off`): rewrites the `mode` key of .lumis/scope_guard.json and re-baselines. Yours to run, like write-manifest.
 
 `--agent` only picks the shape of the refusal each client renders best; the payload is recognised automatically,
 so a missing or wrong flag still blocks with exit 2. Every block and warning is appended to .lumis/guard.log
@@ -67,7 +72,18 @@ for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to a legacy
     except Exception:
         pass
 
-EMPTY_CONFIG = {"non_goals": [], "keywords": [], "warn_keywords": [], "deny_packages": [], "deny_paths": [], "drift_phrases": [], "design_non_goals": []}
+# The release this script belongs to — bump it on every change of this file. The pack writes the same string into
+# .lumis/scope_guard.json as `hook_version`, so `doctor` can tell a config that expects a newer hook (keys the old
+# script would ignore in silence) from a hook that is merely newer than its config (harmless: new keys take defaults).
+HOOK_VERSION = "2026-09-23"
+
+# The three decisions that are the founder's whatever the Non-Goals say: a new dependency changes the stack, a push
+# or a deploy leaves the machine, a write outside the project is not this project's change. Missing key -> "ask".
+DEFAULT_CLASSES = {"dependency": "ask", "outbound": "ask", "outside_root": "ask"}
+CLASS_VERDICTS = ("allow", "ask", "block")
+
+EMPTY_CONFIG = {"non_goals": [], "keywords": [], "warn_keywords": [], "deny_packages": [], "deny_paths": [], "drift_phrases": [], "design_non_goals": [],
+                "mode": "enforce", "classes": dict(DEFAULT_CLASSES)}
 ORIGIN_LABELS = {
     "founder": "set by the founder",
     "consilium": "added by the consilium for this release (DECISION_LOG.md)",
@@ -135,6 +151,33 @@ def emit_denial(agent: str, message: str) -> None:
         print(json.dumps({"permissionDecision": "deny", "permissionDecisionReason": message}, ensure_ascii=False))
 
 
+def emit_ask(agent: str, message: str) -> int:
+    """Hand the decision to the human, where the client can: Claude Code and Cursor show a permission prompt for an
+    "ask" answer on exit 0. Codex, Windsurf and Copilot have no such answer, so they get the warning on stderr and
+    exit 1 — the call proceeds and the founder reads why in the transcript and in the log. Returns the exit code."""
+    if agent == "claude":
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
+                                                 "permissionDecisionReason": message}}, ensure_ascii=False))
+        return 0
+    if agent == "cursor":
+        print(json.dumps({"permission": "ask", "userMessage": message, "agentMessage": message}, ensure_ascii=False))
+        return 0
+    sys.stderr.write(message + "\n")
+    return 1
+
+
+def guard_mode(cfg: dict) -> str:
+    """"observe" or "enforce" (the default, and whatever else the key says: a typo must not switch the guard off)."""
+    return "observe" if str((cfg or {}).get("mode") or "").strip().lower() == "observe" else "enforce"
+
+
+def class_verdict(cfg: dict, name: str) -> str:
+    """allow | ask | block for one boundary class; a missing or unreadable value is "ask"."""
+    classes = (cfg or {}).get("classes")
+    value = str((classes if isinstance(classes, dict) else {}).get(name, DEFAULT_CLASSES.get(name, "ask"))).strip().lower()
+    return value if value in CLASS_VERDICTS else "ask"
+
+
 def load_config() -> dict:
     root = project_root()
     for candidate in (root / ".lumis" / "scope_guard.json", Path(__file__).resolve().parents[1] / ".lumis" / "scope_guard.json"):
@@ -170,6 +213,58 @@ SEGMENT_SPLIT = re.compile(r"\|\||&&|[;|\n]")
 WRITES_TO_FILE = re.compile(r">>?\s*(?!/dev/null\b|NUL\b)\S")
 
 
+def reader_output_file(exe: str, args: list[str]) -> str:
+    """The file an otherwise read-only command was told to write, or "". `sort -o f`, `uniq in out`, `tree -o f` and
+    `git diff --output=f` look like looking: the 2026-09-23 audit replaced the guard's config with `sort -o
+    .lumis/scope_guard.json cfg.json` while the hook counted it as a look, so neither the tamper nor the class check ran."""
+    if exe in ("sort", "tree"):
+        for i, a in enumerate(args):
+            if a in ("-o", "--output"):
+                return args[i + 1] if i + 1 < len(args) else ""
+            if a.startswith("--output="):
+                return a.split("=", 1)[1]
+            # `sort -uo out`, `sort -oout`: the first `o` of a short cluster takes the rest, or the next word
+            m = re.match(r"^-([A-Za-z]*?)o(.*)$", a) if exe == "sort" and not a.startswith("--") else None
+            if m and not set(m.group(1)) & set("ktST"):
+                return m.group(2) or (args[i + 1] if i + 1 < len(args) else "")
+    if exe == "uniq":
+        positional = [a for a in args if not a.startswith("-") or a == "-"]
+        return positional[1] if len(positional) >= 2 else ""
+    if exe == "git":
+        for i, a in enumerate(args):
+            if a.startswith("--output="):
+                return a.split("=", 1)[1]
+            if a == "--output" and i + 1 < len(args):
+                return args[i + 1]
+    return ""
+
+
+# `git config` reads a value or writes one. Only the reading forms are a look: `git config alias.p push`,
+# `git config remote.origin.url …` rewrite what a later `git p` or `git push` does (audit 2026-09-23).
+GIT_CONFIG_WRITE_FLAGS = {"--add", "--unset", "--unset-all", "--replace-all", "--rename-section", "--remove-section",
+                          "-e", "--edit"}
+GIT_CONFIG_VALUE_FLAGS = {"-f", "--file", "--blob", "--type", "--default", "--comment", "--value"}
+
+
+def git_config_writes(args_after_config: list[str]) -> bool:
+    """True for a `git config …` that changes the configuration."""
+    if any(a.lower() in GIT_CONFIG_WRITE_FLAGS for a in args_after_config):
+        return True
+    positional: list[str] = []
+    skip = False
+    for a in args_after_config:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-"):
+            skip = a.lower() in GIT_CONFIG_VALUE_FLAGS
+            continue
+        positional.append(a)
+    if positional[:1] and positional[0].lower() in ("set", "unset", "rename-section", "remove-section", "edit"):
+        return True
+    return len(positional) >= 2 and positional[0].lower() not in ("get", "list")
+
+
 def is_read_only_command(command: str) -> bool:
     """True only when every segment is a known inspection command and nothing is redirected into a file.
     Anything we cannot read confidently (substitutions, unknown executables) is treated as not read-only."""
@@ -182,9 +277,13 @@ def is_read_only_command(command: str) -> bool:
             return False
         exe = parts[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
         exe = exe[:-4] if exe.endswith(".exe") else exe
+        if reader_output_file(exe, [p.strip("'\"") for p in parts[1:]]):
+            return False  # a look that writes a file is a write
         if exe == "git":
             sub = next((p for p in parts[1:] if not p.startswith("-")), "")
             if sub not in GIT_READ_ONLY or "--edit" in parts:
+                return False
+            if sub == "config" and git_config_writes(parts[parts.index(sub) + 1:]):
                 return False
         elif exe == "find":
             # `find` reads — until -exec/-delete hands what it found to a program that writes (u/northbridgedev, case 41)
@@ -211,6 +310,10 @@ GUARD_FILES = (
     ".claude/settings.json", ".cursor/hooks.json", ".codex/hooks.json", ".windsurf/hooks.json",
     ".github/hooks/lumis-scope-guard.json",
     "CONSTITUTION.md",
+    # Claude Code reads the project-local override too, and `{"disableAllHooks": true}` there switches this hook off
+    # as surely as an edit of settings.json does (audit 2026-09-23). It is not fingerprinted (see MANIFEST_FILES):
+    # the client itself writes it whenever the founder clicks "always allow".
+    ".claude/settings.local.json",
 )
 # the rules the agent reads are generated by LUMIS too, but users keep their own notes in them: warn, do not block
 GUARD_TEXT_FILES = (".cursorrules", "CLAUDE.md", "AGENTS.md")
@@ -242,18 +345,20 @@ TREE_REMOVERS = {"rm", "rmdir", "rd", "del", "erase", "shred", "mv", "move", "re
 XARGS_VALUE_FLAGS = {"-n", "-i", "-p", "-d", "-l", "-s", "-e", "-a", "--max-args", "--max-procs", "--delimiter", "--arg-file", "--replace"}
 LISTING_EXECUTABLES = {"ls", "dir", "get-childitem", "gci"}
 # Running the guard is not rewriting it: `python scripts/scope_guard.py report` is the documented way to read the
-# log. Exactly four words are read-only, and every other word naming this file — `write-manifest`,
-# `rebuild-markers`, with or without `--dry-run` — stays a `tamper` refusal: re-baselining and re-deriving the
-# markers are the founder's, run by them in their own shell.
+# log. Exactly three words are open to the agent — report, doctor, request — and every other word naming this file —
+# `write-manifest`, `rebuild-markers`, `observe`, with or without `--dry-run` — stays a `tamper` refusal:
+# re-baselining, re-deriving the markers and switching the mode are the founder's, run by them in their own shell.
+# `pre-tool` and `prompt` were open too until 2026-09-23: they append to .lumis/guard.log, so an agent could pipe any
+# payload in and forge journal lines — a fake refusal, or noise that pushes real events out of the studio's view.
 # The separator is either slash: on Windows, where these agents mostly run, PowerShell tab-completion produces
 # `.\scripts\scope_guard.py`, and the two documented read-only commands were refused to the agent for the spelling
 # alone (review 2026-09-21). Everything else in this file already normalises backslashes; this pattern did not.
-GUARD_SELF_RUN = re.compile(r"^\s*(?:python3?|py)(?:\s+-X\s+utf8)?\s+(?:\.[\\/])?scripts[\\/]scope_guard\.py\s+(?:pre-tool|prompt|report|doctor|request)\b[^>|;&\n]*$", re.I)
+GUARD_SELF_RUN = re.compile(r"^\s*(?:python3?|py)(?:\s+-X\s+utf8)?\s+(?:\.[\\/])?scripts[\\/]scope_guard\.py\s+(?:report|doctor|request)\b[^>|;&\n]*$", re.I)
 
 
 MANIFEST = ".lumis/guard.manifest.json"
-# the log is meant to grow and the manifest cannot fingerprint itself
-MANIFEST_FILES = tuple(f for f in GUARD_FILES if f not in (".lumis/guard.log", MANIFEST))
+# the log is meant to grow and the manifest cannot fingerprint itself; the local settings are the client's to rewrite
+MANIFEST_FILES = tuple(f for f in GUARD_FILES if f not in (".lumis/guard.log", MANIFEST, ".claude/settings.local.json"))
 
 
 def file_digest(path: Path) -> str:
@@ -829,12 +934,34 @@ def _write_target_of_line(line: str) -> str:
     return m.group(1).strip("'\"") if m else ""
 
 
-def _command_without_data(text: str) -> str:
+# A heredoc that becomes a commit message: `git commit -m "$(cat <<'EOF' … EOF)"` (Claude Code's own commit form) or
+# `git commit -F - <<EOF`. Its body is the message whatever quotes it holds; `_MESSAGE_ARG` stops at the first inner
+# quote, and the rest of the body was read as commands — `Checked; git push after review` was held as a push.
+_MESSAGE_HEREDOC = re.compile(r"(?:\s(?:-m|-am|--message)(?:\s+|=)[\"']?\$\(\s*cat\b|\s(?:-F|--file)(?:\s+|=)-(?:\s|$))")
+# what copies a heredoc into a file unchanged; anything else fed a heredoc (python, bash, psql) runs it
+_HEREDOC_WRITERS = {"cat", "tee"}
+
+
+def _heredoc_feeds_a_writer(line: str) -> bool:
+    """`cat > Dockerfile <<'EOF'`, `cat <<EOF > notes.txt`, `tee x.yml <<EOF`: the body is file content."""
+    for segment in SEGMENT_SPLIT.split(line):
+        if "<<" in segment:
+            words = segment.strip().split()
+            return bool(words) and words[0].rsplit("/", 1)[-1].lower() in _HEREDOC_WRITERS
+    return False
+
+
+def _command_without_data(text: str, files_too: bool = False) -> str:
     """The command minus the data it carries into a document: a heredoc body written to a prose file, a commit
     message. A note in DECISION_LOG.md that names CONSTITUTION.md is a note about the guard, not a change to it —
     the founder's agent was refused three times in a row for exactly that (field report 2026-09-22). A heredoc fed
     to an interpreter, or written anywhere but a prose file, keeps its body: that is a script, and a script is read
-    as a command."""
+    as a command.
+
+    `files_too` also drops the body `cat`/`tee` writes into any file (a Dockerfile, a CI workflow, notes.txt): the
+    boundary classes judge what a command *runs*, and file content written through a shell is judged like the same
+    content written with the Write tool. The tamper and Non-Goal checks keep the default: for them a script body
+    written to disk is still a script."""
     raw = str(text or "")
     if "<<" not in raw and "-m" not in raw and "--message" not in raw:
         return raw
@@ -845,7 +972,9 @@ def _command_without_data(text: str) -> str:
         line = lines[i]
         m = _HEREDOC.search(line)
         target = _write_target_of_line(line) if m else ""
-        if m and target and is_prose_path(target) and not _mentions_guard_file(_clean_path(target), GUARD_FILES):
+        as_data = bool(m) and (_MESSAGE_HEREDOC.search(line) is not None
+                               or (files_too and bool(target) and _heredoc_feeds_a_writer(line)))
+        if m and (as_data or (target and is_prose_path(target))) and not _mentions_guard_file(_clean_path(target), GUARD_FILES):
             out.append(line)
             j = i + 1
             while j < len(lines) and lines[j].strip() != m.group(2):
@@ -886,16 +1015,49 @@ def check_tamper(tool_name: str, tool_input: dict) -> tuple[list[str], list[str]
                 files.append(f"{name} (named in the command text)")
         if _touches_baseline(command):
             files.append("the guard's baseline outside the repository (~/.lumis)")
+        if HOOK_AS_MODULE.search(command) and not any("scope_guard" in hit for hit in files):
+            files.append("scripts/scope_guard.py (loaded as a module: its founder-only commands run without their names)")
         return files, _mentions_guard_file(command, GUARD_TEXT_FILES)
-    if not path:
+    targets = [p for p in [path] + destination_paths(tool_name, tool_input) if p]
+    if not targets:
         return [], []
-    files = _mentions_guard_file(_clean_path(path), GUARD_FILES)
-    if _touches_baseline(path) or _touches_baseline(os.path.realpath(os.path.expanduser(str(path)))):
-        files.append("the guard's baseline outside the repository (~/.lumis)")
-    linked = _resolves_to_guard(path)
-    if linked and linked not in files:
-        files.append(f"{linked} (through a link)")
-    return files, _mentions_guard_file(_clean_path(path), GUARD_TEXT_FILES)
+    files: list[str] = []
+    rules: list[str] = []
+    for target in targets:
+        for name in _mentions_guard_file(_clean_path(target), GUARD_FILES):
+            if name not in files:
+                files.append(name)
+        if (_touches_baseline(target) or _touches_baseline(os.path.realpath(os.path.expanduser(str(target))))) \
+                and "the guard's baseline outside the repository (~/.lumis)" not in files:
+            files.append("the guard's baseline outside the repository (~/.lumis)")
+        linked = _resolves_to_guard(target)
+        if linked and linked not in files and f"{linked} (through a link)" not in files:
+            files.append(f"{linked} (through a link)")
+        rules += [n for n in _mentions_guard_file(_clean_path(target), GUARD_TEXT_FILES) if n not in rules]
+    return files, rules
+
+
+# `python -c "import sys; sys.argv=['g','observe','on']; sys.path.insert(0,'scripts'); import scope_guard;
+# scope_guard.main()"` ran the founder's `observe on` — mode switched, manifest and baseline re-taken, nothing on
+# record — because the command never spells `scope_guard.py` (audit 2026-09-23). The module name counts as the file.
+# A name assembled at run time ('scr' + 'ipts/scope_' + 'guard.py') is still invisible: the same class as base64.
+HOOK_AS_MODULE = re.compile(r"(?<![\w.\-])scope_guard(?![\w\-])", re.I)
+# where a move or copy tool names the path it writes to; `path` alone missed mcp__filesystem__move_file's target
+DEST_KEYS = ("destination", "dest", "target", "target_path", "destination_path", "new_path", "newPath", "to")
+
+
+def destination_paths(tool_name: str, tool_input: dict) -> list[str]:
+    """The second path a file tool writes: the destination of a move or a copy (and, for a move, the source it
+    removes). Only for a tool whose name says it writes; a read tool's `target` is not a write."""
+    tool_input = tool_input or {}
+    words = tool_words(tool_name)
+    if is_command(tool_name, tool_input) or not any(w in WRITE_TOOL_WORDS for w in words):
+        return []
+    out = [str(tool_input[k]) for k in DEST_KEYS if isinstance(tool_input.get(k), str) and tool_input.get(k)]
+    if any(w in ("move", "rename", "delete", "remove") for w in words):
+        out += [str(tool_input[k]) for k in ("source", "src", "old_path", "oldPath", "from")
+                if isinstance(tool_input.get(k), str) and tool_input.get(k)]
+    return out
 
 
 def is_command(tool_name: str, tool_input: dict) -> bool:
@@ -1015,14 +1177,43 @@ def trigger_hits(cfg: dict, text: str, path: str = "") -> list[tuple[str, str]]:
             continue
         if re.search(rf"(^|[\s'\"/@=])" + re.escape(pkg.lower()) + r"([\s'\"@=:]|$)", low) or f"import {pkg.lower()}" in low or f"from {pkg.lower()}" in low or f"require('{pkg.lower()}" in low or f'require("{pkg.lower()}' in low:
             hits.append(("package", pkg))
+    slashed_path, slashed_text = str(path or "").replace("\\", "/").lower(), low.replace("\\", "/")
     for deny_path in cfg.get("deny_paths", []):
-        if deny_path and (deny_path.lower() in path.lower() or deny_path.lower() in low):
+        if deny_path and (deny_path_pattern(deny_path).search(slashed_path) or deny_path_pattern(deny_path).search(slashed_text)):
             hits.append(("path", deny_path))
-    spelled = _spelled_out(text)
+    words = _without_home_folders(text)
+    low_words, spelled = words.lower(), _spelled_out(words)
     for kw in cfg.get("keywords", []):
-        if kw and (keyword_pattern(kw).search(low) or keyword_pattern(kw).search(spelled)):
+        if kw and (keyword_pattern(kw).search(low_words) or keyword_pattern(kw).search(spelled)):
             hits.append(("phrase" if " " in kw.strip() else "keyword", kw))
     return hits
+
+
+_DENY_PATH_PATTERNS: dict[str, "re.Pattern[str]"] = {}
+
+
+def deny_path_pattern(deny_path: str) -> "re.Pattern[str]":
+    """A forbidden path as a whole path segment: `ios/` is src/ios/App.swift and `ios/` itself, never
+    `scenarios/`, `studios/` or `portfolios/`. A plain substring test refused `pytest tests/scenarios/` and a commit
+    message about "the scenarios/ page" as crossings of «No native iOS/Android apps» (audit 2026-09-23)."""
+    low = str(deny_path or "").replace("\\", "/").lower()
+    pattern = _DENY_PATH_PATTERNS.get(low)
+    if pattern is None:
+        head = r"(?<![A-Za-z0-9_.\-])" if low[:1].isalnum() or low[:1] == "_" else ""
+        pattern = re.compile(head + re.escape(low))
+        _DENY_PATH_PATTERNS[low] = pattern
+    return pattern
+
+
+# `C:\Users\<name>\…`, `/Users/<name>/…`, `/home/<name>/…`: the folder every absolute path on the machine starts with.
+# A marker `users` (out of «…between several users at once») warned on each of them (audit 2026-09-23).
+# Only at the start of an absolute path: `src/users/models.py` is the project's own `users` and still counts.
+_HOME_FOLDER = re.compile(r"(?i)(?<![^\s'\"=(])(?:[a-z]:)?[\\/]+(?:users|home)[\\/]+[^\\/\s'\"]+")
+
+
+def _without_home_folders(text: str) -> str:
+    """The text with the home-folder prefix of every absolute path blanked, for the keyword match only."""
+    return _HOME_FOLDER.sub(" ", str(text or ""))
 
 
 def warn_triggers(cfg: dict, text: str) -> list[tuple[str, str]]:
@@ -1032,14 +1223,17 @@ def warn_triggers(cfg: dict, text: str) -> list[tuple[str, str]]:
     2026-09-21 the hook would have refused `python -m pytest`, a file whose docstring said "canonical
     curriculum", and the project's own `services/` package. A word out of a sentence is a hint for a human;
     it is reported, it never stops a tool call, and a config written before this key existed simply has none."""
-    low, spelled = (text or "").lower(), _spelled_out(text)
+    words = _without_home_folders(text)
+    low, spelled = words.lower(), _spelled_out(words)
     return [("phrase" if " " in str(kw).strip() else "keyword", kw)
             for kw in cfg.get("warn_keywords", []) or [] if kw and (keyword_pattern(kw).search(low) or keyword_pattern(kw).search(spelled))]
 
 
-def match_triggers(cfg: dict, text: str, path: str = "") -> list[str]:
-    """Non-Goal triggers in any text — a tool call's payload or the user's own prompt. One line per boundary."""
-    raw = [(f"{TRIGGER_LABELS[kind]} '{trigger}'", trigger) for kind, trigger in trigger_hits(cfg, text, path)]
+def match_triggers(cfg: dict, text: str, path: str = "", kinds: tuple[str, ...] | None = None) -> list[str]:
+    """Non-Goal triggers in any text — a tool call's payload or the user's own prompt. One line per boundary.
+    `kinds` keeps only those kinds of hit (the prompt hook drops single-word keywords)."""
+    raw = [(f"{TRIGGER_LABELS[kind]} '{trigger}'", trigger) for kind, trigger in trigger_hits(cfg, text, path)
+           if kinds is None or kind in kinds]
     # one line per boundary: "forbidden dependency 'stripe', forbidden path 'billing/' → NG-1 "..." (set by the founder; ...)"
     grouped: dict[str, list[str]] = {}
     for what, trigger in raw:
@@ -1048,16 +1242,32 @@ def match_triggers(cfg: dict, text: str, path: str = "") -> list[str]:
 
 
 def check_pre_tool(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
+    """Non-Goal hits of a tool call. For a shell command the data it carries into a document — a commit message, a
+    heredoc body appended to a Markdown file — is left out: `git commit -m "docs: explain why billing is out of
+    scope"` was refused as a crossing of the billing boundary (audit 2026-09-23). `check_data_mentions` reports what
+    the data names, as `noted`."""
     text, path = text_of_tool_input(tool_name, tool_input)
+    if is_command(tool_name, tool_input):
+        text = _command_without_data(text)
     return match_triggers(cfg, text, path)
+
+
+def check_data_mentions(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
+    """Non-Goal hits that only the data of a shell command carries (see `check_pre_tool`): documentation of a
+    boundary, the same reasoning as a Write of a prose file."""
+    if not is_command(tool_name, tool_input):
+        return []
+    return match_triggers(cfg, str((tool_input or {}).get("command", "")))
 
 
 def check_warn_markers(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
     """One line per warn-only marker, each naming its boundary — the same `→ NG-n "…" (origin; source)` tail a
     refusal carries, so `report`, `doctor` and LUMIS Amend attribute a warning to a boundary exactly as they
     attribute a block. Runs for commands too: a lone word out of a long sentence shows up in `python -m …`
-    more often than anywhere else."""
+    more often than anywhere else. A commit message is data, like for a refusal."""
     text, _path = text_of_tool_input(tool_name, tool_input)
+    if is_command(tool_name, tool_input):
+        text = _command_without_data(text)
     return sorted({f"possible match with '{trigger}'" + explain(cfg, trigger) for _kind, trigger in warn_triggers(cfg, text)})
 
 
@@ -1164,6 +1374,7 @@ TECHNOLOGY_WORDS = {
     "tensorflow", "pytorch", "langchain", "pinecone", "weaviate", "chromadb",
 }
 SHORT_BOUNDARY_WORDS = 4  # longer than this, in the founder's own words, and the boundary's lone words only warn
+PHRASE_BRIDGES = {"of"}   # the one dropped word a phrase steps over (see markers_for); the product's list is the same
 # How many comma/«or»-separated items make a boundary an enumeration: «social feeds, followers, public profiles,
 # leaderboards or multiplayer» is five refusals on one line, and an item that is one rare word is that item in
 # full, so it blocks like a short boundary (field report 2026-09-21: `class Leaderboard` walked past `leaderboards`).
@@ -1238,8 +1449,19 @@ def markers_for(boundary: str, vocabulary: set) -> tuple:
               if len(t) > 3 and t not in GENERIC_ARCHITECTURAL_STOPWORDS and t not in FUNCTION_WORDS and not t.isdigit()]
     phrases = []
     for clause in clauses:
-        content = [t for t in clause.split() if len(t) > 2 and t not in FUNCTION_WORDS]
-        phrases += ["%s %s" % (a, b) for a, b in zip(content, content[1:]) if a != b]
+        # only words that stand next to each other in the founder's sentence: «users at once» is not a phrase
+        # «users once», and «editing between several» is not «editing several» — those refused `# remind users once
+        # per day` (audit 2026-09-23). A dropped word ends the run instead of being stepped over — except «of», which
+        # keeps one noun phrase together («sharing of patient records»).
+        run: list = []
+        for t in clause.split() + [""]:
+            if t in PHRASE_BRIDGES:
+                continue
+            if t and len(t) > 2 and t not in FUNCTION_WORDS:
+                run.append(t)
+                continue
+            phrases += ["%s %s" % (a, b) for a, b in zip(run, run[1:]) if a != b]
+            run = []
     # an item of an enumeration that is one rare word is that item in full: such items lead the list, because the
     # per-boundary cap cuts from the tail and a word the founder listed on its own must survive it
     enumerated = len(clauses) >= LIST_ITEMS_MIN and len(clauses[0].split()) <= LIST_HEAD_WORDS
@@ -1275,17 +1497,27 @@ TEST_DIRS = {"tests", "test", "__tests__", "spec", "specs"}
 def is_prose_path(path: str) -> bool:
     """A file that names a boundary on purpose: an ADR that explains the Non-Goal, a README line restating it, a
     test that asserts the forbidden feature is absent. Writing the boundary down is inside the boundary; only the
-    code that crosses it is not. These warn and are logged (`noted`), they are never refused."""
+    code that crosses it is not. These warn and are logged (`noted`), they are never refused.
+
+    Narrowed on 2026-09-23: the exemption followed the directory, so `docs/checkout.py` and a billing module parked in
+    `tests/fixtures/` were prose. Code is code wherever it lives; a test directory exempts its test files and the files
+    directly in it (conftest, helpers), not everything beneath it. A Markdown plan that *announces* crossing a
+    boundary is still `noted`: telling a plan that describes the Non-Goal from one that schedules it is a judgement
+    about meaning, and a text hook cannot make it — the founder reads the `noted` line and decides."""
     p = _clean_path(path)
     if not p:
         return False
     if p.endswith(PROSE_SUFFIXES):
         return True
-    segments = set(p.split("/")[:-1])
-    base = p.rsplit("/", 1)[-1]
-    if segments & DOC_DIRS or segments & TEST_DIRS:
+    parts = p.split("/")
+    base = parts[-1]
+    if base.startswith(("test_", "test-")) or any(m in base for m in ("_test.", ".test.", ".spec.", "_spec.")):
         return True
-    return base.startswith(("test_", "test-")) or any(m in base for m in ("_test.", ".test.", ".spec.", "_spec."))
+    if len(parts) > 1 and parts[-2] in TEST_DIRS:
+        return True  # tests/conftest.py, spec/helpers.rb: the support files a test directory holds
+    if p.endswith(CODE_SUFFIXES):
+        return False
+    return bool(set(parts[:-1]) & DOC_DIRS)
 
 
 UI_FILE_SUFFIXES = (".css", ".scss", ".html", ".jsx", ".tsx", ".vue", ".svelte", ".astro", ".js", ".ts")
@@ -1371,6 +1603,973 @@ def check_architecture(cfg: dict, tool_name: str, tool_input: dict) -> list[str]
     return sorted(set(hits))
 
 
+# --- boundary classes: what is the founder's to decide whatever the Non-Goals say ----------------------------------
+# A Non-Goal names a feature. Three things are the founder's in every project and no Non-Goal sentence spells them:
+# a dependency added to the stack, a command that leaves the machine (a push, a publish, a deploy), a write outside
+# the project. Each is held for approval by default ("ask"); `"classes"` in the config sets allow | ask | block.
+# Read-only commands are never a class hit, and a package the Non-Goals already forbid stays a refusal: the class
+# check runs only after the Non-Goal check found nothing.
+PIP_VALUE_FLAGS = {"-r", "--requirement", "-c", "--constraint", "-e", "--editable", "-i", "--index-url", "--extra-index-url",
+                   "-f", "--find-links", "-t", "--target", "--prefix", "--root", "--src", "--upgrade-strategy", "--python-version",
+                   "--platform", "--implementation", "--abi", "--only-binary", "--no-binary", "--progress-bar", "--log",
+                   "--cache-dir", "--trusted-host", "--proxy", "--timeout", "--retries", "--python", "-p", "--group", "-G",
+                   # these take a value too: without them `pip install -e . --config-settings editable_mode=compat` held
+                   # `editable_mode` as a new dependency, `--exists-action w` held `w` (audit 2026-09-23)
+                   "--config-settings", "-C", "--exists-action", "--report", "--use-feature", "--use-deprecated",
+                   "--global-option", "--install-option", "--root-user-action", "--keyring-provider", "--cert",
+                   "--client-cert", "--extra", "--extras", "-E", "--source", "--markers", "--index", "--default-index",
+                   "--index-strategy", "--resolution", "--prerelease", "--python-platform", "--categories", "--package"}
+JS_VALUE_FLAGS = {"--registry", "--prefix", "-w", "--workspace", "--filter", "-F", "--cwd", "--tag", "--save-prefix", "--scope",
+                  # `npm install --omit dev` held `dev`, `--loglevel error` held `error` (audit 2026-09-23)
+                  "--omit", "--include", "--loglevel", "--cache", "--userconfig", "--install-strategy", "--before", "--otp",
+                  "--location", "--dir"}
+OTHER_VALUE_FLAGS = {"-v", "--version", "--source", "--git", "--branch", "--rev", "--path", "--features", "-F", "--package", "-p",
+                     "--group", "-G", "--registry", "--vers", "--rename"}
+CONDA_VALUE_FLAGS = {"-c", "--channel", "-n", "--name", "-p", "--prefix", "--file", "--solver", "--repodata-fn"}
+# An unknown long flag followed by one of these words: the word is the flag's value, not a package
+# (`--omit dev`, `--loglevel error`, `--exists-action w`).
+FLAG_VALUE_WORDS = {"dev", "prod", "production", "development", "optional", "peer", "error", "warn", "silent", "info",
+                    "verbose", "http", "timing", "notice", "true", "false", "global", "project", "user", "w", "s", "i", "b", "a"}
+# manager -> subcommands that name a package to add. The same manager with no package named (`npm install`,
+# `pip install -r requirements.txt`, `uv sync`, `bundle install`) installs what is already declared: not a change.
+ADD_SUBCOMMANDS = {
+    "pip": {"install"}, "uv": {"add"}, "poetry": {"add"}, "pipenv": {"install"},
+    "npm": {"install", "i", "add", "in"}, "pnpm": {"add", "install", "i"}, "yarn": {"add"}, "bun": {"add", "a", "install", "i"},
+    "expo": {"install"}, "cargo": {"add"}, "go": {"get"}, "gem": {"install"}, "bundle": {"add"}, "composer": {"require"},
+    "conda": {"install"}, "mamba": {"install"}, "micromamba": {"install"},
+}
+# a tool installed for the whole machine (`npm install -g vercel`) is not a dependency of this project; `pipx`,
+# `uv tool install`, `cargo install`, `go install` and `yarn global add` never reach ADD_SUBCOMMANDS for the same reason
+GLOBAL_INSTALL_FLAGS = {"-g", "--global", "--location=global"}
+# upgrading the installer itself is housekeeping, not a dependency of the product
+INSTALLER_SELF = {"pip", "setuptools", "wheel", "npm", "pnpm", "yarn", "uv", "poetry", "bun"}
+GH_OUTBOUND = {("repo", "create"), ("repo", "delete"), ("repo", "rename"), ("repo", "edit"), ("repo", "archive"),
+               ("repo", "fork"), ("repo", "sync"), ("release", "create"), ("release", "upload"), ("release", "delete"),
+               ("release", "edit"), ("pr", "merge"), ("pr", "create"), ("gist", "create"), ("alias", "set"),
+               ("secret", "set"), ("secret", "delete"), ("variable", "set"), ("variable", "delete")}
+# gh's own commands. Anything else after `gh` is an alias or an extension the guard cannot read (`gh alias set rd
+# 'repo delete'` and then `gh rd x/y`), so it is held rather than guessed at.
+GH_COMMANDS = {"auth", "browse", "codespace", "cs", "gist", "issue", "org", "pr", "project", "release", "repo", "cache",
+               "run", "workflow", "alias", "api", "completion", "config", "extension", "extensions", "ext", "gpg-key",
+               "label", "ruleset", "rs", "search", "secret", "ssh-key", "status", "variable", "attestation", "copilot",
+               "help", "agent-task", "preview", "accessibility", "licenses", "version"}
+# (executable, first word) pairs that publish, deploy or rewrite something that is not on this machine
+OUTBOUND_VERBS = {
+    ("twine", "upload"), ("cargo", "publish"), ("docker", "push"), ("podman", "push"),
+    ("flyctl", "deploy"), ("fly", "deploy"), ("railway", "up"), ("railway", "deploy"),
+    ("wrangler", "publish"), ("wrangler", "deploy"), ("vercel", "deploy"), ("netlify", "deploy"), ("firebase", "deploy"),
+    ("serverless", "deploy"), ("sls", "deploy"),
+    ("uv", "publish"), ("poetry", "publish"), ("flit", "publish"), ("hatch", "publish"), ("pdm", "publish"),
+    ("bun", "publish"), ("gem", "push"), ("mvn", "deploy"), ("gradle", "publish"), ("gradlew", "publish"),
+    ("terraform", "apply"), ("terraform", "destroy"), ("tofu", "apply"), ("tofu", "destroy"),
+    ("pulumi", "up"), ("pulumi", "destroy"), ("helm", "install"), ("helm", "upgrade"), ("helm", "uninstall"),
+    ("helm", "rollback"), ("kubectl", "apply"), ("kubectl", "create"), ("kubectl", "delete"), ("kubectl", "replace"),
+    ("kubectl", "patch"), ("kubectl", "rollout"), ("kubectl", "scale"), ("kubectl", "edit"), ("kubectl", "set"),
+}
+# git configuration that redirects what a later command does: an alias (`alias.p=push`, then `git p`), a remote's
+# URL (the same effect as the held `git remote set-url`), a URL rewrite
+GIT_REDIRECT_KEY = re.compile(r"^(?:alias\..+|remote\..+\.(?:url|pushurl)|url\..+\.(?:insteadof|pushinsteadof))$", re.I)
+COPY_MOVE = {"cp", "mv", "copy", "move", "xcopy", "robocopy", "copy-item", "cpi", "move-item", "mi"}
+CMD_SWITCH = re.compile(r"^/[A-Za-z]+(?::\S*)?$")  # `copy /Y`, `robocopy /MIR`: a switch of a cmd verb, not a path
+CMD_VERBS = {"copy", "move", "xcopy", "robocopy", "del", "erase", "rd", "md"}
+# What removes or creates the paths it is given: each of them is a write to that path (audit 2026-09-23 — `rm -rf
+# C:/Users/…/Documents`, `Remove-Item ..\sibling`, `touch ../x`, `mkdir ../newdir` all walked past the class).
+PATH_WRITERS = {"rm", "rmdir", "rd", "del", "erase", "unlink", "shred", "truncate", "touch", "mkdir", "md",
+                "remove-item", "ri", "new-item", "ni"}
+# the flags of each that take a value; `-r` is a value only for truncate and touch — for rm it is "recursive"
+PATH_WRITER_VALUE_FLAGS = {"truncate": {"-s", "--size", "-r", "--reference"}, "touch": {"-d", "--date", "-t", "-r", "--reference"},
+                           "shred": {"-n", "--iterations", "-s", "--size"}, "mkdir": {"-m", "--mode"}, "md": {"-m", "--mode"},
+                           "new-item": {"-itemtype", "-type", "-name", "-value"}, "ni": {"-itemtype", "-type", "-name", "-value"}}
+PS_ITEM_FLAGS = {"-include", "-exclude", "-filter"}
+# PowerShell's writers: the target is -Path / -FilePath / -LiteralPath, or the first positional
+PS_WRITERS = {"set-content", "sc", "add-content", "ac", "out-file", "clear-content", "clc", "export-csv", "export-clixml"}
+PS_VALUE_FLAGS = {"-value", "-encoding", "-width", "-inputobject", "-delimiter", "-stream", "-filter", "-include", "-exclude"}
+PS_PATH_FLAGS = {"-path", "-literalpath", "-filepath", "-pspath", "-lp"}
+# The agent's own client keeps state in its home folder: its memory, its sessions, its plans. Writing those is not
+# "outside the project" for this class, and asking about them on every turn would teach the founder to click "yes".
+# Only these state folders are open; the rest of an agent's home — ~/.codex/config.toml (approval and sandbox
+# policy), ~/.cursor/mcp.json (a new MCP server), ~/.claude/hooks, agents and commands — is configuration that
+# changes what the agent may do, and it is held like any other write outside the project (audit 2026-09-23).
+AGENT_STATE_DIRS = (".claude/projects", ".claude/todos", ".claude/plans", ".claude/shell-snapshots", ".claude/statsig",
+                    ".claude/ide", ".codex/sessions", ".codex/log", ".codeium/windsurf/memories")
+# what only starts another command: `time git push`, `command git push`, `exec git push`, `xargs git push`
+COMMAND_PREFIXES = {"time", "command", "exec", "builtin", "nice", "ionice", "xargs", "watch", "stdbuf", "chronic",
+                    "unbuffer", "caffeinate", "noglob", "call", "start"}
+PREFIX_VALUE_FLAGS = {"-n", "-i", "-I", "-L", "-P", "-d", "-a", "-s", "-E", "-c", "-o", "-e", "--max-args", "--max-procs",
+                      "--delimiter", "--arg-file", "--replace", "--interval", "--adjustment"}
+# a shell reading its script from a pipe runs whatever the left side prints: `echo git push | sh`
+PIPE_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "pwsh", "powershell", "iex", "invoke-expression"}
+START_PROCESS_VALUE_FLAGS = {"-workingdirectory", "-windowstyle", "-verb", "-redirectstandardoutput",
+                             "-redirectstandarderror", "-redirectstandardinput", "-credential"}
+
+
+def _exe_name(token: str) -> str:
+    exe = str(token or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        if exe.endswith(suffix):
+            return exe[: -len(suffix)]
+    return exe
+
+
+def _split_shell(text: str) -> list[tuple[str, str]]:
+    """(segment, the separator in front of it) for a shell line, split on `;`, `&&`, `||`, `|`, `&` and newlines —
+    outside quotes. `echo "done; git push later" >> NOTES.txt` is one command, not two; `>|`, `2>&1`, `&>` are
+    redirects, `git push&` is a push sent to the background (audit 2026-09-23)."""
+    s = str(text or "")
+    out: list[tuple[str, str]] = []
+    buf: list[str] = []
+    sep = ""
+    quote = ""
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "'\"`":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        pair = s[i:i + 2]
+        prev = s[i - 1] if i else ""
+        if pair in ("&&", "||"):
+            out.append(("".join(buf), sep))
+            buf, sep = [], pair
+            i += 2
+            continue
+        if ch == "|" and prev != ">":
+            out.append(("".join(buf), sep))
+            buf, sep = [], "|"
+            i += 2 if pair == "|&" else 1
+            continue
+        if ch == "&" and prev not in "<>" and s[i + 1:i + 2] != ">":
+            out.append(("".join(buf), sep))
+            buf, sep = [], "&"
+            i += 1
+            continue
+        if ch in ";\n":
+            out.append(("".join(buf), sep))
+            buf, sep = [], ch
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    out.append(("".join(buf), sep))
+    return [(seg, sep) for seg, sep in out if seg.strip()]
+
+
+def _shell_tokens(segment: str) -> list[str]:
+    """Words of one command with the quotes taken off and quoted spaces kept: `"C:\\Program Files\\Git\\bin\\git.exe"
+    push` is two words, `cp a.txt "../my dir/"` is three. Backslashes are not escapes here — on Windows they are
+    the path separator."""
+    import shlex
+
+    try:
+        lex = shlex.shlex(str(segment or ""), posix=True)
+        lex.whitespace_split = True
+        lex.escape = ""
+        lex.commenters = ""
+        return [t for t in lex if t]
+    except ValueError:  # an unbalanced quote: the plain split is the best reading left
+        return [t.strip("'\"`") for t in str(segment or "").split() if t.strip("'\"`")]
+
+
+def _start_process(tokens: list[str]) -> list[str]:
+    """`Start-Process git -ArgumentList push` -> ['git', 'push']."""
+    prog, args = "", []
+    i = 1
+    while i < len(tokens):
+        a, low = tokens[i], tokens[i].lower()
+        if low == "-filepath" and i + 1 < len(tokens):
+            prog, i = tokens[i + 1], i + 2
+            continue
+        if low in ("-argumentlist", "-args") and i + 1 < len(tokens):
+            args += [x for x in re.split(r"[,\s]+", tokens[i + 1]) if x]
+            i += 2
+            continue
+        if low.startswith("-"):
+            i += 2 if low in START_PROCESS_VALUE_FLAGS else 1
+            continue
+        if not prog:
+            prog = a
+        else:
+            args += [x for x in re.split(r"[,\s]+", a) if x]
+        i += 1
+    return [prog] + args if prog else []
+
+
+def _bare_command(tokens: list[str]) -> list[str]:
+    """The command itself, with what only surrounds it taken off: a group (`(git push)`, `{ git push; }`), a
+    background `&`, leading `VAR=value` assignments, `npx`, prefixes (`time`, `command`, `exec`, `xargs`, `watch`,
+    `nice -n 5`) and `Start-Process`."""
+    tokens = [t for t in tokens if t]
+    for _ in range(8):
+        while tokens and tokens[0] in ("(", "{", "!", "if", "then", "do", "else", "elif", "while", "until"):
+            tokens = tokens[1:]
+        if tokens and tokens[0].startswith("(") and not tokens[0].startswith("(("):
+            tokens = [tokens[0].lstrip("(")] + tokens[1:]
+        while tokens and tokens[-1] in (")", "}", "&", "fi", "done"):
+            tokens = tokens[:-1]
+        if tokens and tokens[-1].endswith((")", "}")) and not tokens[-1].startswith("$("):
+            tokens = tokens[:-1] + [tokens[-1].rstrip(")}")]
+        tokens = [t for t in tokens if t]
+        while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+            tokens = tokens[1:]
+        if not tokens:
+            return []
+        exe = _exe_name(tokens[0])
+        if exe in ("npx", "pnpx", "bunx") or exe in COMMAND_PREFIXES:
+            rest = tokens[1:]
+            while rest and (rest[0].startswith("-") or rest[0].isdigit() or rest[0] == ""
+                            or (exe in ("start", "call") and CMD_SWITCH.match(rest[0]))):
+                rest = rest[2:] if (rest[0] in PREFIX_VALUE_FLAGS and exe not in ("npx", "pnpx", "bunx")) else rest[1:]
+            tokens = rest
+            continue
+        if exe in ("start-process", "saps"):
+            tokens = _start_process(tokens)
+            continue
+        return tokens
+    return tokens
+
+
+def _command_words(text: str, depth: int = 0) -> list[list[str]]:
+    """The commands a shell line runs, as token lists: separators read outside quotes, wrappers opened (`bash -c`,
+    `sudo`, `env X=1`), `eval` and a pipe into a shell read as the command they run, `$(…)` read too, and
+    `_bare_command` applied. What `cd` does to them is left to the caller."""
+    out: list[list[str]] = []
+    prev: list[str] = []
+    for segment, sep in _split_shell(text):
+        if depth < 2:
+            for a, b in re.findall(r"\$\(([^()]*)\)|`([^`]*)`", segment):
+                if (a or b).strip():
+                    out += _command_words(a or b, depth + 1)
+        inner = _wrapped_command(segment)
+        if inner and depth < 2:
+            out += _command_words(inner, depth + 1)
+            prev = []
+            continue
+        tokens = _bare_command(_shell_tokens(segment))
+        if not tokens:
+            prev = []
+            continue
+        exe = _exe_name(tokens[0])
+        if exe == "eval" and depth < 2:
+            out += _command_words(" ".join(tokens[1:]), depth + 1)
+            prev = []
+            continue
+        if (sep == "|" and exe in PIPE_SHELLS and all(t.startswith("-") for t in tokens[1:]) and prev
+                and _exe_name(prev[0]) in ("echo", "printf", "write-output") and depth < 2):
+            out += _command_words(" ".join(t for t in prev[1:] if not t.startswith("-")), depth + 1)
+        out.append(tokens)
+        prev = tokens
+    return out
+
+
+def _package_name(token: str) -> str:
+    """`stripe>=5` -> stripe, `@scope/pkg@1.2` -> @scope/pkg, `serde@1` -> serde; a URL is kept as it is."""
+    t = token.strip()
+    if "://" in t or t.startswith("git+"):
+        return t[:120]
+    if t.startswith("@"):
+        return "@" + t[1:].split("@", 1)[0]
+    return re.split(r"[<>=!~\[;@:\s]", t, maxsplit=1)[0]
+
+
+def _pep503(name: str) -> str:
+    """One spelling per package for comparing names: lower case, runs of `-`, `_`, `.` as one `-` (PyPI's own rule).
+    It never makes `fast-api` equal `fastapi`: those are two different projects."""
+    return re.sub(r"[-_.]+", "-", str(name or "").strip().lower())
+
+
+def _is_local_path(token: str) -> bool:
+    """`.`, `./dist/x.whl`, `../lib`, `C:\\wheels\\x.whl`: the project or a local build, not a package from outside."""
+    t = token.strip()
+    if "://" in t or t.startswith("git+"):
+        return False
+    return (t.startswith((".", "/", "~")) or "\\" in t or bool(re.match(r"^[A-Za-z]:", t))
+            or t.endswith((".whl", ".tar.gz", ".tgz", ".zip")))
+
+
+def _named(args: list[str], value_flags: set[str]) -> list[str]:
+    """The positional arguments, with the value of each flag that takes one skipped. After a long flag this list
+    does not know, a word that is an ordinary flag value (`dev`, `error`, `w`) is taken as that flag's value."""
+    out: list[str] = []
+    skip = False
+    after_unknown = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-"):
+            skip = a in value_flags
+            after_unknown = not skip and a.startswith("--") and "=" not in a
+            continue
+        if after_unknown and a.lower() in FLAG_VALUE_WORDS:
+            after_unknown = False
+            continue
+        after_unknown = False
+        out.append(a)
+    return out
+
+
+def dependency_additions(command: str) -> list[str]:
+    """The packages a shell command adds to the project, by name. Empty for an install of what is already declared,
+    and for a tool installed for the whole machine (`npm install -g`)."""
+    found: list[str] = []
+    for tokens in _command_words(command):
+        exe, rest = _exe_name(tokens[0]), tokens[1:]
+        if re.match(r"^(?:python|py)(?:\d+(?:\.\d+)?)?$", exe) and "-m" in rest:
+            i = rest.index("-m")
+            if i + 1 < len(rest) and re.match(r"^pip\d*(?:\.\d+)?$", rest[i + 1].lower()):
+                exe, rest = "pip", rest[i + 2:]
+            else:
+                continue
+        elif re.match(r"^pip\d+(?:\.\d+)?$", exe):
+            exe = "pip"
+        if exe == "uv" and rest[:1] and rest[0].lower() == "pip":
+            exe, rest = "pip", rest[1:]
+        if exe == "dotnet":  # `dotnet add [<project>] package <name>`
+            words = [a for a in rest if not a.startswith("-")]
+            low = [w.lower() for w in words]
+            if low[:1] == ["add"] and "package" in low[1:3] and low.index("package") + 1 < len(words):
+                name = words[low.index("package") + 1]
+                if name not in found:
+                    found.append(name)
+            continue
+        subs = ADD_SUBCOMMANDS.get(exe)
+        if not subs:
+            continue
+        words = [a for a in rest if not a.startswith("-")]
+        if not words or words[0].lower() not in subs:
+            continue
+        low_rest = [a.lower() for a in rest]
+        if any(a in GLOBAL_INSTALL_FLAGS for a in low_rest) or any(
+                a == "--location" and low_rest[i + 1:i + 2] == ["global"] for i, a in enumerate(low_rest)):
+            continue  # a tool for the machine, not a dependency of this project
+        after = rest[rest.index(words[0]) + 1:]
+        flags = PIP_VALUE_FLAGS if exe in ("pip", "uv", "poetry", "pipenv") else (
+            JS_VALUE_FLAGS if exe in ("npm", "pnpm", "yarn", "bun", "expo") else
+            CONDA_VALUE_FLAGS if exe in ("conda", "mamba", "micromamba") else OTHER_VALUE_FLAGS)
+        for arg in _named(after, flags):
+            if _is_local_path(arg):
+                continue
+            name = _package_name(arg)
+            if name and name.lower() not in INSTALLER_SELF and name not in found:
+                found.append(name)
+    return found
+
+
+# --- what a dependency manifest declares ----------------------------------------------------------------------
+MANIFEST_FILE = re.compile(r"^(?:requirements[\w.\-]*\.(?:txt|in)|pyproject\.toml|package\.json|cargo\.toml|go\.mod|"
+                           r"gemfile|composer\.json|pipfile)$", re.I)
+PACKAGE_JSON_DEPENDENCIES = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies", "require",
+                             "require-dev")
+MANIFEST_SKIP_DIRS = {"node_modules", ".git", ".venv", "venv", "env", "__pycache__", "dist", "build", "target", "vendor"}
+
+
+def _is_manifest(path: str) -> bool:
+    parts = str(path or "").replace("\\", "/").rstrip("/").split("/")
+    return bool(MANIFEST_FILE.match(parts[-1])) or (len(parts) > 1 and parts[-2].lower() == "requirements"
+                                                     and parts[-1].lower().endswith((".txt", ".in")))
+
+
+def _toml_names(text: str) -> set[str]:
+    """Package names a pyproject.toml, Pipfile or Cargo.toml declares — read line by line, because the hook runs on
+    Python 3.9 and `tomllib` arrived in 3.11. Arrays (`dependencies = ["stripe>=5"]`) and tables
+    (`[tool.poetry.dependencies]`, `[dependencies]`, `[packages]`) are both read."""
+    names: set[str] = set()
+    section = ""
+    in_array = False
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if in_array:
+            names |= {_package_name(s) for s in re.findall(r"[\"']([^\"']+)[\"']", line.split(" #", 1)[0])}
+            in_array = "]" not in line
+            continue
+        if line.startswith("["):
+            section = line.strip("[] ").lower()
+            continue
+        m = re.match(r"^([A-Za-z0-9_.\-\"']+)\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        key, value = m.group(1).strip("\"'"), m.group(2).strip()
+        dep_section = ("dependencies" in section or "dependency-groups" in section
+                       or section in ("packages", "dev-packages"))
+        if value.startswith("[") and (dep_section or key.lower() in ("dependencies", "requires", "dev-dependencies")):
+            names |= {_package_name(s) for s in re.findall(r"[\"']([^\"']+)[\"']", value.split(" #", 1)[0])}
+            in_array = "]" not in value
+        elif dep_section and key.lower() != "python" and not value.startswith("["):
+            names.add(key)
+    return {n for n in names if n}
+
+
+def declared_names(text: str, filename: str) -> set[str]:
+    """What one manifest declares, as `_pep503` names."""
+    base = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    names: set[str] = set()
+    if base in ("package.json", "composer.json"):
+        try:
+            data = json.loads(text or "{}")
+        except Exception:
+            data = {}
+        for key in PACKAGE_JSON_DEPENDENCIES:
+            if isinstance(data, dict) and isinstance(data.get(key), dict):
+                names |= set(data[key])
+    elif base in ("pyproject.toml", "pipfile", "cargo.toml"):
+        names = _toml_names(text)
+    elif base == "go.mod":
+        names = set(re.findall(r"^\s*(?:require\s+)?([\w.\-]+\.[\w.\-]+/[^\s]+)\s+v\d", str(text or ""), re.M))
+    elif base == "gemfile":
+        names = set(re.findall(r"^\s*gem\s+[\"']([^\"']+)[\"']", str(text or ""), re.M))
+    else:  # requirements*.txt / *.in
+        for raw in str(text or "").splitlines():
+            line = raw.split(" #", 1)[0].strip()
+            if line and not line.startswith(("#", "-")) and not _is_local_path(line):
+                names.add(_package_name(line))
+    return {_pep503(n) for n in names if n}
+
+
+def project_declared_packages(root: Path) -> set[str]:
+    """Everything the project's manifests already declare, at the root and one folder down (`frontend/package.json`,
+    `requirements/dev.txt`). `pip install pytest` after an ImportError, for a package requirements.txt names, is
+    not a change of the stack (audit 2026-09-23)."""
+    found: set[str] = set()
+    try:
+        files = [p for p in root.iterdir() if p.is_file() and _is_manifest(p.name)]
+        for d in root.iterdir():
+            if d.is_dir() and not d.name.startswith(".") and d.name.lower() not in MANIFEST_SKIP_DIRS:
+                files += [p for p in d.iterdir() if p.is_file() and _is_manifest(f"{d.name}/{p.name}")]
+    except Exception:
+        files = []
+    for p in files[:60]:
+        try:
+            found |= declared_names(p.read_text(encoding="utf-8", errors="replace")[:400_000], p.name)
+        except Exception:
+            continue
+    return found
+
+
+def manifest_additions(tool_name: str, tool_input: dict) -> list[str]:
+    """The packages a Write or an Edit adds to a dependency manifest: requirements*.txt, pyproject.toml,
+    package.json, Pipfile, Cargo.toml, go.mod, Gemfile, composer.json. Adding `stripe` to package.json and then
+    running `npm install` added a dependency with no event at all (audit 2026-09-23): the install of a declared
+    manifest is rightly not held, so the declaration is where the stack changes. An Edit is applied to the file as it
+    is on disk; an edit that would not apply is left to the client, which refuses it anyway."""
+    tool_input = tool_input or {}
+    if is_command(tool_name, tool_input) or is_read_only_tool(tool_name, tool_input):
+        return []
+    _text, path = text_of_tool_input(tool_name, tool_input)
+    if not path or not _is_manifest(path):
+        return []
+    target = Path(path) if os.path.isabs(path) else project_root() / path
+    try:
+        old = target.read_text(encoding="utf-8", errors="replace") if target.is_file() else ""
+    except Exception:
+        old = ""
+    content = next((tool_input[k] for k in ("content", "contents") if isinstance(tool_input.get(k), str)), None)
+    if content is not None:
+        new = content
+    else:
+        edits: list[tuple[str, str, bool]] = []
+        for e in [tool_input] + [x for x in (tool_input.get("edits") or []) if isinstance(x, dict)]:
+            o = next((e[k] for k in ("old_string", "old_str", "oldText", "old_text") if isinstance(e.get(k), str)), None)
+            n = next((e[k] for k in EDIT_BODY_KEYS if isinstance(e.get(k), str)), None)
+            if o is not None and n is not None:
+                edits.append((o, n, bool(e.get("replace_all"))))
+        if not edits:
+            return []
+        new = old
+        for o, n, every in edits:
+            if not o and not new:
+                new = n
+                continue
+            if not o or o not in new:
+                return []
+            new = new.replace(o, n) if every else new.replace(o, n, 1)
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return sorted(declared_names(new, name) - declared_names(old, name))
+
+
+def stack_packages(cfg: dict) -> set[str]:
+    """Package names the founder's approved stack already names, spelled exactly (`_pep503`): `FastAPI` is fastapi,
+    `Next.js` is next, `Tailwind CSS` is tailwindcss or tailwind-css, plus the technology names in the pack's stored
+    vocabulary. Not the idea's other words and not a hyphen-stripped form: `fast-api` is another PyPI project than
+    `fastapi`, and `pip install <any idea word>` passed silently while the message claimed the stack was checked
+    (audit 2026-09-23)."""
+    names: set[str] = set()
+    stack = str((cfg or {}).get("stack") or "").lower()
+    for item in re.split(r"[,;()\n+]|\band\b|\bwith\b|\bплюс\b", stack):
+        words = re.findall(r"[a-z0-9@][a-z0-9._@/\-]*", item)
+        for w in words:
+            w = w.rstrip(".")
+            names |= {w, re.sub(r"\.?js$", "", w) if w.endswith("js") and len(w) > 3 else w}
+        for a, b in zip(words, words[1:]):
+            names |= {a + b, f"{a}-{b}"}
+    vocabulary = {str(w).lower() for w in (cfg or {}).get("vocabulary") or []}
+    names |= vocabulary & TECHNOLOGY_WORDS
+    return {_pep503(n) for n in names if n}
+
+
+def _git_subcommand(args: list[str]) -> tuple[str, list[str], list[str]]:
+    """(subcommand, what follows it, the `-c key=value` settings) for `git [-C dir] [-c k=v] <sub> ...`."""
+    i = 0
+    settings: list[str] = []
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-c" and i + 1 < len(args):
+            settings.append(args[i + 1])
+        i += 2 if args[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env") else 1
+    return ((args[i].lower(), args[i + 1:]) if i < len(args) else ("", [])) + (settings,)
+
+
+def _git_config_key(args_after_config: list[str]) -> str:
+    positional: list[str] = []
+    skip = False
+    for a in args_after_config:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-"):
+            skip = a.lower() in GIT_CONFIG_VALUE_FLAGS
+            continue
+        positional.append(a)
+    if positional[:1] and positional[0].lower() in ("set", "unset"):
+        positional = positional[1:]
+    return positional[0] if positional else ""
+
+
+def _remote_spec(token: str) -> bool:
+    """`host:path`, `user@host:path`, `rsync://host/…` — and not `C:\\x` or `C:/x`."""
+    t = str(token or "")
+    if t.startswith("rsync://"):
+        return True
+    return bool(re.match(r"^[^\s/\\:]+:", t)) and not re.match(r"^[A-Za-z]:(?:[\\/]|$)", t)
+
+
+def outbound_actions(command: str) -> list[str]:
+    """What in a shell command leaves the machine or rewrites a remote: `git push`, `gh repo delete`, `npm publish`,
+    `docker push`, a deploy, an upload. Named the way the log will show them."""
+    found: list[str] = []
+    for tokens in _command_words(command):
+        exe = _exe_name(tokens[0])
+        if re.match(r"^(?:python|py)(?:\d+(?:\.\d+)?)?$", exe) and "-m" in tokens[1:]:
+            i = tokens.index("-m")
+            if i + 1 >= len(tokens):
+                continue
+            tokens = tokens[i + 1:]  # `python -m twine upload` is twine
+            exe = _exe_name(tokens[0])
+        words = [a.lower() for a in tokens[1:] if not a.startswith("-")]
+        flags = [a.lower() for a in tokens[1:] if a.startswith("-")]
+        hit = ""
+        if exe == "git":
+            sub, after, settings = _git_subcommand(tokens[1:])
+            rest = [a.lower() for a in after if not a.startswith("-")]
+            redirect = next((s.split("=", 1)[0] for s in settings if GIT_REDIRECT_KEY.match(s.split("=", 1)[0])), "")
+            if redirect:
+                hit = f"git -c {redirect}"
+            elif sub == "push" and not any(a in ("-n", "--dry-run") for a in after):
+                hit = "git push"
+            elif sub == "remote" and rest[:1] and rest[0] in ("add", "set-url"):
+                hit = f"git remote {rest[0]}"
+            elif sub == "config" and git_config_writes(after) and GIT_REDIRECT_KEY.match(_git_config_key(after)):
+                hit = f"git config {_git_config_key(after)}"
+            elif sub == "send-pack":
+                hit = "git send-pack"
+            elif sub == "subtree" and rest[:1] == ["push"]:
+                hit = "git subtree push"
+            elif sub == "svn" and rest[:1] == ["dcommit"]:
+                hit = "git svn dcommit"
+        elif exe == "gh":
+            if words[:1] == ["api"]:
+                method = ""
+                for i, a in enumerate(tokens):
+                    if a in ("-X", "--method") and i + 1 < len(tokens):
+                        method = tokens[i + 1].upper()
+                    elif a.startswith("--method="):
+                        method = a.split("=", 1)[1].upper()
+                    elif a.startswith("-X") and len(a) > 2:
+                        method = a[2:].upper()
+                if not method and any(a in ("-f", "-F", "--field", "--raw-field", "--input")
+                                      or a.startswith(("--field=", "--raw-field=", "--input=")) for a in tokens):
+                    method = "POST"  # gh api sends a POST as soon as a field is given
+                if method and method != "GET":
+                    hit = f"gh api {method}"
+            elif tuple(words[:2]) in GH_OUTBOUND:
+                hit = f"gh {words[0]} {words[1]}"
+            elif words and words[0] not in GH_COMMANDS:
+                hit = f"gh {words[0]} (an alias or extension the guard cannot read)"
+        elif exe in ("npm", "pnpm", "yarn") and words[:1] == ["publish"]:
+            hit = f"{exe} publish"
+        elif exe == "yarn" and words[:2] == ["npm", "publish"]:
+            hit = "yarn npm publish"
+        elif exe == "docker" and (words[:2] == ["image", "push"]):
+            hit = "docker push"
+        elif exe == "docker" and (words[:1] == ["build"] or words[:2] in (["buildx", "build"], ["buildx", "bake"])) and (
+                "--push" in flags or any("type=registry" in a for a in flags)):
+            hit = "docker build --push"
+        elif exe == "dotnet" and words[:2] == ["nuget", "push"]:
+            hit = "dotnet nuget push"
+        elif exe == "aws" and words[:1] == ["s3"] and words[1:2] and (
+                words[1] in ("rm", "rb") or (words[1] in ("cp", "sync", "mv") and words[-1:] and words[-1].startswith("s3://"))):
+            hit = f"aws s3 {words[1]}"
+        elif exe in ("aws", "gcloud", "az") and "deploy" in words:
+            hit = f"{exe} … deploy"
+        elif exe == "supabase" and (words[:2] == ["db", "push"] or "deploy" in words[:2]):
+            hit = f"supabase {' '.join(words[:2])}"
+        elif exe in ("scp", "rsync"):
+            positional = [a for a in tokens[1:] if not a.startswith("-")]
+            if positional and _remote_spec(positional[-1]):
+                hit = f"{exe} to a remote host"
+        elif exe == "curl" and any(a in ("-T", "--upload-file") or a.startswith("--upload-file=") for a in tokens[1:]):
+            hit = "curl --upload-file"
+        elif exe == "surge":
+            hit = "surge"  # surge publishes whatever folder it is given
+        elif (exe, words[0] if words else "") in OUTBOUND_VERBS:
+            hit = f"{exe} {words[0]}" if words else exe
+        elif exe == "vercel" and not words:
+            hit = "vercel"  # a bare `vercel` deploys
+        if hit and hit not in found:
+            found.append(hit)
+    return found
+
+
+def _home() -> str:
+    try:
+        home = os.path.expanduser("~")
+        return "" if home == "~" else home
+    except Exception:
+        return ""
+
+
+def _within(path: str, base: str) -> bool:
+    try:
+        p = os.path.normcase(os.path.realpath(path))
+        b = os.path.normcase(os.path.realpath(base))
+        return os.path.commonpath([p, b]) == b
+    except Exception:
+        return False  # another drive on Windows, or a path the OS cannot read
+
+
+def _allowed_outside() -> list[str]:
+    """Where a write outside the project is not the founder's question: the system temp folder, the guard's own
+    folder in the home directory (its baseline; a write there is a tamper refusal anyway), the agents' state folders."""
+    bases: list[str] = []
+    try:
+        import tempfile
+
+        bases.append(tempfile.gettempdir())
+    except Exception:
+        pass
+    try:
+        bases.append(str(baseline_home().parent))
+    except Exception:
+        pass
+    home = _home()
+    if home:
+        bases += [os.path.join(home, ".lumis")] + [os.path.join(home, *d.split("/")) for d in AGENT_STATE_DIRS]
+    return bases
+
+
+def _resolve_target(raw: str, cwd: Path | None) -> str:
+    """The absolute path a written-to token names, or "" when it cannot be read (a variable, a flag, a relative path
+    after a `cd` the hook could not follow)."""
+    t = str(raw or "").strip().strip("'\"`")
+    if not t or t.startswith(("-", "&")) or len(t) > 1024:
+        return ""
+    home = _home()
+    if home:
+        t = re.sub(r"^(?:~|\$\{?HOME\}?|\$env:USERPROFILE|%USERPROFILE%)(?=$|[/\\])", lambda _m: home, t, flags=re.I)
+    if "$" in t or "%" in t or t.startswith("~"):
+        return ""
+    if os.name == "nt":
+        t = re.sub(r"^/([A-Za-z])(?=/|$)", r"\1:", t)  # Git Bash spells C:\x as /c/x
+    if os.path.isabs(t) or t.startswith(("/", "\\")):
+        return os.path.abspath(t)
+    return os.path.abspath(str(cwd / t)) if cwd is not None else ""
+
+
+def _outside_root(raw: str, cwd: Path | None) -> bool:
+    low = str(raw or "").strip().strip("'\"`").replace("\\", "/").lower()
+    if low.startswith("/"):
+        # `..` is resolved before the scratch-place test: `/tmp/../Users/x/evil.py` is /Users/x/evil.py, and the raw
+        # string starting with /tmp/ let it through (audit 2026-09-23)
+        import posixpath
+
+        low = posixpath.normpath(low)
+    if low in ("nul", "con", "/dev/null") or low.startswith("/dev/"):
+        return False
+    target = _resolve_target(raw, cwd)
+    if not target or _within(target, str(project_root())):
+        return False
+    if any(_within(target, base) for base in _allowed_outside()):
+        return False
+    home = _home()
+    if home and _within(target, home):
+        # an agent's own configuration under the home folder is the founder's question even when the home folder
+        # itself sits under /tmp (a CI runner, a container): the scratch-place allowance below must not reach it
+        return True
+    if low.startswith(("/tmp/", "/var/tmp/", "/private/tmp/")) or low in ("/tmp", "/var/tmp"):
+        return False  # the POSIX scratch places, whatever the OS maps them to
+    return True
+
+
+REDIRECT_TOKEN = re.compile(r"^(?:\d|&)?(?:>\||>>?)(.*)$")  # `>|` first: it is noclobber's redirect, not `>` then a pipe
+
+
+def _redirect_targets(tokens: list[str]) -> list[str]:
+    """Where `>`, `>>`, `>|`, `2>`, `&>` send output, read word by word after the quotes are off: `> "a b/x.txt"` is
+    one path. `2>&1`, `>&2` and `>(…)` are not files."""
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        m = REDIRECT_TOKEN.match(t)
+        if m:
+            rest = m.group(1)
+            if rest and not rest.startswith(("&", "(")):
+                out.append(rest)
+            elif not rest and i + 1 < len(tokens):
+                out.append(tokens[i + 1])
+                i += 1
+        elif ">" in t and not re.search(r"\s", t) and not t.startswith(("-", "=")):
+            glued = re.match(r"^(.*?[^=\-<>\d])\d?(?:>\||>>?)(?![&(])(.+)$", t)  # `echo hi>out.txt`
+            if glued:
+                out.append(glued.group(2))
+        i += 1
+    return out
+
+
+def _flag_value(args: list[str], names: tuple[str, ...]) -> list[str]:
+    """Values of the given flags, spelled `-o x`, `--output x`, `--output=x` (and `-ox` for a one-letter flag)."""
+    out: list[str] = []
+    for i, a in enumerate(args):
+        for n in names:
+            # a one-letter flag is case-sensitive (`tar -C` is not `-c`); a PowerShell parameter is not (`-Path`)
+            same = a == n if len(n) == 2 else a.lower() == n.lower()
+            if same and i + 1 < len(args):
+                out.append(args[i + 1])
+            elif n.startswith("--") and a.lower().startswith(n + "="):
+                out.append(a.split("=", 1)[1])
+            elif len(n) == 2 and a.startswith(n) and len(a) > 2 and not a.startswith("--"):
+                out.append(a[2:])
+    return out
+
+
+def _positional(args: list[str], value_flags: set[str], exe: str = "") -> list[str]:
+    """Positional arguments, skipping flags, their values and a cmd switch (`/q`, `/s`)."""
+    out: list[str] = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-") and a != "-":
+            skip = a.lower() in value_flags
+            continue
+        if re.match(r"^/[A-Za-z]$", a) or (exe in CMD_VERBS and CMD_SWITCH.match(a)):
+            continue
+        out.append(a)
+    return out
+
+
+def _writes_of(exe: str, args: list[str]) -> list[str]:
+    """The paths one command writes, removes or creates (not counting redirects)."""
+    low = [a.lower() for a in args]
+    if exe == "tee":
+        return [a for a in args if not a.startswith("-")]
+    if exe in COPY_MOVE:
+        dest = next(iter(_flag_value(args, ("-destination", "-t", "--target-directory"))), "")
+        if dest:
+            return [dest]
+        positional = [a for a in args if not a.startswith("-") and not (exe in CMD_VERBS and CMD_SWITCH.match(a))]
+        if exe == "robocopy" and len(positional) >= 2:
+            return [positional[1]]
+        written = positional[-1:] if len(positional) >= 2 else []
+        if exe in ("mv", "move", "move-item", "mi"):
+            written += positional[:-1]  # a move also removes its sources
+        return written
+    if exe in PATH_WRITERS:
+        paths = _flag_value(args, tuple(PS_PATH_FLAGS))
+        value_flags = PATH_WRITER_VALUE_FLAGS.get(exe, set()) | PS_ITEM_FLAGS | PS_PATH_FLAGS
+        return paths + [a for a in _positional(args, value_flags, exe) if a not in paths]
+    if exe in PS_WRITERS:
+        paths = _flag_value(args, tuple(PS_PATH_FLAGS))
+        return paths or _positional(args, PS_VALUE_FLAGS | PS_PATH_FLAGS)[:1]
+    if exe in ("sed", "perl"):
+        in_place = any(a.startswith("-i") or a == "--in-place" or a.startswith("--in-place=")
+                       or (exe == "perl" and re.match(r"^-[a-z]*i", a)) or (exe == "sed" and re.match(r"^-[a-zA-Z]*i", a))
+                       for a in args if a.startswith("-") and not a.startswith("--expression"))
+        if not in_place:
+            return []
+        scripted = any(a in ("-e", "-f", "--expression", "--file") or a.startswith(("--expression=", "--file="))
+                       or (exe == "perl" and re.match(r"^-[a-z]*e$", a)) for a in low)
+        positional = _positional(args, {"-e", "-f", "--expression", "--file", "-l", "--line-length"}
+                                 | ({a for a in args if exe == "perl" and re.match(r"^-[a-z]*e$", a.lower())}))
+        return positional if (scripted or exe == "perl") else positional[1:]
+    if exe == "curl":
+        return _flag_value(args, ("-o", "--output", "--output-dir"))
+    if exe == "wget":
+        return _flag_value(args, ("-O", "--output-document", "-P", "--directory-prefix"))
+    if exe == "git":
+        words = [a for a in args if not a.startswith("-")]
+        if words[:1] and words[0].lower() == "clone":
+            positional = _positional(args[args.index(words[0]) + 1:], {"-b", "--branch", "--depth", "-o", "--origin",
+                                                                      "--reference", "-c", "--config", "--template",
+                                                                      "--separate-git-dir", "-j", "--jobs", "-u"})
+            return positional[1:2]
+        output = reader_output_file("git", args)
+        return [output] if output else []
+    if exe in ("sort", "uniq", "tree"):
+        output = reader_output_file(exe, args)
+        return [output] if output else []
+    if exe == "tar":
+        first = args[0] if args else ""
+        cluster = "".join(a.lstrip("-") for a in args if re.match(r"^-?[A-Za-z]+$", a) and not a.startswith("--")
+                          and (a.startswith("-") or a is first))
+        creates = any(c in cluster for c in "cru") or any(a in ("--create", "--append", "--update") for a in low)
+        extracts = "x" in cluster or any(a in ("--extract", "--get") for a in low)
+        out: list[str] = []
+        if creates:
+            out += _flag_value(args, ("--file",))
+            for i, a in enumerate(args):
+                if re.match(r"^-?[A-Za-z]+$", a) and "f" in a and not a.startswith("--") and (a.startswith("-") or a is first) \
+                        and i + 1 < len(args):
+                    out.append(args[i + 1])
+                    break
+        if extracts:
+            out += _flag_value(args, ("-C", "--directory"))
+        return out
+    if exe == "unzip":
+        return _flag_value(args, ("-d",))
+    if exe == "7z":
+        return [a[2:] for a in args if a.startswith("-o") and len(a) > 2]
+    if exe == "dd":
+        return [a.split("=", 1)[1] for a in args if a.lower().startswith("of=")]
+    if exe in ("install", "ln"):
+        positional = _positional(args, {"-m", "--mode", "-o", "--owner", "-g", "--group", "-t", "--target-directory", "-S", "--suffix"})
+        targets = _flag_value(args, ("-t", "--target-directory"))
+        if exe == "install" and "-d" in low:
+            return targets + positional
+        return targets or (positional[-1:] if len(positional) >= 2 else [])
+    if exe in ("rsync", "scp"):
+        positional = _positional(args, {"-e", "--rsh", "--exclude", "--include", "--filter", "-f", "-i", "-p", "-P",
+                                        "-o", "-F", "-l", "-c", "--password-file"} if exe == "scp" else
+                                 {"-e", "--rsh", "--exclude", "--include", "--filter", "-f", "--password-file"})
+        dest = positional[-1] if len(positional) >= 2 else ""
+        return [dest] if dest and not _remote_spec(dest) else []  # a remote destination is the outbound class
+    return []
+
+
+def _command_write_targets(command: str) -> list[tuple[str, Path | None]]:
+    """(token, directory it is relative to) for every place a shell line writes a file: a redirect, `tee`, a copy or
+    a move, and what removes, creates, edits in place, downloads or unpacks (`rm`, `mkdir`, `touch`, `sed -i`,
+    `Set-Content`, `curl -o`, `git clone … <dest>`, `tar -C`, `dd of=`). `cd` is followed while the hook can read where
+    it goes. Not seen: a path an interpreter opens (`python -c "open('../x', 'w')"`)."""
+    root = project_root()
+    cwd: Path | None = root
+    out: list[tuple[str, Path | None]] = []
+    for tokens in _command_words(command):
+        exe = _exe_name(tokens[0])
+        if exe in ("cd", "set-location", "sl", "pushd", "chdir"):
+            nxt = [a for a in tokens[1:] if not a.startswith("-")]
+            if len(nxt) > 1 and nxt[0].lower() == "/d":
+                nxt = nxt[1:]  # cmd's `cd /d <dir>`: the switch, not the D: drive
+            where = _resolve_target(nxt[0], cwd) if nxt else ""
+            cwd = Path(where) if where else None
+            continue
+        out += [(t, cwd) for t in _redirect_targets(tokens)]
+        # the redirects are not arguments of the command itself
+        args: list[str] = []
+        skip = False
+        for t in tokens[1:]:
+            if skip:
+                skip = False
+                continue
+            m = REDIRECT_TOKEN.match(t)
+            if m:
+                skip = not m.group(1)
+                continue
+            args.append(t)
+        out += [(t, cwd) for t in _writes_of(exe, args) if t and t != "-"]
+    return out
+
+
+def outside_root_writes(tool_name: str, tool_input: dict) -> list[str]:
+    """The paths outside the project a tool call writes to, as the agent spelled them."""
+    tool_input = tool_input or {}
+    if is_read_only_tool(tool_name, tool_input):
+        return []
+    if is_command(tool_name, tool_input):
+        found: list[str] = []
+        for token, cwd in _command_write_targets(_command_without_data(str(tool_input.get("command", "")), files_too=True)):
+            if _outside_root(token, cwd) and token not in found:
+                found.append(token)
+        return found
+    _text, path = text_of_tool_input(tool_name, tool_input)
+    writes = (any(tool_input.get(k) for k in BODY_KEYS) or tool_input.get("edits")
+              or any(w in WRITE_TOOL_WORDS for w in tool_words(tool_name)))
+    targets = ([path] if (path and writes) else []) + destination_paths(tool_name, tool_input)
+    return [p for p in dict.fromkeys(targets) if _outside_root(p, project_root())]
+
+
+def check_classes(cfg: dict, tool_name: str, tool_input: dict) -> list[tuple[str, str]]:
+    """(class, what) for every boundary class a tool call touches: ("dependency", "stripe"), ("outbound", "git push"),
+    ("outside_root", "C:/elsewhere/x.py"). The verdict (allow | ask | block) is the caller's, from `class_verdict`."""
+    tool_input = tool_input or {}
+    if is_read_only_tool(tool_name, tool_input):
+        return []
+    hits: list[tuple[str, str]] = []
+    outbound: list[str] = []
+    if is_command(tool_name, tool_input):
+        command = str(tool_input.get("command", ""))
+        if is_read_only_command(command) or _only_guard_self_run(command):
+            return []
+        # what a command writes into a file (a Dockerfile, a workflow, notes.txt) is file content, judged like the same
+        # content written with the Write tool — not a command this call runs
+        text = _command_without_data(command, files_too=True)
+        candidates = dependency_additions(text)
+        outbound = outbound_actions(text)
+    else:
+        candidates = manifest_additions(tool_name, tool_input)
+    if candidates:
+        # what the approved stack names, and what the project's manifests already declare, is not a new dependency;
+        # a package the Non-Goals forbid was refused before this check ran
+        known = stack_packages(cfg) | project_declared_packages(project_root())
+        denied = {_pep503(p) for p in cfg.get("deny_packages") or []}
+        for pkg in candidates:
+            if _pep503(pkg) in denied or _pep503(pkg) in known:
+                continue
+            hits.append(("dependency", pkg))
+    hits += [("outbound", act) for act in outbound]
+    hits += [("outside_root", p) for p in outside_root_writes(tool_name, tool_input)]
+    return list(dict.fromkeys(hits))
+
+
+CLASS_REASONS = {
+    "dependency": lambda what: (f"dependency '{what}' — adding a dependency is a change of the stack, not a side effect: {what} is "
+                                "not in ARCHITECTURE.md's stack — confirm it with the founder (Feature Delta) or add it to the architecture first"),
+    "outbound": lambda what: f"outbound '{what}' — this leaves the machine or rewrites a remote — irreversible; the founder decides",
+    "outside_root": lambda what: (f"outside_root '{what}' — this writes outside the project ({project_root()}): a change there is not "
+                                  "part of this project's scope — the founder decides"),
+}
+
+
+# how a class hit reads in the log: "dependency 'stripe'", "outbound 'git push'", "outside_root '<path>'"
+CLASS_HIT = re.compile(r"^(?:dependency|outbound|outside_root)\s+'")
+
+
+def class_message(active: list[tuple[str, str]], blocking: bool) -> str:
+    head = ("⛔ LUMIS Scope Guard blocked this (.lumis/scope_guard.json → \"classes\"): " if blocking else
+            "⏸ LUMIS Scope Guard holds this for the founder: ")
+    return (head + "; ".join(CLASS_REASONS[c](w) for c, w in active)
+            + ". Each class is set in .lumis/scope_guard.json → \"classes\" (allow | ask | block); the agent never changes it.")
+
+
 # --- the local log: what the guard did, kept in the repository ------------------------------------------------
 # What a leaked credential looks like in a tool payload. A warning, never a block: the agent may be writing a
 # fixture on purpose, but the founder's agent checked for this by hand before every push (field report 2026-09-22).
@@ -1409,7 +2608,8 @@ def redact(text: str, limit: int = 160) -> str:
     return out[:limit] + ("…" if len(out) > limit else "")
 
 
-def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: list[str], agent: str = "", attempted: str = "") -> None:
+def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: list[str], agent: str = "", attempted: str = "",
+              observed: bool = False) -> None:
     rel = cfg.get("log", ".lumis/guard.log")
     if not rel:
         return
@@ -1421,9 +2621,12 @@ def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: lis
         "path": text_of_tool_input(tool_name, tool_input)[1][:200],
         # what the agent actually asked for: without it the log says "something was blocked" and no more
         # a refusal keeps more of the payload: the token that matched is usually past the first line of a heredoc
-        "attempted": redact(attempted or (tool_input or {}).get("command", ""), limit=600 if event in ("blocked", "tamper") else 160),
+        "attempted": redact(attempted or (tool_input or {}).get("command", ""), limit=600 if event in ("blocked", "tamper", "held") else 160),
         "hits": [h[:300] for h in hits if str(h).strip()][:8],
     }
+    if observed:
+        # observe mode: the event the guard WOULD have produced, under its own name, marked as not enforced
+        entry["observed"] = True
     if event in ("warned", "possible") and not entry["hits"]:
         return  # a warning with no reason teaches the agent to skip the whole category (field report 2026-09-22)
     try:
@@ -1460,7 +2663,20 @@ def fingerprints() -> str:
         config = file_digest(project_root() / ".lumis" / "scope_guard.json")[:8]
     except Exception:
         config = "absent"
-    return f"hook {hook} · config {config}"
+    return f"hook {HOOK_VERSION} · hook {hook} · config {config}"
+
+
+HOOK_VERSION_RE = re.compile(r'^HOOK_VERSION\s*=\s*["\']([^"\']+)["\']', re.M)
+
+
+def script_version(path: Path) -> str:
+    """HOOK_VERSION of the hook script at `path`, read as text (never imported); "" for a script written before
+    versions existed, or one that cannot be read."""
+    try:
+        m = HOOK_VERSION_RE.search(path.read_text(encoding="utf-8", errors="replace"))
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
 
 
 def write_request(reason: str) -> int:
@@ -1469,7 +2685,10 @@ def write_request(reason: str) -> int:
     agent's context being compacted, and paste-ready for LUMIS Amend. The founder's agent wrote such a file by hand,
     twice, because the first copy had drifted from the file by the time a decision came (field report 2026-09-22)."""
     root = project_root()
-    events = [e for e in read_log({"log": ".lumis/guard.log"}) if e.get("event") in ("blocked", "tamper")]
+    # a `held` call (a dependency, a push, a write outside the project) is a request by nature; an observed event
+    # stopped nothing, so there is no refusal to ask about
+    events = [e for e in read_log({"log": ".lumis/guard.log"})
+              if e.get("event") in ("blocked", "tamper", "held") and not e.get("observed")]
     if not events:
         print("no refusal on record: nothing to request")
         return 1
@@ -1479,9 +2698,15 @@ def write_request(reason: str) -> int:
     target = root / ".lumis" / "requests" / f"{stamp}-{slug}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     hits = last.get("hits") or []
-    kind = "the guard's own files" if last.get("event") == "tamper" else "a Non-Goal"
-    amend_lines = [f"- Consider lifting or narrowing the boundary behind: {h}" for h in hits if "NG-" in str(h)] or [
-        "- The refusal concerned the guard's own files: if the change was meant, run Amend or edit the boundary yourself; the agent must not."]
+    # a class set to "block" logs `blocked` with class hits and no NG-n: it is a class decision, not a Non-Goal and not
+    # the guard's own files (review 2026-09-23 — the request called it both)
+    by_class = any(CLASS_HIT.match(str(h)) for h in hits)
+    kind = {"tamper": "the guard's own files", "held": "a boundary class held for you"}.get(
+        str(last.get("event")), "a boundary class set to block" if by_class else "a Non-Goal")
+    amend_lines = [f"- Consider lifting or narrowing the boundary behind: {h}" for h in hits if "NG-" in str(h)] or (
+        ["- A dependency, a push or a write outside the project waits for your decision: approve it once, or set the class "
+         "in .lumis/scope_guard.json → \"classes\" (allow | ask | block)."] if (last.get("event") == "held" or by_class) else
+        ["- The refusal concerned the guard's own files: if the change was meant, run Amend or edit the boundary yourself; the agent must not."])
     body = "\n".join([
         f"# Request to the founder: {reason or '(no reason given)'}",
         "",
@@ -1513,20 +2738,57 @@ def write_request(reason: str) -> int:
     return 0
 
 
+def request_lines(root: Path, limit: int = 10) -> list[str] | None:
+    """`<filename> · <first line of the reason>` for the newest request files in .lumis/requests; None when the folder
+    does not exist. The reason is the first line under «## Why the agent asks» (what `request` writes), or else the
+    first non-empty line after the file's heading — a request written by hand is listed too."""
+    folder = root / ".lumis" / "requests"
+    if not folder.is_dir():
+        return None
+    files = [p for p in folder.iterdir() if p.is_file()]
+    files.sort(key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    out = [f"requests (.lumis/requests): {len(files)}"]
+    for p in files[:limit]:
+        try:
+            lines = [l.strip() for l in p.read_text(encoding="utf-8", errors="replace").splitlines()]
+        except Exception:
+            lines = []
+        reason = ""
+        if "## Why the agent asks" in lines:
+            reason = next((l for l in lines[lines.index("## Why the agent asks") + 1:] if l), "")
+        if not reason:
+            start = next((i + 1 for i, l in enumerate(lines) if l.startswith("#")), 0)
+            reason = next((l for l in lines[start:] if l and not l.startswith("#")), "")
+        reason = reason[:140] + ("…" if len(reason) > 140 else "")
+        out.append(f"  {p.name} · {reason or '(empty)'}")
+    return out
+
+
 def report(cfg: dict) -> int:
     entries = read_log(cfg)
     counts = {"blocked": 0, "warned": 0, "possible": 0, "drift": 0, "tamper": 0}
+    observed = 0
     for e in entries:
+        if e.get("observed"):
+            observed += 1  # would have been stopped; it was not, so it is not counted as stopped
+            continue
         counts[e.get("event", "")] = counts.get(e.get("event", ""), 0) + 1
     agents = sorted({str(e.get("agent") or "unknown") for e in entries})
     stopped = counts.get("blocked", 0) + counts.get("tamper", 0)
     print(f"LUMIS Scope Guard — {len(entries)} events in {cfg.get('log', '.lumis/guard.log')} · {fingerprints()}")
-    # «blocked: 0» beside eighteen tamper refusals read as «the guard never stepped in» (field report 2026-09-22)
+    # «blocked: 0» beside eighteen tamper refusals read as «the guard never stepped in» (field report 2026-09-22);
+    # every kind is printed even at zero, so a missing word never has to be read as «not counted»
     print(f"  stopped: {stopped} (blocked: {counts.get('blocked', 0)} · tamper: {counts.get('tamper', 0)})"
-          f" · asked: {counts.get('asked', 0)} · inspected: {counts.get('inspected', 0)} · warned: {counts.get('warned', 0)} · drift prompts: {counts.get('drift', 0)}"
-          + (f" · possible: {counts.get('possible', 0)}" if counts.get("possible") else "")
-          + (f" · noted: {counts.get('noted', 0)}" if counts.get("noted") else "")
+          f" · held: {counts.get('held', 0)} · asked: {counts.get('asked', 0)} · inspected: {counts.get('inspected', 0)}"
+          f" · warned: {counts.get('warned', 0)} · possible: {counts.get('possible', 0)} · noted: {counts.get('noted', 0)}"
+          f" · drift prompts: {counts.get('drift', 0)}"
           + (f" · agents: {', '.join(agents)}" if entries else ""))
+    if guard_mode(cfg) == "observe" or observed:
+        print(f"  mode: {guard_mode(cfg)} — {observed} event(s) would have been stopped"
+              + (" (observe mode records them and stops nothing but changes to the guard itself)" if guard_mode(cfg) == "observe" else ""))
+    if counts.get("held"):
+        print("  ('held' is a new dependency, a push or deploy, or a write outside the project, handed to you to approve —")
+        print("   `classes` in .lumis/scope_guard.json sets each to allow, ask or block. A decision, not a violation.)")
     if counts.get("possible"):
         print("  ('possible' is a single word out of a long Non-Goal sentence that turned up in a change: a match for you")
         print("   to judge, not a violation. Nothing was blocked; the word alone does not prove the boundary was crossed.)")
@@ -1534,17 +2796,23 @@ def report(cfg: dict) -> int:
         print("  ('inspected' is a read-only command — grep, git log, ls, an MCP read tool — that merely mentions a boundary: allowed, never a violation.)")
     if counts.get("noted"):
         print("  ('noted' is a document or a test that writes a boundary down — docs/, *.md, tests/: allowed, never a violation.)")
-    if counts.get("asked") and not counts.get("blocked"):
+    # an observed block did reach a tool, and the hook would have refused it: the legend would be false then
+    if counts.get("asked") and not counts.get("blocked") and not observed:
         print("  ('asked' without 'blocked' means the agent was told to cross a boundary and stopped before touching a tool —")
         print("   the written rules held; the hook never had to. Both are the guard doing its job.)")
     for e in entries[-10:]:
         where = f" {e.get('path')}" if e.get("path") else ""
         who = f"[{e.get('agent')}] " if e.get("agent") else ""
-        print(f"  {e.get('ts', '')} {e.get('event', ''):7} {who}{e.get('tool', '')}{where}: " + "; ".join(e.get("hits", [])))
+        # "(observed)" after the name: pasted into the studio, the text form must not count it as a real block
+        event = f"{e.get('event', ''):7}" + (" (observed)" if e.get("observed") else "")
+        print(f"  {e.get('ts', '')} {event} {who}{e.get('tool', '')}{where}: " + "; ".join(e.get("hits", [])))
         if e.get("attempted"):
             print(f"      attempted: {e['attempted']}")
     if not entries:
         print("  nothing yet — the guard has not had to step in.")
+    # what the agent asked the founder for, next to what the guard did: the workspace reads both from here
+    for line in request_lines(project_root()) or []:
+        print(line)
     return 0
 
 
@@ -1589,6 +2857,25 @@ def doctor() -> int:
                       + ", ".join(f"'{w}'" for w in stale[:8]) + ("…" if len(stale) > 8 else ""))
                 print("    (they refuse ordinary work — `python scripts/scope_guard.py rebuild-markers --dry-run`")
                 print("     shows what today's rules would derive from the same boundaries; nothing else changes.)")
+            if guard_mode(cfg) == "observe":
+                print("  · mode: observe — nothing is refused except a change to the guard itself; what would have been stopped is"
+                      " logged (`python scripts/scope_guard.py observe off` to enforce)")
+            else:
+                print("  · mode: enforce")
+            print("  · classes: " + " · ".join(f"{name} {class_verdict(cfg, name)}" for name in DEFAULT_CLASSES))
+            # the config names the hook it was written for: a newer config read by an older hook loses its new keys
+            # in silence (the old script simply does not know them), the reverse only means new keys take defaults
+            wanted = str(cfg.get("hook_version") or "")
+            have = script_version(script) if script.exists() else HOOK_VERSION
+            if wanted and (not have or have < wanted):
+                message = (f"the hook in scripts/ is older than the config ({have or 'unversioned'} < {wanted}): copy "
+                           "scripts/scope_guard.py from the ZIP, then run write-manifest")
+                print(f"  ✗ {message}")
+                problems.append(message)
+            elif wanted and have > wanted:
+                print(f"  · the hook ({have}) is newer than the config's hook_version ({wanted}): fine — keys the config lacks take their defaults")
+            elif not wanted:
+                print(f"  · the config names no hook_version (written before versions existed, or by hand); the hook is {have or 'unversioned'}")
         except Exception as exc:
             problems.append(f".lumis/scope_guard.json is not valid JSON ({exc})")
             print("  ✗ .lumis/scope_guard.json — invalid JSON")
@@ -1725,7 +3012,7 @@ def doctor() -> int:
 # re-downloading the ZIP: the download would overwrite the architecture inventory they normalised (field report
 # 2026-09-21). This command re-derives the markers in place, from the boundaries the config already carries, and
 # leaves everything else alone. It is the founder's command: the hook refuses it to an agent exactly as it refuses
-# `write-manifest` — `GUARD_SELF_RUN` whitelists `pre-tool|prompt|report|doctor` and nothing else, so a tool call
+# `write-manifest` — `GUARD_SELF_RUN` whitelists `report|doctor|request` and nothing else, so a tool call
 # naming this file with any other word is denied as `tamper`, `--dry-run` included. That is deliberate: a dry run
 # prints what the real run would do, and an agent that can read the plan can argue for it.
 def config_path(root: Path) -> Path | None:
@@ -1746,6 +3033,64 @@ def rebaseline(root: Path) -> tuple[dict, Path | None]:
     manifest = build_manifest(root)
     target.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return manifest, write_baseline(root, manifest["files"])
+
+
+# The variable each agent client sets in the shells it spawns for the agent's commands. CLAUDECODE=1 was read in a
+# Claude Code session on the founder's machine (2026-09-23); CODEX_SANDBOX and CODEX_SANDBOX_NETWORK_DISABLED are
+# what Codex CLI documents for its sandboxed commands. Cursor, Windsurf and Copilot set nothing this script knows of,
+# so there the check cannot tell an agent from the founder — it is a speed bump, not a lock.
+AGENT_SHELL_MARKERS = ("CLAUDECODE", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED")
+
+
+def agent_shell() -> str:
+    """The marker variable of the agent session this process runs in, or "" for a shell of the founder's own."""
+    return next((name for name in AGENT_SHELL_MARKERS if str(os.environ.get(name) or "").strip()), "")
+
+
+def set_observe(root: Path, on: bool) -> int:
+    """`python scripts/scope_guard.py observe on|off` — the founder's own command, refused to the agent like
+    `write-manifest` (it is not in `GUARD_SELF_RUN`): an agent that could switch observe on would own an off switch.
+    Only the `mode` key changes; the config is fingerprinted, so the manifest and the baseline are taken again,
+    or `doctor` would report the guard as rewritten — which it was, by the founder, on purpose.
+
+    The hook refuses the command line; it cannot see the same switch reached through code (`python -c "… import
+    scope_guard; scope_guard.main()"` with argv set to `observe on`), and that route left doctor clean because the
+    re-baseline came with it (audit 2026-09-23). So the switch itself looks at where it runs: a shell an agent
+    client spawned carries that client's marker, and there it writes nothing."""
+    marker = agent_shell()
+    if marker:
+        print(f"observe is the founder's switch, and this shell belongs to an agent session ({marker} is set): nothing was "
+              "written. Run it in a terminal of your own — a command typed into the agent's own prompt runs inside its "
+              "session too.", file=sys.stderr)
+        return 1
+    path = config_path(root)
+    if path is None:
+        print("No .lumis/scope_guard.json here — nothing to switch.", file=sys.stderr)
+        return 1
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"{path} is not valid JSON ({exc}) — nothing was written. Fix the file first.", file=sys.stderr)
+        return 1
+    if not isinstance(cfg, dict):
+        print(f"{path} does not hold a JSON object — nothing was written.", file=sys.stderr)
+        return 1
+    cfg["mode"] = "observe" if on else "enforce"
+    try:
+        path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:
+        print(f"could not write {path}: {exc}", file=sys.stderr)
+        return 1
+    manifest, outside = rebaseline(root)
+    if on:
+        print("mode: observe — the guard records what it would have stopped (`report`) and stops nothing but changes to "
+              "itself. Back to enforcing: python scripts/scope_guard.py observe off")
+    else:
+        print("mode: enforce — Non-Goals are refused and the boundary classes are held again.")
+    print(f"{MANIFEST}: {len(manifest['files'])} guard file(s) fingerprinted")
+    print(f"baseline outside the repository: {outside}" if outside else
+          "baseline outside the repository: not written (switched off, or the home folder is read-only)")
+    return 0
 
 
 def config_boundaries(cfg: dict) -> list[dict]:
@@ -2031,21 +3376,30 @@ def main() -> int:
     if mode == "rebuild-markers":  # the founder re-derives the markers of a config they edited by hand
         # read straight from argv: `parse_args` answers (mode, agent) to five callers and swallows the rest
         return rebuild_markers(project_root(), dry_run="--dry-run" in sys.argv[1:])
+    if mode == "observe":  # the founder switches refusing off and on; the hook refuses this to the agent
+        switch = next((a.lower() for a in sys.argv[2:] if not a.startswith("-")), "")
+        if switch not in ("on", "off"):
+            print("usage: python scripts/scope_guard.py observe on|off   (now: " + guard_mode(cfg) + ")", file=sys.stderr)
+            return 1
+        return set_observe(project_root(), switch == "on")
     # first contact: the installed state is recorded outside the repository before any tool call is judged
     record_baseline_if_absent(project_root())
     payload = read_stdin_json()
     tool_name, tool_input, prompt, detected = normalize_payload(payload)
     agent = agent or detected or "claude"
     if mode == "prompt" or (not tool_name and prompt):
-        # the earliest signal: the request itself asks for something the constitution forbids. The prompt hook
-        # cannot block a tool call — none has happened yet — but it tells the agent and records the attempt, so
-        # a refusal that never reaches a tool call is still counted.
-        asked = match_triggers(cfg, prompt)
+        # the earliest signal: the request itself names a boundary. The prompt hook cannot block a tool call — none
+        # has happened yet — so it advises and records. It used to order the agent to "say so and stop: do not plan
+        # it" on any hit, a lone word included, and the founder's agent refused ordinary work because a word of a
+        # Non-Goal sentence was in the request (2026-09-23). Only what names the boundary itself counts here: a
+        # forbidden package, a forbidden path, a multi-word phrase. The hook still refuses the tool call that crosses.
+        asked = match_triggers(cfg, prompt, kinds=("package", "path", "phrase"))
         if asked:
             print(
-                "⛔ LUMIS Scope Guard: this request asks for something CONSTITUTION.md forbids — "
+                "🔎 LUMIS Scope Guard: this request mentions a boundary from CONSTITUTION.md — "
                 + "; ".join(asked)
-                + ". Say so and stop: do not plan it, do not start it. Only the founder can lift a boundary (LUMIS Amend)."
+                + ". Check the Non-Goal before acting: if the request really is the ruled-out feature, tell the founder "
+                  "instead of building it; if it is ordinary work, carry on."
             )
             log_event(cfg, "asked", "prompt", {}, asked, agent, attempted=prompt)
         phrases = [p for p in cfg.get("drift_phrases", []) if p.lower() in prompt.lower()]
@@ -2106,26 +3460,60 @@ def main() -> int:
     for w in warnings:
         sys.stderr.write(w + "\n")
     hits = check_pre_tool(cfg, tool_name, tool_input)
-    if hits and looking:
+    # what only a commit message or a note appended to a document names: the boundary written down, not crossed
+    in_data = [] if hits else check_data_mentions(cfg, tool_name, tool_input)
+    if (hits or in_data) and looking:
         # the agent is looking, not building: allow it and record that a boundary area was inspected
-        log_event(cfg, "inspected", tool_name, tool_input, hits, agent, attempted=command or attempted_text)
+        log_event(cfg, "inspected", tool_name, tool_input, hits or in_data, agent, attempted=command or attempted_text)
         return 1 if warnings else 0
-    if hits and documenting:
+    noted = False
+    if (hits and documenting) or in_data:
         # documenting a boundary is not crossing it: the ADR that explains the Non-Goal, the README line restating
         # it and the test that asserts the feature is absent were all refused as violations of the boundary they
         # were writing down — and each refusal then argued in the Amend dialog for lifting it (audit 2026-09-15).
-        sys.stderr.write("📝 LUMIS Scope Guard: this file writes a Non-Goal down (" + "; ".join(hits)
+        # A commit message that explains a boundary is the same thing (audit 2026-09-23).
+        written = hits or in_data
+        sys.stderr.write("📝 LUMIS Scope Guard: this " + ("file" if hits else "command's message or note")
+                         + " writes a Non-Goal down (" + "; ".join(written)
                          + "). Documenting or testing a boundary is inside it — only the code that crosses it is not. "
                            "Allowed and logged as `noted`.\n")
-        log_event(cfg, "noted", tool_name, tool_input, hits, agent, attempted=attempted_text)
-        return 1
+        log_event(cfg, "noted", tool_name, tool_input, written, agent, attempted=attempted_text or command)
+        hits, noted = [], True
+        # no early return: the same call can still add a dependency, push, or write outside the project
+    # observe mode: every refusal and every hold below becomes a warning and a journal line under its own name. The
+    # tamper refusal above is deliberately not here — the guard's own files are not a boundary, and a mode that let
+    # the agent rewrite the hook would be an off switch, not an observation.
+    observing = guard_mode(cfg) == "observe"
     if hits:
-        emit_denial(agent,
-                    "⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): "
-                    + "; ".join(hits)
-                    + ". The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.")
+        message = ("⛔ LUMIS Scope Guard blocked this change (CONSTITUTION.md, Article I — Non-Goals): "
+                   + "; ".join(hits)
+                   + ". The boundary can be lifted only by the founder (LUMIS Amend / a new consilium run), never by bypassing the hook.")
+        if observing:
+            sys.stderr.write("👁 OBSERVE (nothing blocked): would have blocked this — " + message + "\n")
+            log_event(cfg, "blocked", tool_name, tool_input, hits, agent, attempted=attempted_text, observed=True)
+            return 1
+        emit_denial(agent, message)
         log_event(cfg, "blocked", tool_name, tool_input, hits, agent, attempted=attempted_text)
         return 2
+    active = [(c, w) for c, w in check_classes(cfg, tool_name, tool_input) if class_verdict(cfg, c) != "allow"]
+    if active:
+        blocking = any(class_verdict(cfg, c) == "block" for c, _w in active)
+        message = class_message(active, blocking)
+        labels = [f"{c} '{w}'" for c, w in active]
+        # "asked" is taken — it is the prompt hook's event — so a call handed to the founder is `held`
+        event = "blocked" if blocking else "held"
+        if observing:
+            sys.stderr.write("👁 OBSERVE (nothing blocked): would have " + ("blocked this — " if blocking else "asked the founder — ")
+                             + message + "\n")
+            log_event(cfg, event, tool_name, tool_input, labels, agent, attempted=attempted_text or command, observed=True)
+            return 1
+        log_event(cfg, event, tool_name, tool_input, labels, agent, attempted=attempted_text or command)
+        if blocking:
+            emit_denial(agent, message)
+            return 2
+        return emit_ask(agent, message)
+    if noted:
+        return 1  # the `noted` line is the record; as before, a documented boundary adds no warned/possible lines
     if design_hits or arch_hits:
         log_event(cfg, "warned", tool_name, tool_input, design_hits + arch_hits, agent, attempted=attempted_text)
     if marker_hits:

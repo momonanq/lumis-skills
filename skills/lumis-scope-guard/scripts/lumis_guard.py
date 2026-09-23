@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LUMIS scope guard — standalone installer and checker (stdlib only).
 
-    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--root .]
+    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--root .] [--observe]
     python lumis_guard.py check --text "the plan or diff to check" [--root .]
     python lumis_guard.py status [--root .]
 
@@ -93,11 +93,16 @@ def split_items(text: str) -> list[str]:
     return out[:25]
 
 
-def guard_config(project: str, non_goals: list[str], stack: str = "") -> dict:
+def guard_config(project: str, non_goals: list[str], stack: str = "", observe: bool = False) -> dict:
     """Triggers for the hook. Two classes leave here: `keywords` stop a tool call (exit 2) — the curated concept
     lexicon, phrases, and the words of a short boundary; `warn_keywords` only warn (exit 1) — a lone word out of a
     long sentence, a possible match for a human to judge. A hook reading a config without the second key behaves
-    exactly as it always did."""
+    exactly as it always did.
+
+    `hook_version` names the hook installed next to this config (the `scope_guard.py` in this folder), so `doctor`
+    can say when one is older than the other; `mode` is "observe" with `init --observe` (record, refuse nothing but
+    changes to the guard); `classes` holds a new dependency, a push and a write outside the project for the founder;
+    `stack` is the founder's own stack line, so a package it names is not held as a new dependency."""
     packages: list[str] = []
     paths: list[str] = []
     keywords: list[str] = []
@@ -132,7 +137,8 @@ def guard_config(project: str, non_goals: list[str], stack: str = "") -> dict:
             "non_goals": non_goals, "boundaries": boundaries, "capabilities": matched, "deny_packages": dedupe(packages), "deny_paths": dedupe(paths),
             "keywords": blocking_keywords, "warn_keywords": warn_only,
             "trigger_sources": trigger_sources, "drift_phrases": list(DRIFT_PHRASES), "design_non_goals": [],
-            "log": ".lumis/guard.log"}
+            "log": ".lumis/guard.log", "hook_version": guard.HOOK_VERSION, "mode": "observe" if observe else "enforce",
+            "classes": dict(guard.DEFAULT_CLASSES), "stack": stack}
 
 
 def explain(cfg: dict, trigger: str) -> str:
@@ -295,7 +301,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     invariants = split_items(args.invariants or "")
     stack = (args.stack or "").strip()[:200]
     project = (args.project or root.name).strip()[:60]
-    cfg = guard_config(project, non_goals, stack)
+    cfg = guard_config(project, non_goals, stack, observe=bool(getattr(args, "observe", False)))
     (root / ".lumis").mkdir(parents=True, exist_ok=True)
     (root / ".lumis" / "scope_guard.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     # the log records what an agent attempted (secrets stripped): local evidence, shared deliberately, not by accident
@@ -361,6 +367,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         if line.startswith("baseline outside the repository"):
             print("  " + line)
     print(f"  Non-Goals: {len(non_goals)} · invariants: {len(invariants)} · deny packages: {len(cfg['deny_packages'])} · deny paths: {len(cfg['deny_paths'])} · keywords: {len(cfg['keywords'])} · warn-only markers: {len(cfg['warn_keywords'])}")
+    print(f"  Hook {cfg['hook_version']} · mode: {cfg['mode']}"
+          + (" (records what it would have stopped, refuses nothing but changes to the guard; "
+             "`python scripts/scope_guard.py observe off` to enforce)" if cfg["mode"] == "observe" else "")
+          + " · classes: " + ", ".join(f"{k} {v}" for k, v in cfg["classes"].items()))
     print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section), CLAUDE.md (section)")
     print("  Agents: Claude Code (.claude/settings.json), Cursor (.cursor/hooks.json), Codex (.codex/hooks.json), Windsurf (.windsurf/hooks.json), Copilot (.github/hooks/lumis-scope-guard.json)")
     print("  Self-test: ask the agent to add something from the Non-Goals list — it must refuse or ask.")
@@ -431,10 +441,15 @@ def cmd_status(args: argparse.Namespace) -> int:
               f" · warn-only markers: {len(cfg.get('warn_keywords') or [])}")
         entries = read_log(root, cfg)
         counts: dict[str, int] = {}
+        observed = 0
         for e in entries:
+            if e.get("observed"):
+                observed += 1  # observe mode: it would have been stopped and was not — counted apart, as `report` does
+                continue
             counts[e.get("event", "")] = counts.get(e.get("event", ""), 0) + 1
-        print(f"Guard log ({cfg.get('log', '.lumis/guard.log')}): blocked {counts.get('blocked', 0)} · warned {counts.get('warned', 0)}"
-              f" · possible {counts.get('possible', 0)} · drift prompts {counts.get('drift', 0)}")
+        print(f"Guard log ({cfg.get('log', '.lumis/guard.log')}): blocked {counts.get('blocked', 0)} · held {counts.get('held', 0)}"
+              f" · warned {counts.get('warned', 0)} · possible {counts.get('possible', 0)} · noted {counts.get('noted', 0)}"
+              f" · drift prompts {counts.get('drift', 0)}" + (f" · observed (not stopped) {observed}" if observed else ""))
         for e in entries[-5:]:
             where = f" {e.get('path')}" if e.get("path") else ""
             print(f"  {e.get('ts', '')} {e.get('event', ''):7} {e.get('tool', '')}{where}: " + "; ".join(e.get("hits", [])))
@@ -450,6 +465,8 @@ def main() -> int:
     i.add_argument("--invariants", default="")
     i.add_argument("--stack", default="")
     i.add_argument("--root", default=".")
+    i.add_argument("--observe", action="store_true",
+                   help="install in observe mode: record what would have been stopped, refuse nothing but changes to the guard")
     i.set_defaults(fn=cmd_init)
     c = sub.add_parser("check")
     c.add_argument("--text", default="")
