@@ -1,6 +1,6 @@
 ---
 name: lumis-scope-guard
-description: Turn a list of Non-Goals into enforceable boundaries for the coding agent — deny rules and hooks that block forbidden dependencies, paths and keywords, a CONSTITUTION.md and a .cursorrules section — plus a startup ritual and a drift check for any plan. No model, no account, stdlib Python.
+description: Turn a list of Non-Goals into enforceable boundaries for the coding agent — deny rules and hooks that block forbidden dependencies, paths and keywords, a CONSTITUTION.md and a .cursorrules section — plus a startup ritual, a drift check for any plan and the same boundaries checked on every pull request (GitHub Actions). No model, no account, stdlib Python.
 ---
 
 # LUMIS scope guard
@@ -17,8 +17,14 @@ Prompts alone do not hold; this installs hooks that block the change before it h
   (`.cursor/hooks.json`), Codex (`.codex/hooks.json`), Windsurf (`.windsurf/hooks.json`) and Copilot
   (`.github/hooks/lumis-scope-guard.json`) — all of them deny on exit code 2, so one script guards every agent — copies `scripts/scope_guard.py`,
   writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and marked sections in `.cursorrules` and `CLAUDE.md` (existing content is kept).
-  Add `--observe` to install in observe mode (below). The last line of the output names the hook version, the mode and the classes:
-  `Hook 2026-09-23 · mode: enforce · classes: ...`.
+  Add `--observe` to install in observe mode (below). The output names the hook version, the mode and the classes:
+  `Hook 2026-09-28 · mode: enforce · classes: ...`.
+  Add `--ci` to also write `.github/workflows/lumis-boundary-check.yml`, the same boundaries checked on every pull request
+  (see "CI check" below). A different file already at that path is never overwritten: the LUMIS copy goes to
+  `.github/lumis-boundary-check.lumis.yml` and the output says so. Without `--ci` the output says how to add it.
+- `/lumis-scope-guard check-diff` — run `python scripts/scope_guard.py check-diff --base <target branch>` from the repository
+  and report the verdict and each finding it prints. Read-only: it reads git and prints; do not add `--markdown`, `--sarif` or
+  `--json` (writing a file with the hook's command is refused to the agent).
 - `/lumis-scope-guard check <plan or diff>` — run `python <skill-dir>/scripts/lumis_guard.py check --text "<text>" --root <repo root>`
   and report every Non-Goal trigger and drift phrase it prints. Exit code 1 means a violation: do not proceed, ask the founder.
 - `/lumis-scope-guard doctor` — run `python <skill-dir>/scripts/scope_guard.py doctor --root <repo root>` (or `python scripts/scope_guard.py doctor`
@@ -69,8 +75,8 @@ encoded command is not readable from the call text and is not caught; the guard 
 Reading them is always allowed; `.cursorrules`, `CLAUDE.md` and `AGENTS.md` are warned about, not blocked, because
 you keep your own notes there.
 
-This is **not** a security boundary: a process with shell access still reaches the files. What it guarantees is
-that no rewrite happens quietly through a tool call. `.lumis/guard.manifest.json` fingerprints the guard at install,
+This is **not** a security boundary: a process with shell access still reaches the files. What it adds is that a
+rewrite through a tool call it recognises is refused, not quiet. `.lumis/guard.manifest.json` fingerprints the guard at install,
 `doctor` reports any file changed since, and `write-manifest` re-baselines after a deliberate change or an Amend.
 When the guard refuses something the agent believes is right, `python scripts/scope_guard.py request --reason "…"` writes the
 last refusal — the exact payload, the boundary named, the reason — into `.lumis/requests/` as a file for the founder, paste-ready
@@ -138,13 +144,47 @@ fingerprints. It is the founder's command: the hook refuses it to the agent as t
 it runs in a shell an agent client spawned (Claude Code's `CLAUDECODE`, Codex's `CODEX_SANDBOX`) — run it in a terminal of your
 own. `init --observe` installs in this mode.
 
+## CI check: the same boundaries on every pull request
+
+The hook stops a tool call in the clients that load it. A pull request is where every change arrives — from any agent and
+from people — so the hook has a second entry point for it: `python scripts/scope_guard.py check-diff --base <ref> --head <ref>`.
+It reads the lines the diff adds (a removal never crosses a boundary), judges them against `.lumis/scope_guard.json` as it is
+on the base branch, and prints one report: PASS, WARN or BLOCK, and for each finding the boundary (NG-n, who set it, where it
+is written), the file and line, the trigger and the line itself. No score and no model.
+
+- **BLOCK** (exit 2): a Non-Goal trigger in an added line of a code file; a file added, changed, moved or copied under a
+  forbidden path; a new top-level directory the base branch and ARCHITECTURE.md's file plan do not have (only when the config
+  carries that inventory, which the full LUMIS pack writes); a dependency when `classes.dependency` is `block`; a change to the
+  hook, its client configs or the workflow, or a `.lumis/scope_guard.json` deleted, unreadable or left with no boundary — the
+  founder confirms.
+- **WARN** (exit 0): a trigger in a document or a test (`noted`); a warn-only word (`possible`); a route, model or table
+  ARCHITECTURE.md does not list; a new dependency held for the reviewer (`classes.dependency: ask`); a submodule (its content
+  is not read); a change to `.lumis/scope_guard.json` or `CONSTITUTION.md`, shown as a boundary diff — which NG-n was removed,
+  added or reworded, which other key changed (`stack`, `architecture.top_level`, `log`…), in which commit, by whom, and the
+  config's `revision` (`amend #n`). That is how a lift by LUMIS Amend arrives.
+- **Exit 1** means the check could not run (no config, no git, a ref that is not there), or the verdict is INCOMPLETE: the diff
+  is larger than the check reads (50 000 lines or 5 MB) and the part read holds no BLOCK. The report says so and never reads as
+  a PASS.
+
+`init --ci` (and both LUMIS ZIPs) install the workflow `.github/workflows/lumis-boundary-check.yml`: on every pull request it
+runs the check with the checker taken from the base commit, posts one comment (edited on the next push, never duplicated),
+writes the job summary, uploads SARIF to the Security tab and fails the job on BLOCK. The workflow is one of the guard's own
+files: the hook refuses the agent's writes to it, as it does for the hook itself. A pull request runs its own copy of the
+workflow, so one that removes the check step removes the check: make the job a required status check and put the guard's
+files under CODEOWNERS.
+
+What it does not read: outbound actions and writes outside the project (they are actions, not lines — the hook holds those);
+what a script runs (`bash -c …` inside it); meaning — a home-grown billing module that never says "stripe" passes; JS/TS beyond
+text patterns (AST rules are planned later, Python only); binary files and the content of submodules (named in the report).
+It is a review aid, not a security boundary. The spec is `docs/BOUNDARY_CHECK_CI.md` in the LUMIS repository.
+
 ## Hook version
 
-The hook carries its release date (`HOOK_VERSION`, now `2026-09-23`) and the config records the version it was written for
+The hook carries its release date (`HOOK_VERSION`, now `2026-09-28`) and the config records the version it was written for
 (`hook_version`). `doctor` compares them. A config newer than the hook is a problem — `the hook in scripts/ is older than the
 config (…): copy scripts/scope_guard.py from the ZIP, then run write-manifest` — because the old hook would ignore the new keys
 in silence. A hook newer than the config is fine: keys the config lacks take their defaults. The fingerprint
-`hook 2026-09-23 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
+`hook 2026-09-28 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
 `request` writes.
 
 ## What `report` shows

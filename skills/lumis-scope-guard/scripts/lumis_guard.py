@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """LUMIS scope guard — standalone installer and checker (stdlib only).
 
-    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--root .] [--observe]
+    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--root .] [--observe] [--ci]
     python lumis_guard.py check --text "the plan or diff to check" [--root .]
     python lumis_guard.py status [--root .]
 
 `init` writes into the repository root: .lumis/scope_guard.json (triggers), .claude/settings.json (deny rules + hooks,
 merged into an existing file), scripts/scope_guard.py (the hook), CONSTITUTION.md (Non-Goals and invariants verbatim)
 hook configs for Cursor / Codex / Windsurf / Copilot,
-and LUMIS sections in .cursorrules and CLAUDE.md (existing content kept). `check` reports Non-Goal triggers and drift phrases in a text. No network, no model.
+and LUMIS sections in .cursorrules and CLAUDE.md (existing content kept); with `--ci` also
+.github/workflows/lumis-boundary-check.yml (the same boundaries checked on every pull request diff). `check` reports Non-Goal triggers and drift phrases in a text. No network, no model.
 Same engine as https://lumis.tools/guard.
 
 Needs `scope_guard.py` in this same folder: the hook it installs is also where the boundary→markers derivation
@@ -76,7 +77,11 @@ DRIFT_PHRASES = (
 GUARD_SELF_PATHS = (".lumis/scope_guard.json", ".lumis/guard.log", ".lumis/guard.manifest.json",
                     "scripts/scope_guard.py", ".claude/settings.json", ".cursor/hooks.json",
                     ".codex/hooks.json", ".windsurf/hooks.json", ".github/hooks/lumis-scope-guard.json",
-                    "CONSTITUTION.md")
+                    "CONSTITUTION.md", guard.CI_WORKFLOW_PATH)
+# Where `init --ci` puts its copy when the repository already has a *different* workflow at CI_WORKFLOW_PATH that
+# is not the one the manifest recorded: next to the workflows, not among them — a second `.yml` inside
+# .github/workflows/ would run as a second check and fight the first over the same pull request comment.
+CI_WORKFLOW_SIDE_PATH = ".github/lumis-boundary-check.lumis.yml"
 MARK_START = "# --- LUMIS scope guard (generated; edit .lumis/scope_guard.json instead) ---"
 MARK_END = "# --- end LUMIS scope guard ---"
 MD_START = "<!-- LUMIS scope guard (generated; edit .lumis/scope_guard.json instead) -->"
@@ -102,7 +107,9 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
     `hook_version` names the hook installed next to this config (the `scope_guard.py` in this folder), so `doctor`
     can say when one is older than the other; `mode` is "observe" with `init --observe` (record, refuse nothing but
     changes to the guard); `classes` holds a new dependency, a push and a write outside the project for the founder;
-    `stack` is the founder's own stack line, so a package it names is not held as a new dependency."""
+    `stack` is the founder's own stack line, so a package it names is not held as a new dependency. `revision` stamps
+    which rules these are — `{"amend": 0, "at": <install date>}` here, the amendment number after a LUMIS Amend — and
+    `check-diff` prints it in the pull request report."""
     packages: list[str] = []
     paths: list[str] = []
     keywords: list[str] = []
@@ -137,7 +144,8 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
             "non_goals": non_goals, "boundaries": boundaries, "capabilities": matched, "deny_packages": dedupe(packages), "deny_paths": dedupe(paths),
             "keywords": blocking_keywords, "warn_keywords": warn_only,
             "trigger_sources": trigger_sources, "drift_phrases": list(DRIFT_PHRASES), "design_non_goals": [],
-            "log": ".lumis/guard.log", "hook_version": guard.HOOK_VERSION, "mode": "observe" if observe else "enforce",
+            "log": ".lumis/guard.log", "hook_version": guard.HOOK_VERSION,
+            "revision": {"amend": 0, "at": date.today().isoformat()}, "mode": "observe" if observe else "enforce",
             "classes": dict(guard.DEFAULT_CLASSES), "stack": stack}
 
 
@@ -204,10 +212,11 @@ def claude_settings(cfg: dict, existing: dict | None) -> dict:
     deny: list[str] = []
     for pkg in cfg.get("deny_packages", []):
         deny += [f"Bash(npm install {pkg}*)", f"Bash(npm i {pkg}*)", f"Bash(pnpm add {pkg}*)", f"Bash(yarn add {pkg}*)", f"Bash(pip install {pkg}*)", f"Bash(uv add {pkg}*)"]
+    # `Edit(path)` covers every file-editing tool; a `Write(path)` rule is never matched and only warns at start
     for path in cfg.get("deny_paths", []):
-        deny += [f"Edit({path}**)", f"Write({path}**)"]
+        deny.append(f"Edit({path}**)")
     for own in GUARD_SELF_PATHS:  # the guard's own files: refused by the client before the hook even runs
-        deny += [f"Edit({own})", f"Write({own})"]
+        deny.append(f"Edit({own})")
     pre = {"matcher": HOOK_MATCHER, "hooks": [{"type": "command", "command": hook_command("pre-tool")}]}
     prompt = {"hooks": [{"type": "command", "command": hook_command("prompt")}]}
     settings = dict(existing or {})
@@ -292,6 +301,48 @@ def upsert_block(path: Path, block: str, start_mark: str = MARK_START, end_mark:
     path.write_text(text, encoding="utf-8")
 
 
+def _recorded_fingerprint(root: Path, rel: str) -> str:
+    """The fingerprint `.lumis/guard.manifest.json` holds for `rel`, or "" when there is none to read."""
+    try:
+        manifest = json.loads((root / ".lumis" / "guard.manifest.json").read_text(encoding="utf-8"))
+        return str((manifest.get("files") or {}).get(rel) or "")
+    except Exception:
+        return ""
+
+
+def install_ci_workflow(root: Path) -> tuple[str, str]:
+    """Writes the pull request workflow (the hook's own `CI_WORKFLOW_YAML`, byte for byte) and returns
+    `(path written, what happened)`: "written", "unchanged", "updated" or "side".
+
+    A file already at the path is replaced only when it is ours as installed: it carries the LUMIS header line and
+    the manifest's fingerprint of it still matches, so it is an older LUMIS copy nobody edited. Any other file is
+    never overwritten: the new copy goes to CI_WORKFLOW_SIDE_PATH and the caller says so. (The header is checked too
+    because the manifest fingerprints whatever sits at the path — after a "side" install, the user's own file.)
+    Written as bytes: `write_text` would turn every newline into CRLF on Windows, and the three installers must
+    produce one identical file."""
+    import hashlib
+
+    text = guard.CI_WORKFLOW_YAML.encode("utf-8")
+    header = b"# LUMIS boundary check - generated by LUMIS"  # the stable start of line 1, in every version of it
+    target = root / guard.CI_WORKFLOW_PATH
+    state = "written"
+    if target.is_file():
+        current = target.read_bytes()
+        if current == text:
+            return guard.CI_WORKFLOW_PATH, "unchanged"
+        ours = current.startswith(header) and \
+            _recorded_fingerprint(root, guard.CI_WORKFLOW_PATH) == hashlib.sha256(current).hexdigest()[:16]
+        if not ours:
+            side = root / CI_WORKFLOW_SIDE_PATH
+            side.parent.mkdir(parents=True, exist_ok=True)
+            side.write_bytes(text)
+            return CI_WORKFLOW_SIDE_PATH, "side"
+        state = "updated"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(text)
+    return guard.CI_WORKFLOW_PATH, state
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     non_goals = split_items(args.non_goals)
@@ -335,6 +386,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             except Exception:
                 merged = content
         target.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # the same boundaries on every pull request; written before the manifest below, so the manifest fingerprints it
+    ci = install_ci_workflow(root) if getattr(args, "ci", False) else None
     const_path = root / "CONSTITUTION.md"
     if const_path.exists() and "LUMIS" not in const_path.read_text(encoding="utf-8"):
         const_path = root / "CONSTITUTION.lumis.md"  # never overwrite a hand-written constitution
@@ -373,6 +426,15 @@ def cmd_init(args: argparse.Namespace) -> int:
           + " · classes: " + ", ".join(f"{k} {v}" for k, v in cfg["classes"].items()))
     print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section), CLAUDE.md (section)")
     print("  Agents: Claude Code (.claude/settings.json), Cursor (.cursor/hooks.json), Codex (.codex/hooks.json), Windsurf (.windsurf/hooks.json), Copilot (.github/hooks/lumis-scope-guard.json)")
+    if ci is None:
+        print(f"  CI: add --ci to write {guard.CI_WORKFLOW_PATH} (the same check on every pull request)")
+    elif ci[1] == "side":
+        print(f"  CI: {guard.CI_WORKFLOW_PATH} already exists and is not the LUMIS copy — left as it is. The LUMIS workflow "
+              f"was written to {ci[0]} instead: compare the two and move it into .github/workflows/ yourself.")
+    else:
+        done = {"written": "written", "updated": "updated (it was an older LUMIS copy)", "unchanged": "already up to date"}[ci[1]]
+        print(f"  CI: {ci[0]} {done} — commit it with .lumis/ and scripts/; every pull request diff is then checked "
+              "against the same boundaries (PASS / WARN / BLOCK, one PR comment, SARIF for the Security tab)")
     print("  Self-test: ask the agent to add something from the Non-Goals list — it must refuse or ask.")
     return 0
 
@@ -434,6 +496,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     for rel in (".lumis/scope_guard.json", ".claude/settings.json", "scripts/scope_guard.py", "CONSTITUTION.md", ".cursorrules", "CLAUDE.md", ".lumis/guard.manifest.json",
                 ".cursor/hooks.json", ".codex/hooks.json", ".windsurf/hooks.json", ".github/hooks/lumis-scope-guard.json"):
         print(("✓ " if (root / rel).exists() else "✗ ") + rel)
+    ci_path = root / guard.CI_WORKFLOW_PATH  # optional: only `init --ci` (or a LUMIS ZIP) writes it
+    print(("✓ " + guard.CI_WORKFLOW_PATH) if ci_path.exists() else f"– {guard.CI_WORKFLOW_PATH} (optional: init --ci)")
     cfg_path = root / ".lumis" / "scope_guard.json"
     if cfg_path.exists():
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -467,6 +531,8 @@ def main() -> int:
     i.add_argument("--root", default=".")
     i.add_argument("--observe", action="store_true",
                    help="install in observe mode: record what would have been stopped, refuse nothing but changes to the guard")
+    i.add_argument("--ci", action="store_true",
+                   help="also write .github/workflows/lumis-boundary-check.yml: the same boundaries checked on every pull request diff")
     i.set_defaults(fn=cmd_init)
     c = sub.add_parser("check")
     c.add_argument("--text", default="")
