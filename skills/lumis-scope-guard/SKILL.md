@@ -168,7 +168,10 @@ is written), the file and line, the trigger and the line itself. No score and no
 
 `init --ci` (and both LUMIS ZIPs) install the workflow `.github/workflows/lumis-boundary-check.yml`: on every pull request it
 runs the check with the checker taken from the base commit, posts one comment (edited on the next push, never duplicated),
-writes the job summary, uploads SARIF to the Security tab and fails the job on BLOCK. The workflow is one of the guard's own
+writes the job summary, uploads SARIF to the Security tab and fails the job on BLOCK; on a push to `main`/`master` it runs
+the same check on what was pushed and uploads the SARIF, so code scanning has the base branch to compare with (code
+scanning is free in public repositories; a private one needs GitHub Advanced Security, otherwise the upload step only logs
+that and the comment and summary remain). The workflow is one of the guard's own
 files: the hook refuses the agent's writes to it, as it does for the hook itself. A pull request runs its own copy of the
 workflow, so one that removes the check step removes the check: make the job a required status check and put the guard's
 files under CODEOWNERS.
