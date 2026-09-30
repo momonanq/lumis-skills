@@ -81,7 +81,7 @@ for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to a legacy
 # The release this script belongs to — bump it on every change of this file. The pack writes the same string into
 # .lumis/scope_guard.json as `hook_version`, so `doctor` can tell a config that expects a newer hook (keys the old
 # script would ignore in silence) from a hook that is merely newer than its config (harmless: new keys take defaults).
-HOOK_VERSION = "2026-09-28"
+HOOK_VERSION = "2026-09-29"
 
 # The three decisions that are the founder's whatever the Non-Goals say: a new dependency changes the stack, a push
 # or a deploy leaves the machine, a write outside the project is not this project's change. Missing key -> "ask".
@@ -1193,7 +1193,14 @@ def keyword_pattern(trigger: str) -> "re.Pattern[str]":
     pattern = _KEYWORD_PATTERNS.get(low)
     if pattern is None:
         words = low.split()
-        if len(words) > 1:
+        if low.startswith("@"):
+            # a name written as code (`@Transactional`, derived from «never use @Transactional»): that name exactly,
+            # in any case — `@TransactionalEventListener` and `@transactionals` are other names (2026-09-29). Also
+            # fully qualified, as Java, Kotlin and TypeScript write an annotation or a decorator:
+            # `@org.springframework.transaction.annotation.Transactional`, `@jakarta.transaction.Transactional`.
+            qualifier = r"(?:[a-z_$][\w$]*\.)*" if re.fullmatch(r"@[\w$]+", low) else ""
+            pattern = re.compile(r"(?<![\w@$.])@" + qualifier + re.escape(low[1:]) + r"(?![\w$])")
+        elif len(words) > 1:
             body = r"[\s._\-/]*".join(re.escape(word) for word in words)
             pattern = re.compile(r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])")
         else:
@@ -1209,6 +1216,13 @@ def keyword_pattern(trigger: str) -> "re.Pattern[str]":
 def _spelled_out(text: str) -> str:
     """The text lower-cased with camel case opened up: `LeaderboardService` -> `leaderboard service`."""
     return re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or "")).lower()
+
+
+def _keyword_found(keyword: str, low: str, spelled: str) -> bool:
+    """A keyword in the lower-cased text or in its camel-case-opened spelling. A name written as code (`@…`) is
+    looked for as written only: opened up, `@TransactionalEventListener` would read as `@transactional event …`."""
+    pattern = keyword_pattern(keyword)
+    return bool(pattern.search(low) or (not str(keyword).lstrip().startswith("@") and pattern.search(spelled)))
 
 
 def trigger_hits(cfg: dict, text: str, path: str = "") -> list[tuple[str, str]]:
@@ -1235,7 +1249,7 @@ def trigger_hits(cfg: dict, text: str, path: str = "") -> list[tuple[str, str]]:
     words = _without_home_folders(text)
     low_words, spelled = words.lower(), _spelled_out(words)
     for kw in cfg.get("keywords", []):
-        if kw and (keyword_pattern(kw).search(low_words) or keyword_pattern(kw).search(spelled)):
+        if kw and _keyword_found(kw, low_words, spelled):
             hits.append(("phrase" if " " in kw.strip() else "keyword", kw))
     return hits
 
@@ -1277,7 +1291,7 @@ def warn_triggers(cfg: dict, text: str) -> list[tuple[str, str]]:
     words = _without_home_folders(text)
     low, spelled = words.lower(), _spelled_out(words)
     return [("phrase" if " " in str(kw).strip() else "keyword", kw)
-            for kw in cfg.get("warn_keywords", []) or [] if kw and (keyword_pattern(kw).search(low) or keyword_pattern(kw).search(spelled))]
+            for kw in cfg.get("warn_keywords", []) or [] if kw and _keyword_found(kw, low, spelled)]
 
 
 def match_triggers(cfg: dict, text: str, path: str = "", kinds: tuple[str, ...] | None = None) -> list[str]:
@@ -1292,34 +1306,349 @@ def match_triggers(cfg: dict, text: str, path: str = "", kinds: tuple[str, ...] 
     return sorted(", ".join(dict.fromkeys(whats)) + why for why, whats in grouped.items())
 
 
-def check_pre_tool(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
-    """Non-Goal hits of a tool call. For a shell command the data it carries into a document — a commit message, a
-    heredoc body appended to a Markdown file — is left out: `git commit -m "docs: explain why billing is out of
-    scope"` was refused as a crossing of the billing boundary (audit 2026-09-23). `check_data_mentions` reports what
-    the data names, as `noted`."""
+# --- where a hit stands: how much one line proves (2026-09-29) --------------------------------------------------------
+# A trigger is text, and the same text proves more on one line than on another. Two independent findings of
+# 2026-09-29 were false refusals on ordinary code: `from collections import defaultdict` under «No payment collection
+# or billing», and a retro over 40 merged pull requests of a public repository where four of five BLOCK verdicts were
+# a comment line (of the kind `// saveDraft is transactional, so a failed batch leaves nothing behind`), a
+# `.gitignore` line (`yarn-debug.log*`) and a pnpm option (`--frozen-lockfile`). The rule since then:
+#   - a hit blocks on a line of code; the same hit in a comment line of a code file or in an ignore file is written
+#     down, not crossed (`noted`);
+#   - a single-word keyword whose every match on the line is inside another tool's or library's name is a possible
+#     match (`possible`). Two such names only: a command-line option, and only in a shell command, a CI file, a
+#     lockfile or a manifest — never in the project's own source, never for a technology the boundaries name
+#     (`--stripe-key` blocks); and the module of an import that is a standard or well-known library spelling another
+#     form of the word (`from collections import …` for `collection`) — never the project's own module (`app.billings`);
+#   - a name written as code (`@Transactional`), a phrase, a package and a path are never weakened this way.
+# Each weaker verdict is printed with its reason (stderr, exit 1) and logged. The hook's content scan of a Write or an
+# Edit, `check-diff` and the studio read each line with `line_hits`; the hook then keeps, per trigger, its strongest
+# line — block, then warn, then noted — so a comment that names a trigger never hides a line of code carrying it, and
+# a whole Write is "written down" only when no line of it is a possible match or a crossing.
+_C_STYLE = ("//", "/*", "*")
+_HASH = ("#",)
+_COMMENT_GROUPS = (
+    (_C_STYLE, (".java", ".kt", ".kts", ".scala", ".groovy", ".gradle", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+                ".mts", ".cts", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".cs", ".go", ".rs", ".swift", ".dart",
+                ".m", ".mm", ".proto", ".scss", ".less", ".jsonc", ".json5", ".zig", ".sol", ".fs", ".fsx")),
+    (("/*", "*"), (".css",)),
+    (_HASH, (".py", ".pyi", ".pyx", ".sh", ".bash", ".zsh", ".fish", ".rb", ".rake", ".pl", ".pm", ".r", ".yml", ".yaml",
+             ".toml", ".cfg", ".conf", ".properties", ".env", ".ps1", ".psm1", ".nix", ".cmake", ".mk", ".ex", ".exs",
+             ".jl", ".cr", ".tcl", ".awk", ".dockerfile", ".txt")),
+    (_HASH + (";",), (".ini",)),
+    (_HASH + _C_STYLE, (".php", ".tf", ".hcl")),
+    (("--", "/*", "*"), (".sql",)),
+    (("--",), (".lua", ".hs", ".elm")),
+    ((";",), (".clj", ".cljs", ".cljc", ".edn", ".lisp", ".el", ".scm")),
+    (("<!--",), (".html", ".htm", ".xhtml", ".xml", ".svg", ".md", ".mdx", ".xaml", ".csproj", ".plist")),
+    (("<!--",) + _C_STYLE, (".vue", ".svelte", ".astro", ".jsp", ".cshtml", ".razor")),
+    (("rem ", "::", "@rem "), (".bat", ".cmd")),
+)
+# How a comment line starts, per extension (after leading whitespace). `#` is not a comment in C, C++, C#, Rust or
+# Swift (`#include`, `#region`, `#[derive]`), so those files know the C-style prefixes only. A file whose language is
+# not known has no comment lines: every hit there is read as code, as before.
+COMMENT_PREFIXES = {ext: prefixes for prefixes, exts in _COMMENT_GROUPS for ext in exts}
+HASH_COMMENT_NAMES = frozenset({"dockerfile", "makefile", "gemfile", "rakefile", "procfile", "podfile", "brewfile",
+                                "vagrantfile", "codeowners", ".gitattributes", ".editorconfig", ".env", ".npmrc",
+                                ".bashrc", ".zshrc", ".profile"})
+BLOCK_COMMENT_CLOSERS = {"/*": "*/", "<!--": "-->"}
+# A comment that is an instruction to a tool is code, not prose: `// eslint-disable-next-line react-hooks/exhaustive-deps`
+# is how a rule is switched off, and «never disable exhaustive-deps» is crossed on exactly that line.
+DIRECTIVE_COMMENT_RE = re.compile(
+    r"(?i)(?<![\w-])(?:eslint-(?:disable|enable)|@ts-(?:ignore|expect-error|nocheck)|noqa|type:\s*ignore|"
+    r"pylint:\s*disable|pyright:\s*ignore|mypy:|nolint|prettier-ignore|(?:istanbul|c8)\s+ignore|biome-ignore|"
+    r"rubocop:(?:disable|todo)|phpcs:(?:ignore|disable)|nosonar|go:(?:generate|build|embed|linkname)|\+build|"
+    r"fmt:\s*(?:off|skip)|#pragma|swiftlint:disable|detekt:|@suppress)")
+# The name of a module an import statement brings in, per language: Python, Java/Kotlin/C#/Rust/PHP, JS/TS, Go.
+IMPORT_MODULE_RES = (
+    re.compile(r"^\s*from\s+([\w.]+)\s+import\b"),
+    re.compile(r"^\s*(?:import|using|use)\s+(?:static\s+)?([\w.:*\\]+(?:\s*,\s*[\w.:*\\]+)*)"),
+    re.compile(r"\bfrom\s+['\"]([^'\"]+)['\"]"),
+    re.compile(r"\b(?:require|import)\s*\(\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"^\s*import\s+['\"]([^'\"]+)['\"]"),
+)
+OPTION_TOKEN_RE = re.compile(r"^-{1,2}[a-z0-9]")
+# Where a `--word` token is another tool's option rather than the project's own name (founder decision 2026-09-29):
+# a CI file and a lockfile or manifest, besides a shell command. In the project's own source `ARGS = ['--billing']`
+# is the project's own flag, and it is read as code.
+CI_FILE_RE = re.compile(
+    r"(?:^|/)(?:\.github/workflows/[^/]+|\.github/actions/.+/action|action|\.gitlab-ci|\.gitlab/ci/.+|"
+    r"\.circleci/config|azure-pipelines|bitbucket-pipelines|\.travis|\.drone|\.woodpecker|\.woodpecker/.+|"
+    r"\.buildkite/.+|appveyor|cloudbuild|codemagic)\.ya?ml$|(?:^|/)jenkinsfile$", re.I)
+LOCKFILE_NAMES = frozenset({"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
+                            "bun.lockb", "deno.lock", "poetry.lock", "pipfile.lock", "pdm.lock", "uv.lock", "cargo.lock",
+                            "go.sum", "gemfile.lock", "composer.lock", "mix.lock", "pubspec.lock", "podfile.lock",
+                            "packages.lock.json", "gradle.lockfile", "flake.lock"})
+# Standard and well-known library modules whose name is another form of an ordinary word, as dotted paths: an import
+# of one of these, or of a module under it, is someone else's module (`from collections import …`,
+# `import java.util.Collections;`, `using System.Collections.Generic;`, `use std::collections::HashMap;`). Anything
+# else an import names may be the project's own module, and the project's own module in either number is how code
+# names the refused feature (`from app.billings import charge`, `import './billings'`, `from app.collections import …`).
+LIBRARY_MODULES = frozenset({
+    "collections", "numbers", "types", "requests", "secrets", "warnings",       # Python (standard library; requests)
+    "java.util.collections", "java.util.arrays", "java.util.objects",           # Java
+    "kotlin.collections", "system.collections", "system.threading.tasks",       # Kotlin, C#
+    "std.collections",                                                          # Rust (`std::collections`)
+    "events", "strings", "errors", "slices", "maps",                            # Node (`events`), Go
+})
+
+
+def _base_name(path: str) -> str:
+    return str(path or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+
+
+def is_option_context(path: str) -> bool:
+    """A CI file, a lockfile or a manifest: text where a `--word` token is another tool's command-line option."""
+    slashed = str(path or "").replace("\\", "/").lower()
+    name = _base_name(path)
+    return bool(slashed) and (bool(CI_FILE_RE.search(slashed)) or name in LOCKFILE_NAMES or _is_manifest(slashed))
+
+
+def technology_triggers(cfg: dict) -> frozenset:
+    """The triggers that name a technology — a lexicon name (`stripe`, `paddle`), a package the config forbids, a
+    package of the capability lexicon. The option rule never weakens them (founder decision 2026-09-29): a Non-Goal
+    that names Stripe is crossed by `--stripe-key` on a line of code, in a shell command and a CI file too."""
+    names = set(TECHNOLOGY_WORDS) | {str(p).lower().strip() for p in cfg.get("deny_packages") or [] if p}
+    for spec in CAPABILITY_TRIGGERS.values():
+        names |= {str(p).lower() for p in spec.get("packages") or []}
+    return frozenset(names)
+
+
+def is_ignore_file(path: str) -> bool:
+    """`.gitignore` and its kin (`.dockerignore`, `.npmignore`, `.eslintignore`, `.prettierignore`, …): a line there
+    names what a tool skips; it builds nothing."""
+    name = _base_name(path)
+    return name.startswith(".") and name.endswith("ignore") and len(name) >= len(".ignore")
+
+
+def comment_prefixes(path: str) -> tuple:
+    """How a comment line starts in this file, by its name or extension; () for a language this does not know."""
+    name = _base_name(path)
+    if name in HASH_COMMENT_NAMES or name.startswith("dockerfile."):
+        return _HASH
+    ext = "." + name.rsplit(".", 1)[1] if "." in name.lstrip(".") else ""
+    return COMMENT_PREFIXES.get(ext, ())
+
+
+def is_comment_line(path: str, line: str) -> bool:
+    """True when the whole line is a comment in this file's language. A trailing comment after code
+    (`x = 1  # stripe`) is not one, and neither is a block comment closed on the line with code after it
+    (`/* eslint-disable */ import stripe from 'stripe'`) or a comment that instructs a tool (`// eslint-disable-…`,
+    `# noqa`, `// @ts-ignore`, `//go:generate`): those lines are code."""
+    s = str(line or "").strip()
+    if not s or DIRECTIVE_COMMENT_RE.search(s):
+        return False
+    for prefix in comment_prefixes(path):
+        if prefix == "*":  # a line inside a /* … */ block; `*ptr = x` is code
+            if s == "*" or s.startswith(("* ", "*/")):
+                return True
+            continue
+        if not s.lower().startswith(prefix):
+            continue
+        closer = BLOCK_COMMENT_CLOSERS.get(prefix)
+        if closer and closer in s[len(prefix):] and s[s.rfind(closer) + len(closer):].strip():
+            return False
+        return True
+    return False
+
+
+def _foreign_name(low: str, keyword: str, options: bool = False) -> str:
+    """Why every match of a single-word keyword in this (lower-cased) line is inside a name that belongs to another
+    tool or library, or "" when one of them may be the project's own code.
+
+    Two such names. A command-line option (`--frozen-lockfile`, `--lockfile-only` for the marker `lockfiles`), only
+    when `options` says the line is a shell command, a CI file, a lockfile or a manifest (`is_option_context`): in the
+    project's own source `ARGS = ['--billing']` is the project's own flag. And the module of an import statement
+    when the module is a standard or well-known library (`LIBRARY_MODULES`) and spells another form of the word
+    (`from collections import …` for the marker `collection`). The project's own identifiers in either number —
+    `class Leaderboard`, `streak_count`, `/api/leaderboards`, `from app.billings import charge`, `import './billings'`
+    — are not foreign: that is how code names the refused feature."""
+    matches = list(keyword_pattern(keyword).finditer(low))
+    if not matches:
+        return ""  # found only with camel case opened up: an identifier of the project's own
+    modules = [m.span(1) for rx in IMPORT_MODULE_RES for m in rx.finditer(low)]
+    word = str(keyword).lower().strip()
+    reasons: list[str] = []
+    for m in matches:
+        if options:
+            start = max(low.rfind(" ", 0, m.start()), low.rfind("\t", 0, m.start())) + 1
+            ends = [i for i in (low.find(" ", m.end()), low.find("\t", m.end())) if i >= 0]
+            token = low[start:min(ends) if ends else len(low)].lstrip("\"'`([{").rstrip("\"'`.,:;)]}")
+            if OPTION_TOKEN_RE.match(token):
+                reasons.append(f"the option '{token}'")
+                continue
+        span = next(((a, b) for a, b in modules if a <= m.start() < b), None)
+        if span is not None and m.group(0) != word and _library_module(low[span[0]:span[1]], m.start() - span[0]):
+            reasons.append(f"the imported module '{low[span[0]:span[1]].strip()}'")
+            continue
+        return ""
+    return reasons[0]
+
+
+def _library_module(modules: str, at: int) -> bool:
+    """The imported module that holds position `at` of an import's module list is a library's (`LIBRARY_MODULES`,
+    or a module under one), not the project's: `collections.abc` yes, `app.collections` and `./collections` no."""
+    for part in re.finditer(r"[^,\s]+", modules):
+        if part.start() <= at < part.end():
+            path = re.sub(r"::|[\\/]", ".", part.group(0).strip("'\"`;"))
+            path = path[len("node:"):] if path.startswith("node:") else path
+            return any(path == lib or path.startswith(lib + ".") for lib in LIBRARY_MODULES)
+    return False
+
+
+def line_hits(cfg: dict, line: str, file: str = "", shell: bool = False,
+              technologies: frozenset | None = None) -> list[tuple[str, str, str, str]]:
+    """(kind, trigger, severity, why) for the Non-Goal triggers of one line of `file` (the file gives the language;
+    it is not itself matched — a forbidden path of the file is the caller's). `shell` says the line is a shell
+    command. `technologies` is `technology_triggers(cfg)`, passed in by a caller that reads many lines. `severity`:
+
+    - `block`: a blocking trigger on a line of code (or of a file whose language is not known, and in a command);
+    - `noted`: a blocking trigger in a comment line of a code file, or anywhere in an ignore file — written down,
+      not crossed; `why` says which;
+    - `warn`: a warn-only marker; or a single-word keyword whose every match is inside another tool's command-line
+      option (in a shell command, a CI file, a lockfile or a manifest, and not a technology) or an import of a
+      library that spells another form of the word (`why` names it).
+
+    Pure. Package names in an install command, a manifest or an import, forbidden paths, names written as code and
+    phrases are never weakened by `_foreign_name`; only a comment or an ignore file makes them `noted`."""
+    out: list[tuple[str, str, str, str]] = []
+    comment = bool(file) and is_comment_line(file, line)
+    ignore = bool(file) and is_ignore_file(file)
+    low = ""
+    context: bool | None = None
+    for kind, trigger in trigger_hits(cfg, line):
+        if ignore:
+            out.append((kind, trigger, "noted", "an ignore file"))
+            continue
+        if comment:
+            out.append((kind, trigger, "noted", "a comment"))
+            continue
+        if kind == "keyword" and not str(trigger).lstrip().startswith("@"):
+            low = low or _without_home_folders(line).lower()
+            if context is None:
+                context = shell or is_option_context(file)
+            options = context and str(trigger).lower().strip() not in (
+                technologies if technologies is not None else technology_triggers(cfg))
+            foreign = _foreign_name(low, trigger, options=options)
+            if foreign:
+                out.append((kind, trigger, "warn", foreign))
+                continue
+        out.append((kind, trigger, "block", ""))
+    out += [(kind, trigger, "warn", "") for kind, trigger in warn_triggers(cfg, line)]
+    return out
+
+
+# The order a trigger's verdict is decided in, over all the lines of one tool call: a line of code outranks a comment
+# line, so `noted` is the verdict only of a trigger no line of code carries (2026-09-29).
+SEVERITY_ORDER = ("block", "warn", "noted")
+
+
+def judge_tool_input(cfg: dict, tool_name: str, tool_input: dict) -> dict[str, list[tuple[str, str, str]]]:
+    """Every Non-Goal hit of a tool call, judged: `{"block" | "warn" | "noted": [(kind, trigger, why)]}`.
+
+    A shell command is one unit, as it always was (a package in `pip install stripe` blocks exactly as before); the
+    data it carries into a document — a commit message, a heredoc body — is left out (`check_data_mentions`). The
+    content of a Write or an Edit is read line by line with `line_hits`, the reading `check-diff` gives an added
+    line; the file's own path is matched once and a forbidden path blocks.
+
+    Per trigger, as `check-diff` reports the same lines: `block` when any line blocks on it; otherwise `warn` when any
+    line is a possible match; `noted` lists every trigger a comment line or an ignore file writes down and no line
+    blocks on — it may also be in `warn`, and both are shown. A Write is only "written down" when `block` and `warn`
+    are both empty (`main`): a comment never hides a line of code that carries the same trigger (review 2026-09-29)."""
     text, path = text_of_tool_input(tool_name, tool_input)
-    if is_command(tool_name, tool_input):
-        text = _command_without_data(text)
-    return match_triggers(cfg, text, path)
+    judged: dict[str, list[tuple[str, str, str]]] = {s: [] for s in SEVERITY_ORDER}
+    shell = is_command(tool_name, tool_input)
+    if shell:
+        units, file = [_command_without_data(text)], ""
+    else:
+        units, file = str(text or "").split("\n"), path
+        judged["block"] += [(kind, trigger, "") for kind, trigger in trigger_hits(cfg, "", path)]
+    whole = "\n".join(units)
+    # only the triggers the whole text holds are read line by line: a long file costs one pass per trigger found
+    found = {t for _k, t in trigger_hits(cfg, whole)} | {t for _k, t in warn_triggers(cfg, whole)}
+    if found:
+        narrow = dict(cfg)
+        for key in ("deny_packages", "deny_paths", "keywords", "warn_keywords"):
+            narrow[key] = [t for t in cfg.get(key) or [] if t in found]
+        technologies = technology_triggers(cfg)  # from the whole config: the narrowed one lost unmatched packages
+        for unit in units:
+            for kind, trigger, severity, why in line_hits(narrow, unit, file, shell=shell, technologies=technologies):
+                judged[severity].append((kind, trigger, why))
+    blocked = {str(trigger).lower() for _k, trigger, _w in judged["block"]}
+    for severity in SEVERITY_ORDER:
+        kept, seen = [], set()
+        for kind, trigger, why in judged[severity]:
+            low = str(trigger).lower()
+            if low in seen or (severity != "block" and low in blocked):
+                continue
+            seen.add(low)
+            kept.append((kind, trigger, why))
+        judged[severity] = kept
+    return judged
+
+
+def _hit_order(cfg: dict):
+    """The order `trigger_hits` reports in: packages, paths, then keywords, each as the config lists them."""
+    rank = {"package": 0, "path": 1, "keyword": 2, "phrase": 2}
+    keys = {"package": "deny_packages", "path": "deny_paths", "keyword": "keywords", "phrase": "keywords"}
+
+    def key(hit: tuple) -> tuple:
+        listed = [str(t) for t in cfg.get(keys.get(hit[0], "keywords")) or []]
+        return (rank.get(hit[0], 3), listed.index(hit[1]) if hit[1] in listed else len(listed))
+    return key
+
+
+def render_hits(cfg: dict, hits: list[tuple[str, str, str]]) -> list[str]:
+    """One line per boundary, as `match_triggers` writes them: "forbidden dependency 'stripe', Non-Goal keyword
+    'stripe' → NG-1 "…" (set by the founder; …)"."""
+    grouped: dict[str, list[str]] = {}
+    for kind, trigger, _why in sorted(hits, key=_hit_order(cfg)):
+        grouped.setdefault(explain(cfg, trigger), []).append(f"{TRIGGER_LABELS[kind]} '{trigger}'")
+    return sorted(", ".join(dict.fromkeys(whats)) + why for why, whats in grouped.items())
+
+
+def check_pre_tool(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
+    """Non-Goal hits of a tool call that refuse it: a blocking trigger in a shell command, on a line of code of the
+    content, or the file's own forbidden path. For a shell command the data it carries into a document — a commit
+    message, a heredoc body appended to a Markdown file — is left out: `git commit -m "docs: explain why billing is
+    out of scope"` was refused as a crossing of the billing boundary (audit 2026-09-23). `check_data_mentions`
+    reports what the data names, as `noted`; `check_written_down` what only a comment or an ignore file names."""
+    return render_hits(cfg, judge_tool_input(cfg, tool_name, tool_input)["block"])
+
+
+def check_written_down(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
+    """Blocking triggers that the content names only in comment lines or in an ignore file (2026-09-29): the
+    boundary written down, not crossed — the same reading as a Write of a prose file, logged as `noted`. A trigger
+    that a line of code also carries is not one of them (it blocks, or it is a possible match)."""
+    judged = judge_tool_input(cfg, tool_name, tool_input)
+    on_code = {str(t).lower() for _k, t, _w in judged["warn"]}
+    return render_hits(cfg, [hit for hit in judged["noted"] if str(hit[1]).lower() not in on_code])
 
 
 def check_data_mentions(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
     """Non-Goal hits that only the data of a shell command carries (see `check_pre_tool`): documentation of a
-    boundary, the same reasoning as a Write of a prose file."""
+    boundary, the same reasoning as a Write of a prose file. A trigger the command itself carries is not one of them,
+    even when it does not refuse the call (`--frozen-lockfile` is a possible match, not a commit message)."""
     if not is_command(tool_name, tool_input):
         return []
-    return match_triggers(cfg, str((tool_input or {}).get("command", "")))
+    command = str((tool_input or {}).get("command", ""))
+    outside = {trigger for _kind, trigger in trigger_hits(cfg, _command_without_data(command))}
+    return render_hits(cfg, [(kind, trigger, "") for kind, trigger in trigger_hits(cfg, command) if trigger not in outside])
+
+
+def possible_line(cfg: dict, trigger: str, why: str = "") -> str:
+    """The warning line of a possible match, naming its boundary and, when there is one, why it is not more."""
+    return f"possible match with '{trigger}'" + (f" (only inside {why})" if why else "") + explain(cfg, trigger)
 
 
 def check_warn_markers(cfg: dict, tool_name: str, tool_input: dict) -> list[str]:
     """One line per warn-only marker, each naming its boundary — the same `→ NG-n "…" (origin; source)` tail a
     refusal carries, so `report`, `doctor` and LUMIS Amend attribute a warning to a boundary exactly as they
     attribute a block. Runs for commands too: a lone word out of a long sentence shows up in `python -m …`
-    more often than anywhere else. A commit message is data, like for a refusal."""
-    text, _path = text_of_tool_input(tool_name, tool_input)
-    if is_command(tool_name, tool_input):
-        text = _command_without_data(text)
-    return sorted({f"possible match with '{trigger}'" + explain(cfg, trigger) for _kind, trigger in warn_triggers(cfg, text)})
+    more often than anywhere else. A commit message is data, like for a refusal. Since 2026-09-29 it also carries a
+    blocking keyword found only inside another tool's command-line option (a shell command, a CI file, a lockfile or a
+    manifest; never a technology) or a library's import spelling another form of the word."""
+    return sorted({possible_line(cfg, trigger, why)
+                   for _kind, trigger, why in judge_tool_input(cfg, tool_name, tool_input)["warn"]})
 
 
 # --- boundary → markers, the stdlib derivation ------------------------------------------------------------------
@@ -1417,12 +1746,27 @@ TECHNOLOGY_WORDS = {
     "grpc", "graphql", "websocket", "websockets", "docker", "kubernetes", "terraform", "nginx",
     "firebase", "supabase", "auth0", "keycloak", "saml", "ldap", "kerberos", "oauth",
     "stripe", "paypal", "braintree", "adyen", "plaid", "twilio", "sendgrid", "mailgun", "smtp",
+    "paddle", "recurly", "razorpay", "mollie",
     "blockchain", "solidity", "ethereum", "bitcoin", "metamask", "web3", "erc20",
     "electron", "tauri", "flutter", "expo", "swiftui", "xcode", "cordova", "capacitor",
     "django", "flask", "fastapi", "express", "nestjs", "nextjs", "rails", "laravel", "spring",
     "sqlalchemy", "sqlmodel", "prisma", "drizzle", "typeorm", "sequelize", "mongoose",
     "microservice", "microservices", "serverless", "istio", "consul", "airflow", "spark",
     "tensorflow", "pytorch", "langchain", "pinecone", "weaviate", "chromadb",
+}
+# The words of a Non-Goal phrase that code uses every day for something else (founder decision 2026-09-29). Inside a
+# short boundary the phrase blocks («payment collection»), and so does each of its words — `payment` and `billing`
+# name the capability itself — except a word on this list, which only warns: `collections` is a standard library
+# module, `session` an HTTP or database session, `mobile` a layout breakpoint, `yarn` and `lockfile` what every
+# JavaScript repository names in its ignore files, CI and lockfiles; `connection`, `pool`, `generated`, `mocks` what
+# every Go or Java repository says in its own code (decision 1б, 29.09: the phrases `connection pool` and `generated
+# mocks` still block). No capability word (`CAPABILITY_TRIGGERS`) and no technology is on it (test_boundary_markers).
+# The product's `boundary_markers.CODE_HOMONYMS` is the same list.
+CODE_HOMONYMS = {
+    "collection", "collections", "session", "sessions", "record", "records", "mobile", "yarn", "lockfile", "lockfiles",
+    "token", "tokens", "cache", "caches", "queue", "queues", "stream", "streams", "channel", "channels",
+    "message", "messages", "connection", "connections", "pool", "pools", "generated", "generate", "modify", "modified",
+    "manually", "manual", "persistent", "mock", "mocks",
 }
 SHORT_BOUNDARY_WORDS = 4  # longer than this, in the founder's own words, and the boundary's lone words only warn
 PHRASE_BRIDGES = {"of"}   # the one dropped word a phrase steps over (see markers_for); the product's list is the same
@@ -1447,6 +1791,12 @@ PRESCRIBES_RE = re.compile(
 # "only" from the half that carries it.
 SEGMENT_RE = re.compile(r"[;:]|(?<!\d)\.(?!\d)|\bbut\b|\bно\b|—|–", re.IGNORECASE)
 PUNCTUATION_RE = re.compile(r"[^\w\s]+", re.UNICODE)
+# A token the founder writes as code: anything in backticks without a space (`eval`, `package-lock.json`) and an
+# annotation or decorator (`@Transactional`), an `@` that opens a word (`admin@example.com` is not one). It blocks as
+# written, and its plain words only warn: «never use @Transactional» armed a bare `transactional` that refused comment
+# lines that merely said a method was transactional (retro of a public repository, 2026-09-29).
+CODE_SPAN_RE = re.compile(r"`([^`\s]{2,80})`")
+ANNOTATION_RE = re.compile(r"(?<![\w@.`/])@[A-Za-z_](?:[\w.\-/]*\w)?")
 CAMEL_RE = re.compile(r"([a-z0-9])([A-Z])")
 SEPARATOR_RE = re.compile(r"[\-_\./\\:;\(\)\[\]\"']+")
 
@@ -1488,8 +1838,47 @@ def stack_vocabulary(stack: str) -> set:
     return words | {w[:-1] for w in words if w.endswith("s")} | {w + "s" for w in words}
 
 
+def code_names(text: str) -> list:
+    """The tokens a boundary writes as code, lower-cased, in order (`@Transactional` → `@transactional`); a trailing
+    `()` and sentence punctuation dropped. A backticked word every repository contains is not a name; a token under
+    three characters is too short to mean one thing. The product's `boundary_markers.code_names`, ported."""
+    raw = [m.group(1) for m in CODE_SPAN_RE.finditer(str(text or ""))] + \
+          [m.group(0) for m in ANNOTATION_RE.finditer(str(text or ""))]
+    out: list = []
+    for token in raw:
+        token = token.strip().rstrip(".,;:!?").lower()
+        if token.endswith("()"):
+            token = token[:-2]
+        body = token.lstrip("@")
+        if len(body) < 3 or not re.search(r"[^\W\d_]", body):
+            continue
+        if token.isalnum() and (token in COMMON_CODE_WORDS or token in GENERIC_ARCHITECTURAL_STOPWORDS
+                                or token in FUNCTION_WORDS):
+            continue
+        if token not in out:
+            out.append(token)
+    return out
+
+
+CODE_MASK = str.maketrans({".": "\x00", ";": "\x01", ":": "\x02"})
+CODE_UNMASK = str.maketrans({"\x00": ".", "\x01": ";", "\x02": ":"})
+
+
+def refused_code_names(boundary: str) -> list:
+    """`code_names` of the statements that refuse (a code token in the half that prescribes is what the founder
+    wants), split with the code tokens masked so the dot of `package-lock.json` does not end a statement."""
+    text = str(boundary or "")
+    chars = list(text)
+    for m in list(CODE_SPAN_RE.finditer(text)) + list(ANNOTATION_RE.finditer(text)):
+        for i in range(*m.span()):
+            chars[i] = chars[i].translate(CODE_MASK)
+    segments = SEGMENT_RE.split("".join(chars))
+    kept = [p for p in segments if not prescribes(p)] or segments
+    return code_names(" ".join(kept).translate(CODE_UNMASK))
+
+
 def markers_for(boundary: str, vocabulary: set) -> tuple:
-    """(blocking markers, warn-only markers) for one boundary — phrases first, then words, in that order."""
+    """(blocking markers, warn-only markers) for one boundary — code names first, then phrases, then words."""
     segments = SEGMENT_RE.split(str(boundary or ""))
     kept = [p for p in segments if not prescribes(p)] or segments
     clauses = [" ".join(glue_technologies(c.split()))
@@ -1517,14 +1906,22 @@ def markers_for(boundary: str, vocabulary: set) -> tuple:
     # per-boundary cap cuts from the tail and a word the founder listed on its own must survive it
     enumerated = len(clauses) >= LIST_ITEMS_MIN and len(clauses[0].split()) <= LIST_HEAD_WORDS
     list_items = {c for c in clauses if len(c.split()) == 1 and len(c) > 3} if enumerated else set()
-    raw = list(dict.fromkeys([t for t in tokens if t in list_items] + phrases + tokens))
+    # a token written as code leads (the most specific marker); its plain words are a part of it and only warn
+    code = refused_code_names(boundary)
+    code_parts = {w for token in code for w in normalize(PUNCTUATION_RE.sub(" ", token)).split()} - set(code)
+    raw = list(dict.fromkeys(code + [t for t in tokens if t in list_items] + phrases + tokens))
     whole = not raw
     if whole:
         raw = [normalize(boundary)]
     short = len(words) <= SHORT_BOUNDARY_WORDS
     blocking, warning = [], []
+    phrase_words: set = set()  # the words of the phrases armed so far: every phrase comes before the first word
     for text in raw:
         parts = text.split()
+        if text in code:
+            if text not in vocabulary:
+                blocking.append(text)
+            continue
         if not text or len(text) < 3 or text in GENERIC_ARCHITECTURAL_STOPWORDS:
             continue
         if not whole and any(len(w) < 3 or w.isdigit() for w in parts):
@@ -1533,7 +1930,17 @@ def markers_for(boundary: str, vocabulary: set) -> tuple:
             continue
         if whole:
             continue  # nothing but function words: a marker nobody would ever write into a file
-        if " " in text or short or text in list_items:
+        if " " in text:
+            blocking.append(text)
+            phrase_words.update(parts)
+        elif short and text in TECHNOLOGY_WORDS:
+            blocking.append(text)  # a short boundary whose one word is the name of the thing refused
+        elif text in code_parts or (short and text in phrase_words and text in CODE_HOMONYMS):
+            # one part of a longer name the boundary gives, and a word code uses for something else: the phrase or
+            # the code name blocks, the word warns — a lone `collection` refused `from collections import
+            # defaultdict` (2026-09-29). `payment` and `billing` name the capability itself and keep blocking.
+            warning.append(text)
+        elif short or text in list_items:
             blocking.append(text)
         else:
             warning.append(text)
@@ -2917,6 +3324,14 @@ def doctor() -> int:
                       + ", ".join(f"'{w}'" for w in stale[:8]) + ("…" if len(stale) > 8 else ""))
                 print("    (they refuse ordinary work — `python scripts/scope_guard.py rebuild-markers --dry-run`")
                 print("     shows what today's rules would derive from the same boundaries; nothing else changes.)")
+            loose = [w for w in downgraded_markers(cfg) if w not in stale]
+            if loose:
+                print(f"  · {len(loose)} blocking keyword(s) would only warn if the markers were derived again today "
+                      "(a word code uses for something else, inside a longer name the boundary gives): "
+                      + ", ".join(f"'{w}'" for w in loose[:8]) + ("…" if len(loose) > 8 else ""))
+                print("    (they still block on a line of code until you run `python scripts/scope_guard.py rebuild-markers`;"
+                      " `--dry-run` shows the change first. A keyword that only a comment line or an ignore file names is"
+                      " logged as `noted`, not blocked, whether you rebuild or not.)")
             if guard_mode(cfg) == "observe":
                 print("  · mode: observe — nothing is refused except a change to the guard itself; what would have been stopped is"
                       " logged (`python scripts/scope_guard.py observe off` to enforce)")
@@ -3316,7 +3731,8 @@ def rebuild_markers(root: Path, dry_run: bool = False) -> int:
             if text in old_block:
                 # not a removal: the word is still a marker, it just stopped refusing. This is the whole of the
                 # 2026-09-21 fix — `python`, `curriculum`, `production` out of a long sentence are hints, not proof
-                lines.append(f"    → warn   {text}   (was blocking; one word of a long sentence)")
+                lines.append(f"    → warn   {text}   (was blocking; one word of a long sentence, or a word code uses"
+                             " for something else inside a longer name the boundary gives)")
             elif text not in old_warn_set:
                 lines.append(f"    + warn   {text}")
         for text in gone:
@@ -3394,6 +3810,18 @@ def rebuild_markers(root: Path, dry_run: bool = False) -> int:
 def stale_markers(cfg: dict) -> list[str]:
     return sorted({k for k in (cfg.get("keywords") or [])
                    if " " not in str(k) and (str(k).lower() in COMMON_CODE_WORDS or str(k).lower() in FUNCTION_WORDS)})
+
+
+# The same kind of advice for the rule of 2026-09-29: a config derived before it blocks on `collection` out of
+# «No payment collection or billing», where today's derivation arms the phrase and lets that word only warn
+# (`payment` and `billing` keep blocking: they name the capability, and `collection` is also a library's name).
+def downgraded_markers(cfg: dict) -> list[str]:
+    try:
+        fresh = derive_config_markers(cfg)
+    except Exception:
+        return []
+    warn_now = {str(w).lower() for w in fresh["warn_keywords"]}
+    return sorted({str(k) for k in (cfg.get("keywords") or []) if " " not in str(k) and str(k).lower() in warn_now})
 
 
 # --- the second checkpoint: the same boundaries on a pull request diff -------------------------------------------
@@ -3513,8 +3941,8 @@ def drop_noise(hits: list[dict]) -> list[dict]:
         trigger = str(hit["trigger"]).lower()
         severity = str(hit.get("severity") or "block")
         wider = covers.get(hit["line"], set())
-        # a warn-only phrase never hides a blocking word: the stronger verdict must stay in sight
-        if hit["kind"] == "keyword" and any(trigger != big and trigger in big and (sev == "block" or severity == "warn")
+        # a warn-only (or only noted) phrase never hides a blocking word: the stronger verdict must stay in sight
+        if hit["kind"] == "keyword" and any(trigger != big and trigger in big and (sev == "block" or severity != "block")
                                             for big, sev in wider):
             continue
         out.append(hit)
@@ -3606,8 +4034,11 @@ def scan_fragment(cfg: dict, fragment: str, path: str = "", *, max_chars: int = 
     """The whole reading of a pasted fragment or diff: ``{hits, possible, lines_checked, truncated}``.
 
     `hits` is what the hook would stop a call on; `possible` are warn-only markers — a single word out of a long
-    boundary, which the hook shows and lets through. They are never mixed: a possible match presented as a violation
-    is an invented verdict, only from the other side.
+    boundary, which the hook shows and lets through — and, since 2026-09-29, what the hook reads as written down
+    rather than crossed (a comment line of a code file, an ignore file: `severity` "noted") or as a keyword only inside
+    another tool's option or module name; `why` says which. They are never mixed: a possible match presented as a
+    violation is an invented verdict, only from the other side. Each line is read by `line_hits`, with the file of the
+    diff header (or `path`) giving the language, exactly as `check-diff` reads an added line.
 
     `lines_checked` counts the text the matcher actually saw (cut at `max_chars`), not the paste as sent. `truncated`
     is true when the input was cut by characters, by lines, **or** the hits reached `max_hits`: a list cut short in
@@ -3623,7 +4054,7 @@ def scan_fragment(cfg: dict, fragment: str, path: str = "", *, max_chars: int = 
     capped = False
 
     def add(kind: str, trigger: str, line_no: int, excerpt: str, file_name: str = "", file_line: int = 0,
-            severity: str = "block") -> bool:
+            severity: str = "block", why: str = "") -> bool:
         nonlocal capped
         key = (trigger.lower(), line_no)
         if key in seen:
@@ -3637,6 +4068,7 @@ def scan_fragment(cfg: dict, fragment: str, path: str = "", *, max_chars: int = 
             "trigger": trigger,
             "kind": kind,
             "severity": severity,
+            "why": why,
             "line": line_no,
             "file": file_name,
             "file_line": file_line,
@@ -3651,7 +4083,7 @@ def scan_fragment(cfg: dict, fragment: str, path: str = "", *, max_chars: int = 
         kept = drop_noise(out)
         return {
             "hits": [h for h in kept if h["severity"] == "block"],
-            "possible": [h for h in kept if h["severity"] == "warn"],
+            "possible": [h for h in kept if h["severity"] != "block"],
             "lines_checked": len(lines),
             "truncated": len(raw) > max_chars or len(diff_text_lines(raw)) > max_lines or capped,
         }
@@ -3661,9 +4093,10 @@ def scan_fragment(cfg: dict, fragment: str, path: str = "", *, max_chars: int = 
         for kind, trigger, severity in all_hits(cfg, "", path):
             if not add(kind, trigger, 0, str(path), file_name=str(path), severity=severity):
                 return result()
+    technologies = technology_triggers(cfg)
     for line_no, file_name, file_line, _sign, body in diff_lines(lines, diff):
-        for kind, trigger, severity in all_hits(cfg, body):
-            if not add(kind, trigger, line_no, body.strip(), file_name, file_line, severity=severity):
+        for kind, trigger, severity, why in line_hits(cfg, body, file_name or str(path or ""), technologies=technologies):
+            if not add(kind, trigger, line_no, body.strip(), file_name, file_line, severity=severity, why=why):
                 return result()
     return result()
 
@@ -3953,8 +4386,10 @@ def _guard_file_name(path: str) -> str:
 
 def _ci_prose(path: str) -> bool:
     """Prose for the CI check: `is_prose_path`, plus the rule files the agent reads (.cursorrules, CLAUDE.md,
-    AGENTS.md): LUMIS writes the Non-Goals into them, and writing a boundary down is inside it."""
-    return is_prose_path(path) or _clean_path(path) in {f.lower() for f in GUARD_TEXT_FILES}
+    AGENTS.md): LUMIS writes the Non-Goals into them, and writing a boundary down is inside it. An ignore file
+    (.gitignore, .dockerignore, …) is read the same way since 2026-09-29, as the hook reads it: it names what a tool
+    skips and builds nothing (`yarn-debug.log*` is not a yarn lockfile)."""
+    return is_prose_path(path) or is_ignore_file(path) or _clean_path(path) in {f.lower() for f in GUARD_TEXT_FILES}
 
 
 def _norm_text(text: str) -> str:
@@ -4175,7 +4610,10 @@ def _ci_finding(cfg: dict, verdict: str, kind: str, *, rule_id: str = "", trigge
 def line_findings(cfg: dict, diff_text: str, *, max_chars: int = CI_MAX_CHARS, max_lines: int = CI_MAX_LINES,
                   max_hits: int = CI_MAX_HITS) -> tuple[list[dict], dict]:
     """Findings on the ADDED lines of a diff; a `-` line never violates anything. A blocking trigger in code is a
-    BLOCK, in a document or a test it is `noted` (the hook's own exemption: writing a boundary down is inside it); a
+    BLOCK, in a document or a test it is `noted` (the hook's own exemption: writing a boundary down is inside it), and
+    so it is in a comment line of a code file or an ignore file; a keyword found only inside another tool's option (in
+    a CI file, a lockfile or a manifest; never a technology) or a library's import spelling another form of the word
+    is `possible` (`line_hits`, the hook's reading of one line, 2026-09-29); a
     warn-only marker is `possible` in code and says nothing in a document, as in the hook; a route, model or table
     ARCHITECTURE.md does not know is a warning on a code file. The guard's own files are skipped: they carry the
     boundaries' own words, and a change to them is `guard_file_findings`' business.
@@ -4194,6 +4632,7 @@ def line_findings(cfg: dict, diff_text: str, *, max_chars: int = CI_MAX_CHARS, m
     added = walked = dropped = blocks = 0
     stopped = False
     kinds: dict[str, tuple[str, bool, bool]] = {}  # header name -> (path, guard file, prose)
+    technologies = technology_triggers(cfg)
 
     def keep(finding: dict) -> None:
         nonlocal dropped, blocks
@@ -4218,22 +4657,27 @@ def line_findings(cfg: dict, diff_text: str, *, max_chars: int = CI_MAX_CHARS, m
             continue
         seen: set[str] = set()
         hits: list[dict] = []
-        for kind, trigger, severity in all_hits(cfg, body):
+        # the hook's own reading of one line (`line_hits`): a comment of a code file and an ignore file write a
+        # boundary down; a keyword only inside another tool's option (a CI file, a lockfile or a manifest, never a
+        # technology) or a library's module name is a possible match
+        for kind, trigger, severity, why in line_hits(cfg, body, path, technologies=technologies):
             if trigger.lower() in seen:
                 continue
             seen.add(trigger.lower())
-            hits.append({"kind": kind, "trigger": trigger, "severity": severity, "line": file_line})
+            hits.append({"kind": kind, "trigger": trigger, "severity": severity, "why": why, "line": file_line})
         excerpt = redact(body, EXCERPT_LEN)
         for hit in drop_noise(hits):
             kind, trigger = hit["kind"], hit["trigger"]
             where = {"trigger": trigger, "trigger_kind": kind, "file": path, "file_line": file_line, "excerpt": excerpt}
             if hit["severity"] == "warn":
                 if not prose:  # the hook says nothing about a possible match in a document, and neither does this
-                    keep(_ci_finding(cfg, "WARN", "possible", message=f"possible match with '{trigger}'"
-                                     + explain(cfg, trigger), **where))
+                    keep(_ci_finding(cfg, "WARN", "possible", message=possible_line(cfg, trigger, hit["why"]), **where))
                 continue
             said = f"{TRIGGER_LABELS.get(kind, 'Non-Goal trigger')} '{trigger}'" + explain(cfg, trigger)
-            if prose:
+            if hit["severity"] == "noted":
+                keep(_ci_finding(cfg, "WARN", "noted", message=f"written down in {hit['why']}, not crossed: " + said,
+                                 **where))
+            elif prose:
                 keep(_ci_finding(cfg, "WARN", "noted", message="written down, not crossed: " + said, **where))
             else:
                 keep(_ci_finding(cfg, "BLOCK", "violation", message=said, **where))
@@ -4268,7 +4712,8 @@ def path_findings(cfg: dict, changed: list[dict]) -> list[dict]:
             said = f"{TRIGGER_LABELS['path']} '{deny_path}'" + explain(cfg, deny_path)
             where = {"trigger": deny_path, "trigger_kind": "path", "file": path, "excerpt": path}
             if prose:
-                out.append(_ci_finding(cfg, "WARN", "noted", message=f"written down, not crossed: {said} (a document {verb} under it)", **where))
+                what = "an ignore file" if is_ignore_file(path) else "a document"
+                out.append(_ci_finding(cfg, "WARN", "noted", message=f"written down, not crossed: {said} ({what} {verb} under it)", **where))
             else:
                 out.append(_ci_finding(cfg, "BLOCK", "violation", message=f"{said} (a file {verb} under it)", **where))
     return out
@@ -5476,15 +5921,21 @@ def main() -> int:
     # the two exemptions a block already has: looking is not doing, and writing a boundary down is inside it.
     # A possible match must not nag about them either, or the founder learns to ignore the guard's stderr.
     looking = (is_command(tool_name, tool_input) and is_read_only_command(command)) or is_read_only_tool(tool_name, tool_input)
-    documenting = not is_command(tool_name, tool_input) and is_prose_path(tool_path)
+    # an ignore file (.gitignore, .dockerignore, …) names what a tool skips: like a document, it builds nothing
+    documenting = not is_command(tool_name, tool_input) and (is_prose_path(tool_path) or is_ignore_file(tool_path))
     warnings: list[str] = []
-    marker_hits = [] if (looking or documenting) else check_warn_markers(cfg, tool_name, tool_input)
+    # one reading of the call for all three answers below (`check_pre_tool`, `check_written_down`,
+    # `check_warn_markers` are this, rendered): a long Write is read once, not three times
+    judged = judge_tool_input(cfg, tool_name, tool_input)
+    marker_hits = [] if (looking or documenting) else sorted({possible_line(cfg, trigger, why)
+                                                              for _kind, trigger, why in judged["warn"]})
     if marker_hits:
         warnings.append(
             "🔎 LUMIS Scope Guard — for you to judge (this is not a violation): "
             + "; ".join(marker_hits)
-            + ". A single word out of a long Non-Goal sentence is a hint, not proof: if this really is the feature "
-              "the founder ruled out, stop and ask; if it is ordinary work, carry on — nothing is blocked.")
+            + ". A single word out of a Non-Goal sentence, or a word found only inside another tool's option or a "
+              "library's module name, is a hint, not proof: if this really is the feature the founder ruled out, stop and ask; "
+              "if it is ordinary work, carry on — nothing is blocked.")
     design_hits = check_design(cfg, tool_name, tool_input)
     if design_hits:
         warnings.append(
@@ -5518,24 +5969,37 @@ def main() -> int:
                         + "). Keep your own notes, but the LUMIS section is regenerated by Amend — edits to it are lost and the boundaries stay.")
     for w in warnings:
         sys.stderr.write(w + "\n")
-    hits = check_pre_tool(cfg, tool_name, tool_input)
+    hits = render_hits(cfg, judged["block"])  # check_pre_tool
     # what only a commit message or a note appended to a document names: the boundary written down, not crossed
     in_data = [] if hits else check_data_mentions(cfg, tool_name, tool_input)
+    # what comment lines or an ignore file write down and no line blocks on (2026-09-29). When a line of the same
+    # content is a possible match (`marker_hits`), both are shown: the Write is not "only documenting" then.
+    in_notes = [] if (hits or in_data) else render_hits(cfg, judged["noted"])
     if (hits or in_data) and looking:
         # the agent is looking, not building: allow it and record that a boundary area was inspected
         log_event(cfg, "inspected", tool_name, tool_input, hits or in_data, agent, attempted=command or attempted_text)
         return 1 if warnings else 0
     noted = False
-    if (hits and documenting) or in_data:
+    if (hits and documenting) or in_data or in_notes:
         # documenting a boundary is not crossing it: the ADR that explains the Non-Goal, the README line restating
         # it and the test that asserts the feature is absent were all refused as violations of the boundary they
         # were writing down — and each refusal then argued in the Amend dialog for lifting it (audit 2026-09-15).
-        # A commit message that explains a boundary is the same thing (audit 2026-09-23).
-        written = hits or in_data
-        sys.stderr.write("📝 LUMIS Scope Guard: this " + ("file" if hits else "command's message or note")
-                         + " writes a Non-Goal down (" + "; ".join(written)
-                         + "). Documenting or testing a boundary is inside it — only the code that crosses it is not. "
-                           "Allowed and logged as `noted`.\n")
+        # A commit message that explains a boundary is the same thing (audit 2026-09-23), and so is a comment in
+        # code or a line of .gitignore (2026-09-29).
+        written = hits or in_data or in_notes
+        where = ("file" if hits else "command's message or note" if in_data
+                 else "file's comments (or ignore file)")
+        if in_notes and marker_hits:
+            # a line of this Write is also a possible match: the file is not only writing the boundary down, and
+            # saying so would hide the warning above (review 2026-09-29) — both are shown and both are logged
+            sys.stderr.write("📝 LUMIS Scope Guard: comment lines of this file (or its ignore-file lines) name a Non-Goal ("
+                             + "; ".join(written) + "): written down there, not crossed, and logged as `noted`. The "
+                             "possible match above is a separate line — judge it on its own.\n")
+        else:
+            sys.stderr.write("📝 LUMIS Scope Guard: this " + where
+                             + " writes a Non-Goal down (" + "; ".join(written)
+                             + "). Documenting or testing a boundary is inside it — only the code that crosses it is not. "
+                               "Allowed and logged as `noted`.\n")
         log_event(cfg, "noted", tool_name, tool_input, written, agent, attempted=attempted_text or command)
         hits, noted = [], True
         # no early return: the same call can still add a dependency, push, or write outside the project
@@ -5575,7 +6039,9 @@ def main() -> int:
             return 2
         return emit_ask(agent, message)
     if noted:
-        return 1  # the `noted` line is the record; as before, a documented boundary adds no warned/possible lines
+        if in_notes and marker_hits:  # a possible match on a line of the same Write is its own record (2026-09-29)
+            log_event(cfg, "possible", tool_name, tool_input, marker_hits, agent, attempted=attempted_text)
+        return 1  # otherwise the `noted` line is the record; a documented boundary adds no warned/possible lines
     if design_hits or arch_hits:
         log_event(cfg, "warned", tool_name, tool_input, design_hits + arch_hits, agent, attempted=attempted_text)
     if marker_hits:

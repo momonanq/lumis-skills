@@ -1,0 +1,15 @@
+{
+  "name": "lumis-skills",
+  "description": "LUMIS skills for coding agents as Claude Code plugins. One plugin: lumis-scope-guard, the repository root itself.",
+  "owner": {
+    "name": "LUMIS",
+    "email": "support@lumis.tools",
+    "url": "https://lumis.tools/?utm_source=github&utm_medium=plugin"
+  },
+  "plugins": [
+    {
+      "name": "lumis-scope-guard",
+      "source": "./"
+    }
+  ]
+}

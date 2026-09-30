@@ -18,7 +18,7 @@ Prompts alone do not hold; this installs hooks that block the change before it h
   (`.github/hooks/lumis-scope-guard.json`) — all of them deny on exit code 2, so one script guards every agent — copies `scripts/scope_guard.py`,
   writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and marked sections in `.cursorrules` and `CLAUDE.md` (existing content is kept).
   Add `--observe` to install in observe mode (below). The output names the hook version, the mode and the classes:
-  `Hook 2026-09-28 · mode: enforce · classes: ...`.
+  `Hook 2026-09-29 · mode: enforce · classes: ...`.
   Add `--ci` to also write `.github/workflows/lumis-boundary-check.yml`, the same boundaries checked on every pull request
   (see "CI check" below). A different file already at that path is never overwritten: the LUMIS copy goes to
   `.github/lumis-boundary-check.lumis.yml` and the output says so. Without `--ci` the output says how to add it.
@@ -44,6 +44,22 @@ marker listed under `pinned_keywords` — is kept. It is the founder's command: 
 Every block names the boundary it enforces — `NG-3 "no crypto payments" (set by the founder; CONSTITUTION.md, Article I)` — so the
 agent (and the founder) see *which* rule fired and where it is written, not just that something was refused.
 The log stays in the repository; nothing is sent anywhere.
+
+### What blocks and what warns
+
+Only high-precision evidence blocks (exit 2): a forbidden package in an install command, an import or a manifest line; a file
+under a forbidden path; a name the Non-Goal writes as code (`@Transactional`, anything in backticks), as written and fully
+qualified (`@org.springframework.transaction.annotation.Transactional`); a phrase of the Non-Goal (`payment collection`, also
+spelled `payment_collection` or `PaymentCollection`) and a word of it that names the capability (`payment`); a word the Non-Goal
+names on its own (`billing` in «No payment collection or billing», `kafka` in «No Kafka»), a technology a short Non-Goal names, an
+item of a list («leaderboards» in «social feeds, followers, leaderboards or multiplayer»). Everything weaker warns (exit 1): the
+warning is printed on stderr with its reason and logged. That is a word of a phrase that code uses for something else
+(`collection`, `mobile`) or the plain word of a code name (`transactional`), a lone word of a long sentence, any trigger in a
+comment line of a code file or in an ignore file (`noted`: written down, not crossed — unless a line of code in the same change
+carries it), a word found only inside another tool's command-line option in a shell command, a CI file, a lockfile or a manifest
+(`--frozen-lockfile`; never in your own source, never for a technology the Non-Goal names: `--stripe-key` is refused), and a word
+found only in the import of a standard library module spelling another form of it (`from collections import`; your own
+`from app.billings import` is refused). The pull request check (below) reads each added line with the same function.
 
 `<skill-dir>` is the directory this SKILL.md lives in (for Claude Code: `.claude/skills/lumis-scope-guard` or `~/.claude/skills/lumis-scope-guard`).
 
@@ -152,12 +168,13 @@ It reads the lines the diff adds (a removal never crosses a boundary), judges th
 on the base branch, and prints one report: PASS, WARN or BLOCK, and for each finding the boundary (NG-n, who set it, where it
 is written), the file and line, the trigger and the line itself. No score and no model.
 
-- **BLOCK** (exit 2): a Non-Goal trigger in an added line of a code file; a file added, changed, moved or copied under a
+- **BLOCK** (exit 2): a Non-Goal trigger on an added line of code (not a comment, see "What blocks and what warns"); a file added, changed, moved or copied under a
   forbidden path; a new top-level directory the base branch and ARCHITECTURE.md's file plan do not have (only when the config
   carries that inventory, which the full LUMIS pack writes); a dependency when `classes.dependency` is `block`; a change to the
   hook, its client configs or the workflow, or a `.lumis/scope_guard.json` deleted, unreadable or left with no boundary — the
   founder confirms.
-- **WARN** (exit 0): a trigger in a document or a test (`noted`); a warn-only word (`possible`); a route, model or table
+- **WARN** (exit 0): a trigger in a document, a test, a comment line or an ignore file (`noted`); a warn-only word, or a word
+  only inside another tool's option (a CI file, a lockfile or a manifest) or a library's module name (`possible`); a route, model or table
   ARCHITECTURE.md does not list; a new dependency held for the reviewer (`classes.dependency: ask`); a submodule (its content
   is not read); a change to `.lumis/scope_guard.json` or `CONSTITUTION.md`, shown as a boundary diff — which NG-n was removed,
   added or reworded, which other key changed (`stack`, `architecture.top_level`, `log`…), in which commit, by whom, and the
@@ -167,8 +184,9 @@ is written), the file and line, the trigger and the line itself. No score and no
   a PASS.
 
 `init --ci` (and both LUMIS ZIPs) install the workflow `.github/workflows/lumis-boundary-check.yml`: on every pull request it
-runs the check with the checker taken from the base commit, posts one comment (edited on the next push, never duplicated),
-writes the job summary, uploads SARIF to the Security tab and fails the job on BLOCK; on a push to `main`/`master` it runs
+runs the check with the checker taken from the base commit, posts one comment (edited on the next push),
+writes the job summary, uploads a SARIF file for code scanning (that upload has not yet been seen on a live repository)
+and fails the job on BLOCK; on a push to `main`/`master` it runs
 the same check on what was pushed and uploads the SARIF, so code scanning has the base branch to compare with (code
 scanning is free in public repositories; a private one needs GitHub Advanced Security, otherwise the upload step only logs
 that and the comment and summary remain). The workflow is one of the guard's own
@@ -183,12 +201,13 @@ It is a review aid, not a security boundary. The spec is `docs/BOUNDARY_CHECK_CI
 
 ## Hook version
 
-The hook carries its release date (`HOOK_VERSION`, now `2026-09-28`) and the config records the version it was written for
+The hook carries its release date (`HOOK_VERSION`, now `2026-09-29`) and the config records the version it was written for
 (`hook_version`). `doctor` compares them. A config newer than the hook is a problem — `the hook in scripts/ is older than the
 config (…): copy scripts/scope_guard.py from the ZIP, then run write-manifest` — because the old hook would ignore the new keys
 in silence. A hook newer than the config is fine: keys the config lacks take their defaults. The fingerprint
-`hook 2026-09-28 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
-`request` writes.
+`hook 2026-09-29 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
+`request` writes. `2026-09-29` blocks only on high-precision evidence (see "What blocks and what warns"); a config written
+before it may still block a lone word, and `doctor` names those words with `rebuild-markers --dry-run`.
 
 ## What `report` shows
 
