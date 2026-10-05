@@ -13,7 +13,8 @@ so the same guard works everywhere; only the config file and the payload shape d
 
   * `python scripts/scope_guard.py pre-tool [--agent <name>]`
         blocks (exit 2) when the change or command touches a Non-Goal trigger:
-        forbidden packages, paths or keywords listed in .lumis/scope_guard.json — the message names the
+        forbidden packages, paths or keywords listed in .lumis/scope_guard.json (a package as the whole name an import,
+        an install or a manifest line brings in, never a word that starts with it) — the message names the
         boundary (NG-n), who set it and where it is written (CONSTITUTION.md / DECISION_LOG.md);
         a write to the guard's own files (hook, its configs, CONSTITUTION.md) or to the directories that hold them
         is refused and logged as `tamper`, also behind `cd`, `./`, `x/../`, a shell glob (`scripts/*.py`),
@@ -28,7 +29,11 @@ so the same guard works everywhere; only the config file and the payload shape d
         `possible`): the word names the boundary it came from and leaves the judgement to you;
         three boundary classes the founder decides on — a new dependency, a push or deploy that leaves the machine,
         a write outside the project — are held for approval (`"classes"` in the config: allow | ask | block,
-        logged as `held`); with `"mode": "observe"` nothing is refused except a change to the guard itself.
+        logged as `held`); with `"mode": "observe"` nothing is refused except a change to the guard itself;
+        where the LUMIS pre-commit check is installed, the plain spellings of a commit past it (`--no-verify`, `-n`,
+        `-c` / `--config-env core.hooksPath=…`, a `GIT_CONFIG_*` variable set in the command, a `git config` write of
+        core.hooksPath, a write to this repository's `.git/config`, `git commit-tree`) are held the same way, and a
+        direct delete or overwrite of its file by path is refused as `tamper` (the limits: docs/BOUNDARY_CHECK_CI.md).
   * `python scripts/scope_guard.py prompt [--agent <name>]`
         adds a note to the context when the prompt names a boundary (a package, a path or a phrase — never a lone
         word) or contains a drift phrase ("quick fix for now", "while I'm in here", ...): advice, it never stops.
@@ -42,7 +47,8 @@ so the same guard works everywhere; only the config file and the payload shape d
         it, after an Amend or a deliberate change. Run it yourself: the hook refuses it to the agent.
   * `python scripts/scope_guard.py rebuild-markers [--dry-run]` -> re-derive `keywords` / `warn_keywords` from the
         boundaries this config already carries, in place, for a config you edited by hand — the architecture
-        inventory, the deny lists, `pinned_keywords` and everything else are kept. `--dry-run` prints the diff and
+        inventory, the deny lists, `pinned_keywords` and everything else are kept (a config written before 2026-09-30
+        also gets the lexicon's package families, `deny_package_prefixes`). `--dry-run` prints the diff and
         writes nothing; the real run saves the file as it was to `.lumis/scope_guard.prev.json` and re-baselines
         the manifest afterwards. Yours to run: the hook refuses it to the agent, `--dry-run` included.
   * `python scripts/scope_guard.py observe on|off` -> switch the guard to recording only (`on`) or back to refusing
@@ -51,7 +57,11 @@ so the same guard works everywhere; only the config file and the payload shape d
         -> the same boundaries on a diff (a pull request in CI, `.github/workflows/lumis-boundary-check.yml`): added
         lines only, PASS / WARN / BLOCK, one markdown report, SARIF for code scanning, JSON; exit 2 on BLOCK, 1 when
         it could not run (never a PASS). `--diff <file>` or stdin read a diff without git. Read-only: the agent may
-        run it too, without the output flags.
+        run it too, without the output flags. `--staged [--format text]` reads the staged change against HEAD: the
+        pre-commit check.
+  * `python scripts/scope_guard.py install-pre-commit [--uninstall]` -> write (or remove) the git pre-commit hook that
+        runs `check-diff --staged --format text` before each commit. Local only: `git commit --no-verify` skips it, and
+        the pull request check reads the diff again. Yours to run: the hook refuses it to the agent.
 
 `--agent` only picks the shape of the refusal each client renders best; the payload is recognised automatically,
 so a missing or wrong flag still blocks with exit 2. Every block and warning is appended to .lumis/guard.log
@@ -68,8 +78,10 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to a legacy code page; the reports carry emoji
@@ -81,7 +93,75 @@ for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to a legacy
 # The release this script belongs to — bump it on every change of this file. The pack writes the same string into
 # .lumis/scope_guard.json as `hook_version`, so `doctor` can tell a config that expects a newer hook (keys the old
 # script would ignore in silence) from a hook that is merely newer than its config (harmless: new keys take defaults).
-HOOK_VERSION = "2026-09-29"
+HOOK_VERSION = "2026-10-01"
+
+# --- the budget: a guard that cannot finish reading refuses (third review of 30.09) -------------------------------
+# Claude Code gives a hook 60 s by default and treats one that runs longer as a non-blocking error: the change lands.
+# Two review rounds found readings that ran past that on a crafted payload (160 KB of dashes: 119 s; 5 000 edits of a
+# 5.5 MB file: 75 s). The regexes are linear again, every disk read and every edit's context is capped, and whatever is
+# left is bounded by the clock: the hook records when it started, the content readers look at the clock line by line
+# and edit by edit, and past SCAN_BUDGET_SECONDS the hook stops reading and REFUSES the call (exit 2, event `timeout`)
+# — refused, not passed. The generators write `timeout: 60` into the Claude Code hook settings, so the budget is below
+# the client's limit. `check-diff` has its own budget: past CI_SCAN_BUDGET_SECONDS the verdict is INCOMPLETE (exit 1).
+SCAN_BUDGET_SECONDS = 20
+CI_SCAN_BUDGET_SECONDS = 60
+# How much of one text is read for packages: the content of a call, a file an Edit lands in, a manifest on disk. Past
+# it a package is not read: the rest is reported as a possible match (WARN, exit 1) with the reason, never passed in
+# silence. Keywords, phrases and paths are still matched in the whole text.
+PACKAGE_READ_MAX = 1_000_000
+EDIT_CONTEXT_MAX = 200         # edits of one call read with the file around them; the rest as their own text only
+REPLACE_ALL_CONTEXT_MAX = 50   # occurrences of one `replace_all` edit read with the file around them
+_SCAN = {"deadline": 0.0, "read": 0, "total": 0}
+
+
+class ScanBudgetExceeded(Exception):
+    """The hook's reading of a call ran past SCAN_BUDGET_SECONDS (`scan_checkpoint`): the call is refused."""
+
+
+def start_scan_budget(seconds: float, started: float | None = None) -> None:
+    """Arm the clock: `scan_checkpoint` raises once `seconds` have passed since `started` (default: now). Only the
+    hook's `main` arms it; `check-diff`, the studio and the tests read without a deadline unless they arm it."""
+    _SCAN.update(deadline=(time.monotonic() if started is None else started) + float(seconds), read=0, total=0)
+
+
+def stop_scan_budget() -> None:
+    _SCAN["deadline"] = 0.0
+
+
+def scan_progress(read: int, total: int | None = None) -> None:
+    """How far the reading of the call's lines got, for the refusal message."""
+    _SCAN["read"] = read
+    if total is not None:
+        _SCAN["total"] = total
+
+
+def scan_checkpoint() -> None:
+    """Called by the content readers at line and edit granularity: raise ScanBudgetExceeded past the deadline."""
+    if _SCAN["deadline"] and time.monotonic() > _SCAN["deadline"]:
+        raise ScanBudgetExceeded()
+
+
+# The tamper check's probes — git's own answer for a rewind (`git status`/`git diff`), `git clean -n`, `git ls-files`,
+# the real path of what a removal takes — go to the disk or spawn git, 10-40 ms each: `git reset --hard HEAD; ` × 1 600
+# took 64 s, past the client's 60 s, and the call went through (fourth review of 30.09). The loops look at the clock
+# (`scan_checkpoint`), and one call gets TAMPER_PROBE_MAX probes: a command with more rewind or removal segments than
+# that is refused as a change to the guard, the rest unprobed — refused, not passed.
+TAMPER_PROBE_MAX = 64
+_PROBES = {"left": TAMPER_PROBE_MAX}
+TAMPER_PROBES_EXHAUSTED = (f"the command has more rewind or removal segments than the guard probes ({TAMPER_PROBE_MAX}): "
+                           "the rest was not checked against the guard's files — refused, not passed; split the command")
+
+
+class TamperProbesExhausted(Exception):
+    """One call asked for more than TAMPER_PROBE_MAX tamper probes (`_take_probe`): refused as a change to the guard."""
+
+
+def _take_probe() -> None:
+    """Called before each probe of the tamper check: the clock first, then one of the call's TAMPER_PROBE_MAX probes."""
+    scan_checkpoint()
+    if _PROBES["left"] <= 0:
+        raise TamperProbesExhausted()
+    _PROBES["left"] -= 1
 
 # The three decisions that are the founder's whatever the Non-Goals say: a new dependency changes the stack, a push
 # or a deploy leaves the machine, a write outside the project is not this project's change. Missing key -> "ask".
@@ -390,7 +470,8 @@ XARGS_VALUE_FLAGS = {"-n", "-i", "-p", "-d", "-l", "-s", "-e", "-a", "--max-args
 LISTING_EXECUTABLES = {"ls", "dir", "get-childitem", "gci"}
 # Running the guard is not rewriting it: `python scripts/scope_guard.py report` is the documented way to read the
 # log. Exactly four words are open to the agent — report, doctor, request, and `check-diff` with its input flags
-# only (`--base`, `--head`, `--diff`, `--root`, `--help`: it reads git and prints; with `--markdown`, `--sarif` or
+# only (`--base`, `--head`, `--diff`, `--root`, `--staged`, `--format markdown|text`, `--help`: it reads git and
+# prints — `--staged --format text` is what the pre-commit check runs, review 2026-10-01; with `--markdown`, `--sarif` or
 # `--json` it writes a file, and that spelling is judged like any other command naming the hook — refused as
 # `tamper`) — and every other word naming this file —
 # `write-manifest`, `rebuild-markers`, `observe`, with or without `--dry-run` — stays a `tamper` refusal:
@@ -403,7 +484,8 @@ LISTING_EXECUTABLES = {"ls", "dir", "get-childitem", "gci"}
 GUARD_SELF_RUN = re.compile(
     r"^\s*(?:python3?|py)(?:\s+-X\s+utf8)?\s+(?:\.[\\/])?scripts[\\/]scope_guard\.py\s+"
     r"(?:(?:report|doctor|request|--help|-h|help)\b[^>|;&\n]*"
-    r"|check-diff(?:\s+(?:--(?:base|head|diff|root)(?:=|\s+)[^\s>|;&<`$]+|--help|-h))*)"
+    r"|check-diff(?:\s+(?:--(?:base|head|diff|root)(?:=|\s+)[^\s>|;&<`$]+|--format(?:=|\s+)(?:markdown|text)"
+    r"|--staged|--help|-h))*)"
     r"(?:\s+2>&1)?\s*$", re.I)
 
 
@@ -723,6 +805,7 @@ def _git_rewind_touches_guard(exe: str, args: list[str], raw_parts: list[str]) -
         return None  # a soft/mixed reset leaves the working tree alone
     if sub == "restore" and "--staged" in args and "--worktree" not in args:
         return None  # unstaging only
+    _take_probe()
     try:
         root = project_root()
         guard = [f for f in GUARD_FILES if (root / f).exists()]
@@ -769,6 +852,7 @@ def _holds_project_tree(token: str, prefix: str = "") -> bool:
     raw = str(token or "").strip().strip("'\"`")
     if not raw or raw.startswith("-") or len(raw) > 512 or any(ch in raw for ch in GLOB_CHARS):
         return False
+    _take_probe()
     try:
         root = Path(os.path.realpath(project_root()))
         home = os.path.expanduser("~")
@@ -840,6 +924,7 @@ def _xargs_reaches_guard(raw_args: list[str], producer: list[str], prefix: str) 
         reach = _find_reaches_guard(p_args + ["-delete"])
         return f"find | xargs {prog}: {reach}" if reach else None
     if p_exe == "git" and next((a for a in names), "") == "ls-files":
+        _take_probe()
         try:
             root = project_root()
             guard = [f for f in GUARD_FILES if (root / f).exists()]
@@ -867,6 +952,7 @@ def _git_clean_reaches_guard(exe: str, raw_args: list[str]) -> str | None:
     forced = any("f" in a[1:] for a in flags) or "--force" in rest
     if not forced or any(a in ("-n", "--dry-run") or (a.startswith("-") and not a.startswith("--") and "n" in a[1:]) for a in rest):
         return None  # without -f git refuses by default; with -n it only prints
+    _take_probe()
     try:
         root = project_root()
         dry = [a for a in rest if a not in ("-i", "--interactive")]
@@ -907,9 +993,16 @@ def _glob_reaches_guard(arg: str, mutates_dirs: bool) -> list[str]:
     return hits
 
 
-def _wrapped_command(segment: str) -> str:
+# the options of `sudo` / `doas` that take a value (`sudo -u deploy pip install …`): read only for packages
+# (`_command_words(sudo_values=True)`); the tamper check and the classes read `sudo` as they always did
+SUDO_VALUE_FLAGS = {"-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-D",
+                    "--chdir", "-r", "--role", "-t", "--type", "-U", "--other-user", "-T", "--command-timeout"}
+
+
+def _wrapped_command(segment: str, sudo_values: bool = False) -> str:
     """The command a wrapper runs: `powershell -c "Remove-Item -Recurse .lumis"` -> `Remove-Item -Recurse .lumis`.
-    Empty when the segment is not a wrapper."""
+    Empty when the segment is not a wrapper. `sudo_values`: the value of a `sudo`/`doas` option that takes one
+    (`-u deploy`) is skipped too."""
     parts = str(segment or "").strip().split()
     if not parts:
         return ""
@@ -919,7 +1012,9 @@ def _wrapped_command(segment: str) -> str:
         return ""
     rest = parts[1:]
     while rest and (rest[0].startswith("-") or rest[0].isdigit() or (rest[0].startswith("/") and len(rest[0]) <= 3)):
-        rest.pop(0)  # -c, -Command, -NoProfile, /c, the seconds of `timeout 5 …`
+        flag = rest.pop(0)  # -c, -Command, -NoProfile, /c, the seconds of `timeout 5 …`
+        if sudo_values and exe in ("sudo", "doas") and flag in SUDO_VALUE_FLAGS and rest:
+            rest.pop(0)
     return " ".join(rest).strip().strip("'\"`")
 
 
@@ -943,6 +1038,7 @@ def _guard_targets_of_command(text: str, depth: int = 0) -> list[str]:
     for idx, (exe, args, _prefix) in enumerate(segments):
         mutates_dirs = exe in DIR_MUTATORS or (exe == "git" and any(a in GIT_MUTATORS for a in args[:2]))
         for a in args:
+            scan_checkpoint()  # a segment's arguments and the segments themselves are read under the clock
             for name in GUARD_FILES:
                 if a == name.lower() and name not in hits:
                     hits.append(name)
@@ -975,7 +1071,9 @@ def _guard_targets_of_command(text: str, depth: int = 0) -> list[str]:
     return hits
 
 
-_HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+# a heredoc opener — never the `<<<` of a here-string, whose word is the data itself (`tee x <<< 'resend'`)
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)(\w+)\1")
+_HERE_STRING = re.compile(r"<<<\s*(?:'([^']*)'|\"((?:[^\"\\]|\\.)*)\"|(\S+))")
 _MESSAGE_ARG = re.compile(r"(\s(?:-m|-am|--message)(?:\s+|=))(\"(?:[^\"\\]|\\.)*\"|'[^']*')")
 
 
@@ -1058,7 +1156,11 @@ def check_tamper(tool_name: str, tool_input: dict) -> tuple[list[str], list[str]
         if is_read_only_command(text) or _only_guard_self_run(text):
             return [], []
         command = _command_without_data(text)
-        files = list(_guard_targets_of_command(command))
+        _PROBES["left"] = TAMPER_PROBE_MAX
+        try:
+            files = list(_guard_targets_of_command(command))
+        except TamperProbesExhausted:
+            files = [TAMPER_PROBES_EXHAUSTED]
         for name in _mentions_guard_file(command, GUARD_FILES):
             # named in the text but not a target the parser can see: the refusal says so, so the agent knows whether
             # to reword a note or to stop (the field report: «three rounds to find out which»)
@@ -1068,6 +1170,7 @@ def check_tamper(tool_name: str, tool_input: dict) -> tuple[list[str], list[str]
             files.append("the guard's baseline outside the repository (~/.lumis)")
         if HOOK_AS_MODULE.search(command) and not any("scope_guard" in hit for hit in files):
             files.append("scripts/scope_guard.py (loaded as a module: its founder-only commands run without their names)")
+        files += [hit for hit in pre_commit_tamper(command=command) if hit not in files]
         return files, _mentions_guard_file(command, GUARD_TEXT_FILES)
     targets = [p for p in [path] + destination_paths(tool_name, tool_input) if p]
     if not targets:
@@ -1085,6 +1188,7 @@ def check_tamper(tool_name: str, tool_input: dict) -> tuple[list[str], list[str]
         if linked and linked not in files and f"{linked} (through a link)" not in files:
             files.append(f"{linked} (through a link)")
         rules += [n for n in _mentions_guard_file(_clean_path(target), GUARD_TEXT_FILES) if n not in rules]
+    files += [hit for hit in pre_commit_tamper(paths=targets) if hit not in files]
     return files, rules
 
 
@@ -1221,13 +1325,1029 @@ def _spelled_out(text: str) -> str:
 def _keyword_found(keyword: str, low: str, spelled: str) -> bool:
     """A keyword in the lower-cased text or in its camel-case-opened spelling. A name written as code (`@…`) is
     looked for as written only: opened up, `@TransactionalEventListener` would read as `@transactional event …`."""
+    need = _keyword_need(keyword)
+    if need and need not in low and need not in spelled:
+        return False  # every match holds this substring: a plain search first (a 2.8 MB file, third review of 30.09)
     pattern = keyword_pattern(keyword)
     return bool(pattern.search(low) or (not str(keyword).lstrip().startswith("@") and pattern.search(spelled)))
 
 
-def trigger_hits(cfg: dict, text: str, path: str = "") -> list[tuple[str, str]]:
+@lru_cache(maxsize=4096)
+def _keyword_need(keyword: str) -> str:
+    """A substring every match of `keyword_pattern(keyword)` contains: the name of an `@name`, the first word of a
+    phrase, the stem of a single word."""
+    low = str(keyword or "").lower().strip()
+    if low.startswith("@"):
+        return low[1:].split(".")[-1]
+    words = low.split()
+    if len(words) > 1:
+        return words[0]
+    return low[:-1] if (len(low) > 4 and low.endswith("s") and not low.endswith("ss")) else low
+
+
+# --- a forbidden package: a whole module name where code brings it in (2026-09-30) ------------------------------------
+# Until hook 2026-09-29 a package was found as a substring — `import {pkg}`, `from {pkg}`, `require('{pkg}` — or as a
+# token between spaces, quotes and slashes. Under «No payment collection or billing; No native mobile apps» (`expo`
+# from the lexicon) that refused `import exportCsv from './exportCsv'`, `require('export-to-csv')`, `import exporter
+# from 'exporter'`, `import expoConfig from './expo.config'` and Python's `import export_utils`; `ws` refused openpyxl's
+# `ws = wb.active` and `import ws_client`, `resend` refused `import resend_queue`, `pika` refused `import pikachu` —
+# while `import * as Notifications from 'expo-notifications'` passed. A package is now the whole name a statement
+# brings in, read per language:
+#   - JS/TS: the specifier of `import … from '<spec>'`, `import '<spec>'`, `export … from '<spec>'`, `require('<spec>')`,
+#     `require.resolve('<spec>')`, `import('<spec>')` is the package, a subpath of it (`expo/config`) or a package of the
+#     scope named after it (`@expo/vector-icons` for `expo`, `@stripe/stripe-js` for `stripe`), also fetched from a
+#     package CDN (`https://esm.sh/resend@2`). A local specifier (`./`, `../`, `/`, `~/`, `@/`, `#`) is never a
+#     package, the name an import binds (`import exportCsv from …`) is never read, and `from '<x>'` counts only in an
+#     import or export statement (`Imported from 'ws' module` in a string is not one);
+#   - Python: the top-level module of `import <mod>[.sub] [as x]` / `from <mod>[.sub] import …`, `-` and `_` alike
+#     (`paypal-checkout` is `import paypal_checkout`) — the whole module, never its start (`export_utils`, `wsgiref`);
+#   - Java, Kotlin, C#, Rust, PHP, Go, Ruby: the vendor's part of the imported path, never a module of the project's
+#     own or a standard namespace — the name after a reversed domain (`com.stripe.Stripe`; `javax.xml.ws`,
+#     `org.springframework.ws` and `com.acme.api.ws` are not the package `ws`), the first segment of a C#, Rust, PHP or
+#     Ruby path (`using Stripe;`, `use stripe::Client`, `use Stripe\StripeClient`, `require 'stripe'`; not
+#     `using Acme.Integration.Ws;`, `use crate::ws`, `use App\Mail\Resend`), a Go module's owner or repository
+#     (`github.com/stripe/stripe-go/v76`; not `github.com/acme/app/internal/ws`);
+#   - a manifest line (`package.json` / `composer.json` keys, `requirements*.txt`, `pyproject.toml`, `Pipfile`,
+#     `Cargo.toml`, `go.mod`, `Gemfile`) and a requirement line of `constraints*.txt`, `tox.ini`, `setup.cfg` or a conda
+#     `environment.yml`: the dependency's name, with the dependency class's own readers;
+#   - a shell command, and an install command written into a file (a Dockerfile `RUN`, its exec form `RUN ["pip",
+#     "install", "x"]`, a CI `run:`, a package.json script): the package installed or run by name — `pip install stripe`,
+#     `npm i expo`, `yarn add ws`, `npx expo start`, `npm create expo-app` (that is `create-expo-app`), also for the whole
+#     machine (`npm i -g`, `pipx`, `uv tool`, `cargo install`, `go install`, `brew install`); in a command the agent runs,
+#     also the package's own program (`expo start`, `flutter run`, `python -m celery`). What a command writes into a file
+#     (`echo 'resend==2' >> requirements.txt`, a heredoc) is read as that file's content, and the code a heredoc feeds
+#     an interpreter as that language's. `npm install export-to-csv` is another package: the dependency class holds it
+#     like any new one.
+# A statement written over several lines — a trailing backslash (`RUN pip install \`, `import os, \`, a hashed
+# requirement), a `require(` or `import(` left open at the end of a line, an exec-form array left open — is read as one
+# line too (`statement_spans`). A bare word of code — `ws = wb.active`, `const expo = 1` — is none of these and is not a
+# package hit: a word the founder wants refused wherever it is written is a keyword of the lexicon, not a package. A
+# request (the prompt hook) and the data a command carries (a commit message) are prose and keep the word reading: a
+# package named in a sentence is how a person names it.
+#
+# A family of packages is named explicitly: `deny_package_prefixes` (the lexicon's `packages_prefix`) — `expo-`,
+# `@expo/`, `react-native-`, `@react-native/` for native mobile apps — refuses every JS/npm name that starts with one
+# (`expo-notifications`, `expo-router`, `react-native-maps`) — an npm name only: `pip install expo-helpers` is another
+# ecosystem's package, held by the dependency class like any new one. A hyphen is not a family separator in general:
+# `ws-…` and `resend-…` are unrelated packages. A config written before 2026-09-30 has no families until
+# `rebuild-markers`.
+#
+# Reading a line costs one pass over it: an install command inside a line is read from its start to its end (a shell
+# separator, the closing quote, or `INLINE_WINDOW` characters), once, and only when the words after the manager install
+# or run something (`go back to the dashboard` is English, not `go`). The hook 2026-09-30 as first built re-read the rest
+# of the line at every match, and a one-line JSON of 60 000 characters took 30 s (review 30.09).
+LOCAL_SPECIFIER_PREFIXES = (".", "/", "~/", "@/", "#")
+# The import statements a file's language has, by extension. Any other file (or no file at all) is read with every form
+# except the JVM's dotted `import a.b.C`, which it reads as Python's; an SQL file with none (`FROM "stripe"` is a table).
+IMPORT_LANGUAGES = {
+    **{ext: "js" for ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte", ".astro",
+                             ".html", ".htm")},
+    **{ext: "py" for ext in (".py", ".pyi", ".pyx")},
+    **{ext: "jvm" for ext in (".java", ".kt", ".kts", ".scala", ".groovy")},
+    ".cs": "cs", ".rs": "rs", ".php": "php", ".go": "go", ".rb": "rb", ".rake": "rb", ".sql": "none",
+}
+# `from '<spec>'` of an import or export statement: after `import`/`export` at the start of a statement (a line, or after
+# `;`, `{`, `}`, the `>` of a `<script>` tag, a closing `*/`), or on the line that closes a multi-line one
+# (`} from 'ws'`); minified `from"ws"` too. A `from '…'` inside a string or a template literal is not an import.
+# Read from each `from '…'` backwards over its clause (`_js_from_specs`), at most JS_CLAUSE_MAX characters: the one
+# regex this replaced scanned forward from every `{import`/`}import` of a line to its end, and a line of 100 000
+# characters of them took 12 s (review 30.09).
+JS_FROM_SPEC_RE = re.compile(r"\bfrom\s*(['\"])([^'\"\n]+)\1")
+JS_CLAUSE_START_RE = re.compile(r"(?:[{}>]|\*/)\s*(?:import|export)\b")
+JS_CLAUSE_MAX = 4000
+_CLAUSE_STOP_RE = re.compile(r"[;'\"`\n]")
+# `require('x')`, `require.resolve('x')`, `import('x')`, also with a bundler's comment first
+# (`import(/* webpackChunkName: "mail" */ 'nodemailer')`, read with the comments taken out first:
+# `_without_block_comments`) and with options after (`import('x', { with: … })`). No nested quantifier: the form with
+# `(?:/\*.*?\*/\s*)*` inside took exponential time on `import(` and forty `/* a */` (review 30.09).
+JS_CALL_RE = re.compile(r"\b(?:require(?:\.resolve)?|import)\s*\(\s*(['\"`])([^'\"`\n]+)\1\s*[,)]")
+JS_SIDE_EFFECT_RE = re.compile(r"(?:^|(?<=[;{}>]))\s*import\s*(['\"])([^'\"\n]+)\1", re.M)
+_PY_MODULE = r"[A-Za-z_][\w.]*"
+# at the start of a statement — a line, or after `;`, `:`, a quote, `(` (`python -c "import stripe"`) or a comment
+# marker (then it is a comment line, `noted`) — and the module list ends the statement: `import exportCsv from './x'`
+# is not Python.
+PY_IMPORT_RE = re.compile(r"(?:^|(?<=[;:\"'`(#/]))\s*import\s+(" + _PY_MODULE + r"(?:\s+as\s+\w+)?(?:\s*,\s*" + _PY_MODULE
+                          + r"(?:\s+as\s+\w+)?)*)\s*(?=$|[;#)\"'`]|\\n)", re.M)
+PY_FROM_RE = re.compile(r"(?:^|(?<=[;:\"'`(#/]))\s*from\s+(\.*" + _PY_MODULE + r"|\.+)\s+import\b", re.M)
+PY_DYNAMIC_RE = re.compile(r"\b(?:import_module|__import__)\s*\(\s*(?:name\s*=\s*)?['\"]([A-Za-z_][\w.]*)['\"]")
+JVM_IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)", re.M)
+CS_USING_RE = re.compile(r"^\s*(?:global\s+)?using\s+(?:static\s+)?(?:\w+\s*=\s*)?([\w.]+)\s*;", re.M)
+RUST_USE_RE = re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:use\s+(?:::)?(\w+(?:::\w+)*)|extern\s+crate\s+(\w+))", re.M)
+PHP_USE_RE = re.compile(r"^\s*use\s+(?:function\s+|const\s+)?\\?(\w+(?:\\\w+)*)", re.M)
+GO_IMPORT_RE = re.compile(r"^\s*import\s+(?:[\w.]+\s+)?\"([^\"]+)\"", re.M)
+GO_BLOCK_LINE_RE = re.compile(r"^\s*(?:[\w.]+\s+)?\"([^\"]+)\"\s*(?://.*)?$")
+RUBY_REQUIRE_RE = re.compile(r"^\s*require\s*\(?\s*['\"]([^'\"]+)['\"]", re.M)
+# the top-level domains a Java/Kotlin/Scala package starts with when it is a reversed domain: the vendor is the next name
+# (`com.stripe`, `io.socket`); any two-letter first name counts too (`de.`, `uk.`)
+REVERSED_DOMAIN_ROOTS = frozenset({"com", "org", "net", "io", "dev", "co", "me", "app", "ai", "edu", "gov", "mil", "info",
+                                   "biz", "xyz", "tech", "cloud", "sh", "gg", "tv", "pro", "name"})
+# a Rust path that starts in the project's own crate
+RUST_LOCAL_ROOTS = frozenset({"crate", "self", "super"})
+# the readings whose name is an import path with a vendor's part (`_import_roots`)
+IMPORT_PATH_READINGS = {"jvm": ".", "cs": ".", "rust": "::", "php": "\\", "ruby": "/", "go": "/"}
+# where a module is fetched by URL and the URL names the npm package: `https://esm.sh/resend@2.0.0` (Deno, Supabase edge
+# functions), `https://cdn.jsdelivr.net/npm/stripe@14/+esm`, `https://unpkg.com/expo@51/…`, `https://deno.land/x/…`
+PACKAGE_CDN_HOSTS = frozenset({"esm.sh", "cdn.esm.sh", "cdn.skypack.dev", "unpkg.com", "cdn.jsdelivr.net", "esm.run",
+                               "jspm.dev", "dev.jspm.io", "ga.jspm.io", "deno.land"})
+_CDN_PATH_PREFIX = re.compile(r"^(?:(?:v\d+|stable|pin|npm|x)/)+")
+# what a manager is read as: a PyPI name (`-`, `_`, `.` alike), an npm name (scopes, subpaths, families), a Go module
+# (its owner or repository), a Composer vendor/package (either name), or one name compared the PyPI way
+MANAGER_READINGS = {**{m: "pip" for m in ("pip", "uv", "uvx", "poetry", "pipenv", "pipx", "conda", "mamba", "micromamba",
+                                          "pdm", "rye")},
+                    **{m: "npm" for m in ("npm", "pnpm", "yarn", "bun", "expo")}, "go": "go", "composer": "slash"}
+# installs for the whole machine rather than the project: not a dependency of this project, still an install
+SYSTEM_INSTALLERS = {"brew", "choco", "scoop", "winget", "apt", "apt-get", "snap", "dnf", "yum"}
+JS_RUNNERS = {"npm", "pnpm", "yarn", "bun"}
+JS_RUN_SUBCOMMANDS = {"exec", "dlx", "x"}         # `npm exec x`, `pnpm dlx x`, `yarn dlx x`, `bun x x` run package x
+JS_CREATE_SUBCOMMANDS = {"create", "init"}       # `npm create expo-app` runs `create-expo-app`
+NPX_RUNNERS = ("npx", "pnpx", "bunx")
+# where an install command starts inside a line of a file: a Dockerfile `RUN`, a CI `run:`, a package.json script
+_INLINE_MANAGERS = (r"pip\d*(?:\.\d+)?|pipx|python\d*(?:\.\d+)?|py|uvx?|poetry|pipenv|pdm|rye|npm|pnpm|yarn|bun|npx|pnpx|bunx|"
+                    r"expo|cargo|go|gem|bundle|composer|conda|mamba|micromamba|dotnet|brew|choco|scoop|winget|apt|"
+                    r"apt-get|snap")
+# The manager may be written with its path (`RUN /opt/venv/bin/pip install`, `.venv/bin/pip install`,
+# `.venv\Scripts\pip install`), after a Makefile recipe's prefix (`\t@pip install`, `\t-pip install`) or kept in a
+# variable named after it (`$PIP install`, `${NPM} i`, make's `$(PIP) install`): until the second review of 30.09 only
+# a manager right after a space or a quote was read. A path segment holds none of the characters a command can start
+# after, and a variable's name is bounded: every start scans only its own word, so a line is still read in one pass.
+_MANAGER_VARIABLE = r"\$[{(]?[A-Za-z_]{0,40}(?:PIP|NPM|PNPM|YARN)[A-Za-z0-9_]{0,40}[})]?"
+# The prefix is at most three characters and the word after it starts with a letter, `$`, `.` or a slash (the third
+# review of 30.09: `[@+\-]*` followed by a path class that also takes `-` backtracked quadratically — a line of 160 KB
+# of dashes took 119 s; possessive quantifiers need Python 3.11 and the hook runs on 3.9). A line that names none of the
+# managers is not read at all (`MANAGER_WORD_RE`). A path may also start with `~`, `%`, `_` or a digit
+# (`~/.local/bin/pip`, `%APPDATA%\Python\Scripts\pip`, `_venv/bin/pip`: fourth review of 30.09) — never with a `-`.
+INLINE_COMMAND_RE = re.compile(r"(?:^|(?<=[\s\"'`(\[,:=;&|]))[@+\-]{0,3}(?:sudo\s+)?(?=[A-Za-z0-9$./\\~%_])"
+                               r"(?:[^\s\"'`\\/(\[,:=;&|]*[\\/])*(?:" + _INLINE_MANAGERS + r"|" + _MANAGER_VARIABLE
+                               + r")\s+\S", re.I)
+MANAGER_WORD_RE = re.compile(r"pip|py|uv|poetry|pdm|rye|npm|yarn|bun|npx|pnpx|expo|cargo|go|gem|bundle|composer|conda|"
+                             r"mamba|dotnet|brew|choco|scoop|winget|apt|snap", re.I)
+# the exec form of a Dockerfile `RUN` / `CMD` or a YAML `command:` — `["pip", "install", "resend"]` — whose first word is
+# a manager: the same command, written as a JSON array
+EXEC_FORM_RE = re.compile(r"\[\s*(['\"])(?:sudo|" + _INLINE_MANAGERS + r")\1\s*,[^\]\n]*\]", re.I)
+# the words that make a manager's command an install or a run of a package, among the three after it: `pip install`,
+# `npm i`, `yarn add`, `go get`, `composer require`, `pnpm dlx`, `npm create`, `uv tool install`, `python -m`. `go back to
+# the dashboard` has none, and is not read (review 30.09: every ` go ` of a one-line JSON was read to the end of the line).
+INLINE_VERBS = frozenset({"install", "i", "in", "add", "a", "get", "require", "reinstall", "inject", "exec", "dlx", "x",
+                          "create", "init", "run", "tool", "global", "pip", "-m"})
+# an install command inside a line is read up to its end — a shell separator, the closing quote — or this many characters
+INLINE_WINDOW = 20000
+# A statement written over several lines (`statement_spans`): a call to `require(` / `import(` / `import_module(` left
+# open at the end of a line, and an exec-form array left open (`RUN [` … `]`, `command: [` … `]`). A trailing
+# backslash is the third. At most STATEMENT_MAX_LINES lines and STATEMENT_MAX_CHARS characters are joined.
+OPEN_CALL_RE = re.compile(r"\b(?:require(?:\.resolve)?|import|import_module|__import__)\s*\(\s*$")
+OPEN_EXEC_FORM_RE = re.compile(r"(?:^\s*(?:RUN|CMD|ENTRYPOINT)\s+|\b(?:command|entrypoint|args)\s*:\s*)\[[^\]]*$", re.I)
+# A JS/TS import or export whose `from '…'` comes on a later line (`import { Resend,` / `  CreateEmailOptions } from
+# 'resend';`, `import Constants` / `  from 'expo';`): a line that starts one and holds no quote and no `;` yet. Only in
+# a JS/TS file, or text of no known language (`_js_import_end`). One that opens a brace is joined only while the lines
+# are inside it, up to the line holding the `}`; then — and for one with no open brace, at once — the `from '…'` must
+# follow on that line or the next non-empty lines (`from` and the module may take two). A comment line never closes
+# it (the third review of 30.09: `export {` … `}` then `// … from 'resend' webhooks` was read as an import).
+OPEN_JS_IMPORT_RE = re.compile(r"^\s*(?:import\b(?!\s*[(.=:])|export\s+(?:type\s+)?(?:\{|\*))[^'\"`;]*$")
+JS_FROM_TAIL_RE = re.compile(r"^\s*from\s*(['\"])[^'\"\n]+\1")
+JS_FROM_PREFIX_RE = re.compile(r"^\s*(?:from\s*)?$")
+JS_COMMENT_LINE_RE = re.compile(r"^\s*(?://|/\*|\*|<!--)")
+JS_IMPORT_TAIL_LINES = 2
+# `import` / `import type` alone on its line, then one line of what it imports (`Resend`, `{ Resend }`, `* as R`), then
+# the `from '…'` (fourth review of 30.09)
+JS_BARE_IMPORT_RE = re.compile(r"^\s*import(?:\s+type)?\s*$")
+JS_IMPORT_NAME_LINE_RE = re.compile(r"^\s*(?:(?!from\s*$)[A-Za-z_$][\w$]*|\*\s*as\s+[A-Za-z_$][\w$]*|\{[^{}'\"`;/]*\})\s*$")
+STATEMENT_MAX_LINES = 60
+STATEMENT_MAX_CHARS = 8000
+
+
+def _without_block_comments(text: str) -> str:
+    """The text with every closed `/* … */` replaced by a space — one pass, left to right: after an unclosed `/*` no
+    later comment can close either. Only for reading a module specifier (`import(/* webpackChunkName */ 'x')`)."""
+    s = str(text or "")
+    if "/*" not in s:
+        return s
+    out: list[str] = []
+    i = 0
+    while True:
+        start = s.find("/*", i)
+        end = s.find("*/", start + 2) if start >= 0 else -1
+        if start < 0 or end < 0:
+            break
+        out += [s[i:start], " "]
+        i = end + 2
+    out.append(s[i:])
+    return "".join(out)
+
+
+def _js_from_specs(text: str) -> list[str]:
+    """The module of every `… from '<spec>'` of an import or export statement in the text (`JS_FROM_SPEC_RE`), read
+    backwards from the `from` over its clause — up to the nearest `;`, quote, backtick or newline, at most JS_CLAUSE_MAX
+    characters: the clause starts the statement with `import`/`export` (at the start of a line or after `;`, or after
+    `{`, `}`, `>`, `*/` inside it), or it is the line that closes a multi-line one (`} from 'ws'`). Linear in the text:
+    each character is in at most one clause."""
+    s = str(text or "")
+    if "from" not in s:
+        return []
+    import bisect
+
+    out: list[str] = []
+    # the clause boundaries of the whole text, found once (not five `rfind`s over a 4 000-character copy per `from`:
+    # a 1 MB line of `from"x"` took 4.5 s, third review of 30.09)
+    stops = [d.start() for d in _CLAUSE_STOP_RE.finditer(s)]
+    for m in JS_FROM_SPEC_RE.finditer(s):
+        lo = max(0, m.start() - JS_CLAUSE_MAX)
+        k = bisect.bisect_left(stops, m.start()) - 1
+        cut = stops[k] if k >= 0 and stops[k] >= lo else -1
+        if cut < 0 and lo > 0:
+            continue  # a clause longer than JS_CLAUSE_MAX is not an import clause
+        bound = s[cut] if cut >= 0 else ""
+        clause = s[cut + 1:m.start()]
+        at_start = bound in ("", ";", "\n")
+        line_start = bound in ("", "\n")
+        if ((at_start and re.match(r"\s*(?:import|export)\b", clause)) or JS_CLAUSE_START_RE.search(clause)
+                or (line_start and re.match(r"\s*\}", clause))):
+            out.append(m.group(2))
+    return out
+
+
+def _cdn_spec(url: str) -> str:
+    """The npm specifier a package CDN's URL names (`https://esm.sh/v135/resend@2.0.0/es2022/resend.mjs` →
+    `resend@2.0.0/es2022/resend.mjs`), or "" for any other URL."""
+    m = re.match(r"^https?://([^/?#]+)/([^?#]*)", str(url or ""))
+    if not m or m.group(1) not in PACKAGE_CDN_HOSTS:
+        return ""
+    path = _CDN_PATH_PREFIX.sub("", m.group(2))
+    return path[len("npm:"):] if path.startswith("npm:") else path
+
+
+def _js_spec_name(spec: str) -> str:
+    """The package a JS/TS module specifier (or an npm name) names, lower-cased and without a version (`npm:stripe@14`
+    → `stripe`, `https://esm.sh/resend@2` → `resend`); "" for a file of the project (`./x`, `../x`, `/x`, `~/x`, `@/x`,
+    `#x`), a URL of anything but a package CDN, or a Node built-in."""
+    s = str(spec or "").strip().lower()
+    if "://" in s:
+        s = _cdn_spec(s)
+    for scheme in ("npm:", "jsr:"):
+        if s.startswith(scheme):
+            s = s[len(scheme):]
+    if not s or s.startswith(LOCAL_SPECIFIER_PREFIXES) or "://" in s or s.startswith("node:"):
+        return ""
+    return re.sub(r"^((?:@[^/@]+/)?[^/@]+)@[^/]*", r"\1", s)
+
+
+def _import_roots(reading: str, name: str) -> list[str]:
+    """The names of an import path that can be a package — the vendor's part, never a module of the project's own or a
+    standard namespace. `jvm`: the name after a reversed domain (`com.stripe.Stripe` → `stripe`, and `io.socket` read
+    back as `socket.io`), else the first (`expo.modules.core` → `expo`) — `javax.xml.ws`, `jakarta.xml.ws`,
+    `org.springframework.ws`, `com.acme.api.ws` name no package `ws`; `cs`, `rust`, `php`, `ruby`: the first segment
+    (`using Stripe.Checkout;`, `use stripe::Client`, `use Stripe\\StripeClient`, `require 'stripe/api'`), and none for
+    Rust's `crate::`, `self::`, `super::`; `go`: the owner and the repository of a path with a host
+    (`github.com/stripe/stripe-go/v76` → `stripe`, `stripe-go`; `gopkg.in/gomail.v2` → `gomail`), else the first
+    segment (`net/http`)."""
+    separator = IMPORT_PATH_READINGS.get(reading, "")
+    parts = [p for p in str(name or "").strip().lower().split(separator)] if separator else []
+    parts = [p for p in parts if p]
+    if not parts:
+        return []
+    if reading == "jvm":
+        if len(parts) > 1 and (parts[0] in REVERSED_DOMAIN_ROOTS or len(parts[0]) == 2):
+            return [parts[1], f"{parts[1]}.{parts[0]}"]
+        return [parts[0]]
+    if reading == "rust" and parts[0] in RUST_LOCAL_ROOTS:
+        return []
+    if reading == "go":
+        # a host has a dot (`github.com`); the dependency class hands over names spelled the PyPI way (`github-com`)
+        host = "." in parts[0] or bool(re.search(r"-(?:com|org|net|io|in|dev|land|sh)$", parts[0]))
+        if host and len(parts) > 1:
+            return [re.sub(r"\.v\d+$", "", p) for p in parts[1:3]]
+        return [parts[0]]
+    return [parts[0]]
+
+
+def reads_as_package(pkg: str, reading: str, name: str) -> bool:
+    """`name`, read the way `reading` says, is the forbidden package `pkg` — as a whole name, never as its start.
+
+    `npm`: the name, a subpath of it (`expo/config`) or a package of the scope named after it (`@expo/…` for `expo`);
+    `py`: the top-level module (`stripe.error` → `stripe`), `-` and `_` alike; `pip` and `exact`: the name, `-`, `_`
+    and `.` alike (PyPI's own rule); `jvm` / `cs` / `rust` / `php` / `ruby` / `go`: the vendor's part of an import path
+    (`_import_roots`); `slash`: either name of a Composer `vendor/package`."""
+    p, n = str(pkg or "").strip().lower(), str(name or "").strip().lower()
+    if not p or not n:
+        return False
+    if reading == "npm":
+        n = _js_spec_name(n)
+        return bool(n) and (n == p or n.startswith(p + "/") or (not p.startswith("@") and n.startswith("@" + p + "/")))
+    if reading == "py":
+        top = n.split(".")[0]
+        return bool(top) and _pep503(top) == _pep503(p)
+    if reading in IMPORT_PATH_READINGS:
+        return any(_pep503(root) == _pep503(p) for root in _import_roots(reading, n))
+    if reading == "slash":
+        return any(_pep503(part) == _pep503(p) for part in n.split("/") if part)
+    return _pep503(n) == _pep503(p)
+
+
+def _file_language(file: str) -> str:
+    """`js`, `py`, `jvm`, `cs`, `rs`, `php`, `go`, `rb`, `none` (SQL) — or "" for any other file and for no file."""
+    name = _base_name(file)
+    ext = "." + name.rsplit(".", 1)[1] if "." in name.lstrip(".") else ""
+    return IMPORT_LANGUAGES.get(ext, "")
+
+
+def import_uses(line: str, file: str = "") -> list[tuple[str, str]]:
+    """(reading, name) for each module or package an import statement on this line brings in, by the file's language
+    (`_file_language`). The name an import binds is never read: `import exportCsv from './exportCsv'` brings in the
+    file `./exportCsv`, which is the project's own."""
+    text = str(line or "")
+    if not text.strip():
+        return []
+    lang = _file_language(file)
+    out: list[tuple[str, str]] = []
+    if lang in ("js", ""):
+        out += [("npm", spec) for spec in _js_from_specs(text)]
+        if "(" in text:
+            out += [("npm", m.group(2)) for m in JS_CALL_RE.finditer(_without_block_comments(text))]
+        out += [("npm", m.group(2)) for m in JS_SIDE_EFFECT_RE.finditer(text)]
+    if lang in ("py", ""):
+        for m in PY_IMPORT_RE.finditer(text):
+            out += [("py", part.split()[0]) for part in m.group(1).split(",") if part.strip()]
+        out += [("py", m.group(1)) for m in PY_FROM_RE.finditer(text) if not m.group(1).startswith(".")]
+        out += [("py", m.group(1)) for m in PY_DYNAMIC_RE.finditer(text)]
+    if lang == "jvm":
+        out += [("jvm", m.group(1)) for m in JVM_IMPORT_RE.finditer(text)]
+    if lang in ("cs", ""):
+        out += [("cs", m.group(1)) for m in CS_USING_RE.finditer(text)]
+    if lang in ("rs", ""):
+        out += [("rust", m.group(1) or m.group(2)) for m in RUST_USE_RE.finditer(text)
+                if lang == "rs" or "::" in (m.group(1) or "")]
+    if lang in ("php", ""):
+        out += [("php", m.group(1)) for m in PHP_USE_RE.finditer(text) if lang == "php" or "\\" in m.group(1)]
+    if lang == "go":
+        out += [("go", m.group(1)) for m in GO_IMPORT_RE.finditer(text)]
+        block = GO_BLOCK_LINE_RE.match(text)
+        if block:
+            out.append(("go", block.group(1)))
+    if lang in ("rb", ""):
+        out += [("ruby", m.group(1)) for m in RUBY_REQUIRE_RE.finditer(text) if not m.group(1).startswith((".", "/"))]
+    return out
+
+
+# keys of a TOML array that are not dependencies (`keywords = ["stripe"]` names a topic, not a package)
+TOML_METADATA_KEYS = {"keywords", "classifiers", "authors", "maintainers", "include", "exclude", "files", "urls", "readme",
+                      "license", "license-files", "members", "exclude-members", "categories", "features", "default"}
+
+
+def manifest_line_uses(line: str, filename: str) -> list[tuple[str, str]]:
+    """(reading, name) for the dependency one line of a manifest declares — the per-line form of `declared_names`, for
+    a diff line or one line of a Write. A key with a string value in `package.json` / `composer.json` (a whole object on
+    one line is read with `declared_names`), a requirement line, a TOML key (`stripe = "^5"`, `[dependencies.stripe]`)
+    or the strings of a dependency array, a `go.mod` require, a `Gemfile` gem."""
+    base = _base_name(filename)
+    s = str(line or "").strip()
+    if not s or not _is_manifest(filename):
+        return []
+    if base in ("package.json", "composer.json"):
+        reading = _manifest_reading(base)
+        if s.startswith("{") and s.rstrip(",").endswith("}"):
+            try:
+                json.loads(s.rstrip(","))
+                return [(reading, n) for n in sorted(declared_names(s.rstrip(","), base))]
+            except Exception:
+                pass
+        # a package name holds no quote and no backslash: the key is read up to the next quote (the escaped form scanned
+        # to the end of the line from every `"`, and a line of `\"` never finished — third review of 30.09)
+        return [(reading, m.group(1)) for m in re.finditer(r"\"([^\"\\\n]{1,214})\"\s*:\s*\"", s)]
+    if base in ("pyproject.toml", "pipfile", "cargo.toml"):
+        reading = _manifest_reading(base)
+        if s.startswith("#"):
+            return []
+        table = re.match(r"^\[+\s*(?:[\w.\-]+\.)?(?:dependencies|dev-dependencies|build-dependencies|packages|dev-packages)"
+                         r"\.[\"']?([\w.\-]+)[\"']?\s*\]+$", s)
+        if table:
+            return [(reading, table.group(1))]
+        if s.startswith("["):
+            return []
+        pair = re.match(r"^([A-Za-z0-9_.\-\"']+)\s*=\s*(.*)$", s)
+        if pair:
+            key, value = pair.group(1).strip("\"'"), pair.group(2).strip()
+            if value.startswith("[") and key.lower() not in TOML_METADATA_KEYS:
+                return [(reading, _package_name(v)) for v in re.findall(r"[\"']([^\"']+)[\"']", value.split(" #", 1)[0])]
+            return [] if value.startswith("[") or key.lower() == "python" else [(reading, key)]
+        return [(reading, _package_name(v)) for v in re.findall(r"[\"']([^\"']+)[\"']", s.split(" #", 1)[0])]
+    if base == "go.mod":  # the module path as written: `github.com/gobwas/ws v1.4.0` (one dot per step of the host:
+        # `[\w.\-]+\.[\w.\-]+` could split a run of dots every way, 12 s on a line of them — third review of 30.09)
+        return [("go", n) for n in re.findall(r"^\s*(?:require\s+)?([\w\-]*(?:\.[\w\-]*)+/\S+)\s+v\d", s)]
+    return [(_manifest_reading(base), n) for n in declared_names(s, base)]
+
+
+def _manifest_reading(filename: str) -> str:
+    """How the names a manifest declares are read (`reads_as_package`): `package.json` as npm names, `composer.json` as
+    Composer's vendor/package, `go.mod` as Go modules, `Cargo.toml` and `Gemfile` as one name, the rest the PyPI way."""
+    return {"package.json": "npm", "composer.json": "slash", "go.mod": "go", "cargo.toml": "exact",
+            "gemfile": "exact"}.get(_base_name(filename), "pip")
+
+
+# The files that carry Python requirement lines without being a manifest the dependency class reads: a pip constraints
+# file, tox's `deps`, setup.cfg's `install_requires`, a conda environment's list (its `pip:` entries included). A line
+# there names a package the environment installs; hook 2026-09-29 refused `resend==2.0` in any of them as a word.
+REQUIREMENT_LIKE_FILE = re.compile(r"^(?:[\w.\-]*constraints[\w.\-]*\.(?:txt|in)|tox\.ini|setup\.cfg|environment\.ya?ml|"
+                                   r"conda[\w.\-]*\.ya?ml)$", re.I)
+# No two `\s*` next to each other: `^\s*(?:… |\s+)` and a spec ending `\s*(?:[…]\s*)?…\s*` split a run of spaces
+# every way before failing — a 100 KB line of spaces in a setup.cfg never finished (third review of 30.09). Each
+# optional part now starts with its own `\s*` and a character it must see.
+_REQUIREMENT_SPEC = (r"([A-Za-z0-9][\w.\-]*)(?:\s*\[[^\]]*\])?(?:\s*(?:===|==|>=|<=|~=|!=|<|>)\s*[\w.*+!\-]+"
+                     r"(?:\s*,\s*(?:===|==|>=|<=|~=|!=|<|>)\s*[\w.*+!\-]+)*)?(?:\s*;.*)?\s*")
+_INI_REQUIREMENT_RE = re.compile(r"^(?:\s*(?:deps|install_requires|tests_require|setup_requires|requires)\s*=\s*|\s+)"
+                                 + _REQUIREMENT_SPEC + r"$")
+_CONDA_REQUIREMENT_RE = re.compile(r"^\s*-\s+(?:[\w.\-]+::)?([A-Za-z0-9][\w.\-]*)(?:\s*\[[^\]]*\])?\s*(?:[=<>!~].*)?$")
+
+
+def requirement_like_line_uses(line: str, filename: str) -> list[tuple[str, str]]:
+    """(reading, name) for the requirement one line of a `REQUIREMENT_LIKE_FILE` names: a constraints line read like
+    requirements.txt, an ini line that is only a requirement (`deps = resend`, `    resend==2.0` — never `ws =
+    app.cli:main`), a conda list item (`- resend==2.0`, `- conda-forge::stripe`)."""
+    base = _base_name(filename)
+    s = str(line or "").rstrip()
+    if not s.strip() or s.lstrip().startswith(("#", ";")) or not REQUIREMENT_LIKE_FILE.match(base):
+        return []
+    if base.endswith((".txt", ".in")):  # a constraints file: `dev-constraints.txt` too
+        return [("pip", n) for n in declared_names(s, "requirements.txt")]
+    if base.endswith(".ini") or base.endswith(".cfg"):
+        m = _INI_REQUIREMENT_RE.match(s.split(" #", 1)[0].rstrip())
+        return [("pip", m.group(1))] if m else []
+    m = _CONDA_REQUIREMENT_RE.match(s.split(" #", 1)[0])
+    return [("pip", m.group(1))] if m and m.group(1).lower() != "pip" else []
+
+
+# The config files of a forbidden stack that name its packages without being a manifest the dependency class reads
+# (the second review of 30.09): Expo's `app.json` / `app.config.json` (a top-level `"expo"` key is the Expo app's config),
+# Flutter's `pubspec.yaml` (its `dependencies:` entries, `flutter:`, `sdk: flutter`), a .NET project's
+# `<PackageReference Include="Stripe.net" …>` (and a central `Directory.Packages.props`), a Deno config or an import
+# map whose values name npm packages (`"mail": "npm:resend@2"`, an esm.sh URL). Read for a forbidden package only.
+# Left as designed — mentioned by a keyword if at all, never read as a package: lockfiles, Django's INSTALLED_APPS,
+# `/// <reference types>`, SCSS imports, next.config's `transpilePackages`.
+STACK_CONFIG_FILE = re.compile(r"^(?:app(?:\.config)?\.json|pubspec\.yaml|[\w.\-]+\.(?:cs|fs|vb)proj|directory\.packages\.props|"
+                               r"deno\.jsonc?|import_map\.json|importmap\.json)$", re.I)
+# Expo's app config is read as a whole document (the third review of 30.09): only a TOP-LEVEL `"expo"` key is the
+# Expo app's config (`{"scripts": {"expo": …}}`, `{"targets": {"expo": {…}}}` are not), so the text is parsed as JSON,
+# and a text that does not parse — one line of the file, a fragment an Edit writes — gets no stack-config reading.
+STACK_DOCUMENT_NAMES = frozenset({"app.json", "app.config.json"})
+# pubspec.yaml: a package is a two-space key under `dependencies:`, `dev_dependencies:` or `dependency_overrides:`, and
+# `sdk: flutter` (never a key of `executables:`, `environment:` or `flutter:`). A line read before any top-level key of
+# the text (one line of a diff, an Edit's fragment) counts when its value is a version, or when it is empty and the
+# next line is its source (`git:`, `path:`, `hosted:`, `version:`, `sdk:`) — what a dependency's value is, and an
+# executable's (`expo: main`, `expo:`) is not. The hook and check-diff read the file as a document too
+# (`stack_document_change`, `diff_row_statements`), so a section header in sight decides.
+PUBSPEC_DEPENDENCY_SECTIONS = frozenset({"dependencies", "dev_dependencies", "dependency_overrides"})
+_PUBSPEC_TOP_RE = re.compile(r"^([A-Za-z_][\w\-]*)\s*:")
+_PUBSPEC_KEY_RE = re.compile(r"^  ([a-z_][a-z0-9_]*)\s*:\s*(.*)$")
+_PUBSPEC_VERSION_RE = re.compile(r"^(?:[\"']?\s*(?:[\^<>=~]|\d|any\b))")
+_PUBSPEC_SDK_FLUTTER_RE = re.compile(r"^\s+sdk\s*:\s*[\"']?flutter[\"']?\s*$")
+_PUBSPEC_SOURCE_RE = re.compile(r"^    \s*(?:git|path|hosted|version|sdk)\s*:")
+DOCUMENT_NAMES = STACK_DOCUMENT_NAMES | {"pubspec.yaml"}
+# bounded: an unbounded `[^>]*?` scanned to the end of the line from each of 60 000 `<PackageReference` (third review)
+# Each scan stops at the next tag or at the value's own quote, so every character is read by one start (the third review
+# of 30.09: `[^>]*?` from each of 60 000 `<PackageReference`, and a key read back over 200 000 `\"`, did not finish).
+_PACKAGE_REFERENCE_RE = re.compile(r"<Package(?:Reference|Version)\b[^<>]{0,1000}?\bInclude\s*=\s*\"([^\"<>]{1,500})\"", re.I)
+_IMPORT_MAP_VALUE_RE = re.compile(r"\"\s*:\s*\"((?:npm:|jsr:|https?://)[^\"\n]{1,2000})\"")
+
+
+def _pubspec_uses(text: str) -> list[tuple[str, str]]:
+    """The packages a pubspec.yaml text names (see PUBSPEC_DEPENDENCY_SECTIONS), read line by line with the section
+    each line is in; "" is the section before any top-level key of the text."""
+    out: list[tuple[str, str]] = []
+    section = ""
+    lines = str(text or "").split("\n")
+    for i, raw in enumerate(lines):
+        line = raw.split(" #", 1)[0].rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        top = _PUBSPEC_TOP_RE.match(line)
+        if top:
+            section = top.group(1).lower()
+            continue
+        if section and section not in PUBSPEC_DEPENDENCY_SECTIONS:
+            continue
+        if _PUBSPEC_SDK_FLUTTER_RE.match(line):
+            out.append(("exact", "flutter"))
+            continue
+        key = _PUBSPEC_KEY_RE.match(line)
+        if not key:
+            continue
+        value = key.group(2).strip()
+        if section or _PUBSPEC_VERSION_RE.match(value):
+            out.append(("exact", key.group(1)))
+        elif not value:  # its source on the next non-empty line (looked for a few lines ahead, never the rest)
+            after = next((x for x in lines[i + 1:i + 4] if x.strip()), "")
+            if _PUBSPEC_SOURCE_RE.match(after):
+                out.append(("exact", key.group(1)))
+    return out
+
+
+def stack_config_uses(line: str, filename: str) -> list[tuple[str, str]]:
+    """(reading, name) for the package a text of a `STACK_CONFIG_FILE` names: an Expo `app.json` whole (a text that
+    parses as JSON with a top-level `"expo"`), a pubspec.yaml by its sections (`_pubspec_uses`), the rest line by line.
+    Pure."""
+    base = _base_name(filename)
+    s = str(line or "")
+    if not s.strip() or not STACK_CONFIG_FILE.match(base):
+        return []
+    if base in STACK_DOCUMENT_NAMES:
+        try:
+            data = json.loads(s)
+        except Exception:
+            return []
+        return [("npm", "expo")] if isinstance(data, dict) and "expo" in data else []
+    if base == "pubspec.yaml":
+        return _pubspec_uses(s)
+    if base.endswith("proj") or base == "directory.packages.props":
+        return [("cs", n) for n in _PACKAGE_REFERENCE_RE.findall(s)]
+    return [("npm", v) for v in _IMPORT_MAP_VALUE_RE.findall(s)]
+
+
+def stack_document_change(tool_name: str, tool_input: dict) -> tuple[str, str] | None:
+    """(the document as the call leaves it, as it was) for a Write or an Edit of an Expo `app.json` /
+    `app.config.json` or a `pubspec.yaml` (`DOCUMENT_NAMES`), None for any other call. A Write's content is the new document and ""
+    the old (a Write names what it writes, as any other Write does); an Edit is applied to the file on disk (read up to
+    PACKAGE_READ_MAX) — when the file cannot be read or an edit does not apply, the new text is only the fragments,
+    which do not parse and so name nothing."""
+    tool_input = tool_input or {}
+    if is_command(tool_name, tool_input):
+        return None
+    text, path = text_of_tool_input(tool_name, tool_input)
+    if _base_name(path) not in DOCUMENT_NAMES:
+        return None
+    content = next((tool_input[k] for k in ("content", "contents") if isinstance(tool_input.get(k), str)), None)
+    if content is not None:
+        return content, ""
+    old, _why = _read_for_packages(Path(path) if os.path.isabs(path) else project_root() / path)
+    if old is None:
+        return text, ""
+    new = old
+    for o, n, every, _offset in _edits_of(tool_input):
+        if not o or o not in new:
+            return text, ""
+        new = new.replace(o, n) if every else new.replace(o, n, 1)
+    return new, old
+
+
+def _create_package(word: str) -> str:
+    """What `npm create <x>` / `npm init <x>` runs: `expo-app` → `create-expo-app`, `@scope/x` → `@scope/create-x`."""
+    name = _package_name(word).lower()
+    if name.startswith("@"):
+        scope, _sep, rest = name.partition("/")
+        return f"{scope}/create-{rest}" if rest else f"{scope}/create"
+    return name if name.startswith("create-") else "create-" + name
+
+
+def command_package_uses(command: str, programs: bool = True) -> list[tuple[str, str]]:
+    """(reading, name) for every package a shell command installs or runs by name: the installs `dependency_additions`
+    reads plus those for the whole machine (`_installs(machine=True)`), `npx|pnpx|bunx <pkg>`, `npm exec|pnpm dlx|
+    yarn dlx|bun x <pkg>`, `npm|yarn|pnpm|bun create|init <x>` (`create-<x>`), `uvx <pkg>`, `python -m <module>`.
+    `programs`: the text is a command the agent runs, so a command whose program is the package's own CLI (`expo start`,
+    `stripe listen`, `flutter run`) counts too."""
+    uses = [(MANAGER_READINGS.get(manager, "exact"), name) for manager, name in _installs(command, machine=True)]
+    for tokens in _install_commands(command):
+        exe = _manager_exe(tokens[0])
+        words = [t for t in _after_global_options(exe, tokens[1:]) if not t.startswith("-")]
+        if re.match(r"^(?:python|py)(?:\d+(?:\.\d+)?)?$", exe) and "-m" in tokens[1:]:
+            i = tokens.index("-m")
+            if i + 1 < len(tokens):
+                uses.append(("py", tokens[i + 1]))
+            continue
+        if exe in JS_RUNNERS and len(words) > 1 and words[0].lower() in JS_RUN_SUBCOMMANDS | JS_CREATE_SUBCOMMANDS:
+            uses.append(("npm", _package_name(words[1]) if words[0].lower() in JS_RUN_SUBCOMMANDS
+                         else _create_package(words[1])))
+            continue
+        if exe == "uvx" and words:
+            uses.append(("pip", _package_name(words[0])))
+            continue
+        if programs:
+            first = tokens[0].strip()
+            uses.append(("npm", _package_name(first) if first.startswith("@") else _package_name(exe)))
+    return uses
+
+
+def _starts_an_install(words: list[str]) -> bool:
+    """The first words of a command inside a line — a manager and what follows it — install or run a package: one of
+    the three words after the manager is an `INLINE_VERBS` word (`pip install`, `pnpm --filter web add`), the manager
+    runs packages itself (`npx`, `uvx`), or Python is told `-m`. `go back to the dashboard` is not a command."""
+    while words and (words[0].lower() == "sudo" or re.fullmatch(r"[@+\-]+", words[0])):
+        words = words[1:]
+    if words:  # a Makefile recipe's prefix glued to the word: `@pip`, `-pip`
+        words = [words[0].lstrip("@+-")] + words[1:]
+    if len(words) < 2:
+        return False
+    exe = _manager_exe(words[0])
+    if exe in NPX_RUNNERS or exe == "uvx":
+        return True
+    after = [w.lower() for w in words[1:4]]
+    if re.match(r"^(?:python|py)(?:\d+(?:\.\d+)?)?$", exe):
+        return "-m" in after
+    return any(w in INLINE_VERBS for w in after)
+
+
+def _command_end(text: str, start: int, limit: int) -> int:
+    """Where the shell command that starts at `start` ends, before `limit`: a separator outside quotes (`;`, `&&`,
+    `||`, `|`, `&`, a newline). `2>&1` and `&>` are redirects, not separators. One pass over the command."""
+    quote = ""
+    i = start
+    while i < limit:
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"`":
+            quote = ch
+        elif ch in ";\n|":
+            return i
+        elif ch == "&" and text[i - 1:i] not in ("<", ">") and text[i + 1:i + 2] != ">":
+            return i
+        i += 1
+    return i
+
+
+def exec_form_uses(line: str) -> list[tuple[str, str]]:
+    """The packages the exec form of a command installs or runs — a Dockerfile `RUN ["pip", "install", "resend"]`, a
+    YAML `command: ["npx", "expo", "start"]` — read as the same command written out."""
+    out: list[tuple[str, str]] = []
+    for m in EXEC_FORM_RE.finditer(str(line or "")):
+        items = [a or b for a, b in re.findall(r"\"((?:[^\"\\]|\\.)*)\"|'([^']*)'", m.group(0)) if a or b]
+        command = " ".join(f"'{item}'" if re.search(r"\s", item) else item for item in items)
+        words = command.split()[:6]
+        if _starts_an_install(words):
+            command = re.sub(r"^sudo\s+", "", command, flags=re.I)
+            out += command_package_uses(command, programs=_exe_name(command.split()[0]) in NPX_RUNNERS)
+    return out
+
+
+def inline_command_uses(line: str) -> list[tuple[str, str]]:
+    """The packages an install command written into a line of a file installs or runs (`RUN pip install stripe`,
+    `run: npm i expo`, `"postinstall": "npx expo prebuild"`, the exec form `RUN ["pip", "install", "resend"]`). A
+    command ends at a shell separator, at its closing quote when the line quotes it, or after `INLINE_WINDOW`
+    characters; a manager whose next words install or run nothing is not a command (`_starts_an_install`), and a match
+    inside a command already read is one of its words. So each character of the line is read at most once (review
+    30.09: the rest of the line was re-read at every match, 30 s for a one-line JSON of 60 000 characters). A program
+    is read as a package only behind `npx`/`pnpx`/`bunx`: `expo = 1` in code is not `expo` run."""
+    text = str(line or "")
+    out: list[tuple[str, str]] = []
+    if not MANAGER_WORD_RE.search(text):
+        return out
+    read_to = 0
+    for m in INLINE_COMMAND_RE.finditer(text):
+        start = m.start()
+        if start < read_to:
+            continue
+        words = text[start:start + 160].split()[:6]
+        if not _starts_an_install(words):
+            continue
+        limit = min(len(text), start + INLINE_WINDOW)
+        quote = text[start - 1] if start and text[start - 1] in "\"'`" else ""
+        if quote:
+            closing = text.find(quote, start, limit)
+            limit = closing if closing >= 0 else limit
+        read_to = _command_end(text, start, limit)
+        command = re.sub(r"^[@+\-]*(?:sudo\s+)?", "", text[start:read_to].strip(), flags=re.I)
+        first = _exe_name(command.split(None, 1)[0]) if command.split() else ""
+        out += command_package_uses(command, programs=first in NPX_RUNNERS)
+    if "[" in text:
+        out += exec_form_uses(text)
+    return out
+
+
+def _statement_open(line: str, js: bool = False) -> str:
+    """What keeps a statement open at the end of this line: `\\` (a trailing backslash), `)` (a `require(`, `import(`,
+    `import_module(` left open), `]` (an exec-form array left open) or, when `js` (the text may be JS/TS), `from` (an
+    import whose module comes on a later line); "" when the line ends its statement."""
+    s = str(line or "").rstrip()
+    if s.endswith("\\"):
+        return "\\"
+    if "(" in s and OPEN_CALL_RE.search(_without_block_comments(s)):
+        return ")"
+    if "[" in s and OPEN_EXEC_FORM_RE.search(s):
+        return "]"
+    if js and OPEN_JS_IMPORT_RE.match(s):
+        return "from"
+    return ""
+
+
+def _js_import_end(lines: list[str], i: int) -> int:
+    """The last line of the import or export that `lines[i]` opens without naming its module (`OPEN_JS_IMPORT_RE`), or
+    -1 when the lines after it do not finish one. With an open brace the lines are joined up to the one holding the
+    `}` (a comment line never is it), at most STATEMENT_MAX_LINES; the `from '…'` must then be on that line after the
+    `}`, or on the next non-empty lines — at most JS_IMPORT_TAIL_LINES of them, holding nothing but `from` and the
+    module. A comment line there ends the reading: `export {` … `}` / `// … from 'resend' webhooks` is no import."""
+    n = len(lines)
+    first = str(lines[i])
+    j = i
+    tail = ""
+    if JS_BARE_IMPORT_RE.match(first):
+        k = i + 1
+        while k < n and not str(lines[k]).strip():
+            k += 1
+        if k < n and JS_IMPORT_NAME_LINE_RE.match(str(lines[k])):
+            j = k  # the one line of names: the `from '…'` comes after it
+    if first.count("{") > first.count("}"):
+        while True:
+            j += 1
+            if j >= n or j - i > STATEMENT_MAX_LINES:
+                return -1
+            line = str(lines[j])
+            if "}" in line and not JS_COMMENT_LINE_RE.match(line):
+                tail = line[line.rfind("}") + 1:]
+                break
+    elif "}" in first:
+        tail = first[first.rfind("}") + 1:]
+    if JS_FROM_TAIL_RE.match(tail):
+        return j
+    if not JS_FROM_PREFIX_RE.match(tail):
+        return -1
+    for _ in range(JS_IMPORT_TAIL_LINES):
+        j += 1
+        while j < n and not str(lines[j]).strip():
+            j += 1
+        if j >= n or JS_COMMENT_LINE_RE.match(str(lines[j])):
+            return -1
+        tail = f"{tail} {str(lines[j]).strip()}"
+        if JS_FROM_TAIL_RE.match(tail):
+            return j
+        if not JS_FROM_PREFIX_RE.match(tail):
+            return -1
+    return -1
+
+
+def statement_spans(lines: list[str], file: str = "") -> list[tuple[int, int, str]]:
+    """(first, last, text) for every statement these consecutive lines write over more than one line, joined into one
+    line: a trailing backslash continues it (`RUN pip install \\`, Python's `import os, \\`, a hashed requirement), a
+    `require(` or `import(` left open runs to its `)` (`const { Server } = require(` / `'ws'` / `)`), an exec-form array
+    left open to its `]`, and — in a JS/TS file (`file`) or text of no known language — an import whose `from '…'` comes
+    on a later line (`import { Resend }` / `  from 'resend';`, `_js_import_end`). At most STATEMENT_MAX_LINES lines and
+    STATEMENT_MAX_CHARS characters. Only packages are read in the joined text (`package_uses`); every line keeps its own
+    reading and its own verdict. Pure, one pass."""
+    out: list[tuple[int, int, str]] = []
+    js = _file_language(file) in ("js", "")
+    i, n = 0, len(lines)
+    while i < n:
+        scan_checkpoint()
+        closer = _statement_open(lines[i], js)
+        if not closer:
+            i += 1
+            continue
+        if closer == "from":
+            j = _js_import_end(lines, i)
+            if j < 0:
+                i += 1
+                continue
+            out.append((i, j, " ".join(str(lines[x]).strip() for x in range(i, j + 1))[:STATEMENT_MAX_CHARS * 2]))
+            i = j + 1
+            continue
+        text, j = str(lines[i]).rstrip(), i
+        while closer and j + 1 < n and j - i < STATEMENT_MAX_LINES and len(text) < STATEMENT_MAX_CHARS:
+            j += 1
+            following = str(lines[j]).strip()
+            if closer == "\\":
+                text = text[:-1].rstrip()
+            text = f"{text} {following}"
+            if closer == "\\" or closer in following:
+                closer = _statement_open(following, js)
+        if j > i:
+            out.append((i, j, text))
+        i = j + 1
+    return out
+
+
+# the interpreters a heredoc can feed code to, and a file name of the language that code is read in
+HEREDOC_INTERPRETERS = {"node": "<stdin>.js", "deno": "<stdin>.ts", "bun": "<stdin>.js", "tsx": "<stdin>.ts",
+                        "ts-node": "<stdin>.ts", "ruby": "<stdin>.rb", "php": "<stdin>.php"}
+
+
+def _heredoc_file(line: str) -> str:
+    """What the body of the heredoc this line opens is read as: the file `cat`/`tee` writes it into, a file of the
+    language an interpreter reads it in (`python - <<EOF` → `<stdin>.py`), or "" — a heredoc fed to anything else (a
+    shell, `psql`) stays part of the command."""
+    for segment in SEGMENT_SPLIT.split(str(line or "")):
+        if "<<" not in segment:
+            continue
+        words = segment.strip().split()
+        exe = _exe_name(words[0]) if words else ""
+        if exe in _HEREDOC_WRITERS:
+            return _write_target_of_line(line)
+        if re.match(r"^(?:python|py)(?:\d+(?:\.\d+)?)?$", exe):
+            return "<stdin>.py"
+        return HEREDOC_INTERPRETERS.get(exe, "")
+    return ""
+
+
+def shell_embedded_files(command: str) -> tuple[str, list[tuple[str, str]]]:
+    """(the command without the text it carries into a file or an interpreter, [(file, text)]), so that a package is
+    read in what the text is: a heredoc `cat`/`tee` writes into a file is that file's content (`cat >> requirements.txt
+    <<EOF` holds requirement lines), what `echo`/`printf` send into a file (`>`, `>>`, `| tee [-a]`) too (`echo
+    'resend==2.0' >> requirements.txt`, review 30.09: it passed while the next `pip install -r` installed it), and a
+    heredoc fed to an interpreter is code of its language (`python - <<EOF` … `ws = wb.active` is Python, not the
+    program `ws`). A heredoc fed to a shell stays commands. Pure."""
+    raw = str(command or "")
+    files: list[tuple[str, str]] = []
+    if "<<" in raw:
+        lines, kept, i = raw.split("\n"), [], 0
+        while i < len(lines):
+            line = lines[i]
+            kept.append(line)
+            m = _HEREDOC.search(line)
+            file = _heredoc_file(line) if m else ""
+            if not file:
+                i += 1
+                continue
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != m.group(2):
+                j += 1
+            files.append((file, "\n".join(lines[i + 1:j])))
+            i = j + 1
+        raw = "\n".join(kept)
+    if "<<<" in raw:  # a here-string: `tee -a requirements.txt <<< 'resend'`, `python3 <<< 'import resend'`
+        for segment, _sep in _split_shell(raw):
+            m = _HERE_STRING.search(segment)
+            if not m:
+                continue
+            data = next((g for g in m.groups() if g is not None), "").replace("\\n", "\n")
+            tokens = _shell_tokens(segment[:m.start()] + " " + segment[m.end():])
+            exe = _exe_name(tokens[0]) if tokens else ""
+            targets = ([t for t in tokens[1:] if not t.startswith("-") and not REDIRECT_TOKEN.match(t)] if exe == "tee"
+                       else _redirect_targets(tokens) if exe == "cat"
+                       else ["<stdin>.py"] if re.match(r"^(?:python|py)(?:\d+(?:\.\d+)?)?$", exe)
+                       else [HEREDOC_INTERPRETERS[exe]] if exe in HEREDOC_INTERPRETERS else [])
+            files += [(t, data) for t in targets]
+    if ">" in raw or "tee" in raw:
+        piped: str | None = None
+        for segment, sep in _split_shell(raw):
+            tokens = _shell_tokens(segment)
+            exe = _exe_name(tokens[0]) if tokens else ""
+            if exe == "tee" and sep == "|" and piped is not None:
+                files += [(t, piped) for t in tokens[1:] if not t.startswith("-")]
+            piped = None
+            if exe not in ("echo", "printf"):
+                continue
+            args: list[str] = []
+            for token in tokens[1:]:
+                if REDIRECT_TOKEN.match(token):
+                    break
+                args.append(token)
+            while exe == "echo" and args and re.match(r"^-[neE]+$", args[0]):
+                args = args[1:]
+            data = " ".join(args).replace("\\n", "\n")
+            targets = _redirect_targets(tokens)
+            files += [(t, data) for t in targets]
+            piped = None if targets else data
+    return raw, files
+
+
+def package_uses(text: str, file: str = "", shell: bool = False, statement: str = "",
+                 statement_base: str = "") -> list[tuple[str, str]]:
+    """(reading, name) for every package the text brings in, line by line: an import statement (`import_uses`), a
+    manifest entry when `file` is a manifest (`manifest_line_uses`), a requirement line of a requirement-like file
+    (`requirement_like_line_uses`), a package a forbidden stack's own config names (`stack_config_uses`), an install
+    command written into the line (`inline_command_uses`) — and the same readings of every statement written over
+    several lines (`statement_spans`), or of `statement`, the joined statement a line belongs to (`line_hits` gets it
+    from its caller). `statement_base` is that statement's text as it was before the change, when the statement reaches
+    lines the change did not write (a context line of a diff, the rest of a file an Edit lands in): a package it already
+    names is not this line's (`statement_changes`). `shell`: the text is a command the agent runs
+    (`command_package_uses`, programs included, a backslash-newline continuing the command), code it carries (`python
+    -c "import stripe"`) is read with every import form, and the text it carries into a file or an interpreter as that
+    file's (`shell_embedded_files`; a comment line there is written down, not read). At most PACKAGE_READ_MAX
+    characters of the text are read (the caller reports the rest: `unread_parts`)."""
+    raw = str(text or "")[:PACKAGE_READ_MAX]
+    if not raw.strip() and not statement:
+        return []
+    if shell:
+        command, embedded = shell_embedded_files(raw)
+        command = re.sub(r"\\\r?\n", " ", command)
+        uses = command_package_uses(command) + [use for line in command.split("\n") for use in import_uses(line)]
+        for target, content in embedded:
+            code = "\n".join(line for line in content.split("\n") if not is_comment_line(target, line))
+            uses += package_uses(code, target)
+        return uses
+    manifest = bool(file) and _is_manifest(file)
+    requirements = bool(file) and bool(REQUIREMENT_LIKE_FILE.match(_base_name(file)))
+    stack_config = bool(file) and bool(STACK_CONFIG_FILE.match(_base_name(file)))
+    lines = raw.split("\n")
+    uses: list[tuple[str, str]] = []
+    if stack_config and _base_name(file) in STACK_DOCUMENT_NAMES | {"pubspec.yaml"}:
+        uses += stack_config_uses(raw, file)  # read as a document: a key's place in it decides (`stack_config_uses`)
+        stack_config = False
+    for line in lines:
+        scan_checkpoint()
+        if not line.strip():
+            continue
+        uses += import_uses(line, file)
+        if manifest:
+            uses += manifest_line_uses(line, file)
+        if requirements:
+            uses += requirement_like_line_uses(line, file)
+        if stack_config:
+            uses += stack_config_uses(line, file)
+        uses += inline_command_uses(line)
+    joined = [span for _first, _last, span in statement_spans(lines, file)] if len(lines) > 1 else []
+    for whole in joined:
+        uses += import_uses(whole, file) + inline_command_uses(whole)
+    if statement:
+        uses += statement_changes(statement, statement_base, file)
+    return uses
+
+
+def statement_changes(statement: str, base: str = "", file: str = "") -> list[tuple[str, str]]:
+    """(reading, name) for the packages a joined statement brings in (an import, an install command) that `base` — the
+    text around it as it was before the change — does not already bring in. With no base, all of them. So a line
+    added to `RUN pip install \\` … `stripe \\` … brings in its own package, never `stripe` the statement already had."""
+    uses = package_uses(statement, file)
+    if not base or not uses:
+        return uses
+    before = {(reading, _pep503(name)) for reading, name in package_uses(base, file)}
+    return [(reading, name) for reading, name in uses if (reading, _pep503(name)) not in before]
+
+
+def _prose_names(trigger: str, low: str, prefix: bool = False) -> bool:
+    """A package named in a sentence: the word between spaces, quotes, slashes, `@` or `=` — the reading every text got
+    until hook 2026-09-29, kept for a request and for the data a command carries. A prefix is followed by a name."""
+    word = str(trigger or "").strip().lower()
+    if not word or word not in low:  # the substring test first: a regex scan per package of a 1 MB text is not free
+        return False
+    t = re.escape(word)
+    tail = r"[a-z0-9]" if prefix else r"(?:[\s'\"@=:]|$)"
+    return bool(t) and bool(re.search(r"(?:^|[\s'\"/@=(`])" + t + tail, low))
+
+
+def package_hits(cfg: dict, text: str, file: str = "", shell: bool = False, prose: bool = False,
+                 statement: str = "", statement_base: str = "") -> list[str]:
+    """The forbidden packages (`deny_packages`) and package families (`deny_package_prefixes`) the text brings in, as
+    the config lists them — the package part of `trigger_hits`. `file` gives the language and says whether a line is a
+    manifest's; `shell` reads a command the agent runs; `prose` (a request, a commit message) also takes a package
+    named in a sentence; `statement` is the joined statement a line belongs to (`statement_spans`), `statement_base`
+    the same text before the change (`statement_changes`). A family is read in npm names only. Pure."""
+    packages = [str(p).strip() for p in cfg.get("deny_packages") or [] if str(p or "").strip()]
+    prefixes = [str(p).strip() for p in cfg.get("deny_package_prefixes") or [] if str(p or "").strip()]
+    if not (packages or prefixes) or not (str(text or "").strip() or statement):
+        return []
+    uses = list(dict.fromkeys(package_uses(text, file, shell=shell, statement=statement,
+                                           statement_base=statement_base)))  # a name read once
+    low = str(text).lower() if prose else ""
+    hits = [pkg for pkg in packages
+            if any(reads_as_package(pkg, reading, name) for reading, name in uses) or (prose and _prose_names(pkg, low))]
+    npm_names = [n for n in (_js_spec_name(name) for reading, name in uses if reading == "npm") if n]
+    hits += [prefix for prefix in prefixes
+             if any(n.startswith(prefix.lower()) for n in npm_names) or (prose and _prose_names(prefix, low, prefix=True))]
+    return hits
+
+
+def forbidden_package(cfg: dict, name: str, reading: str = "npm") -> str:
+    """The `deny_packages` or `deny_package_prefixes` entry an installed or declared package name is, or "" — the
+    reading `package_hits` gives the same name, so the dependency class skips exactly what was refused: the name read
+    as `reading` says (`MANAGER_READINGS`, `_manifest_reading`) or the PyPI way, and a family only for an npm name
+    (`pip install expo-helpers` is not in the Expo family: held as a new dependency, review 30.09)."""
+    for pkg in cfg.get("deny_packages") or []:
+        if str(pkg or "").strip() and (reads_as_package(str(pkg), "exact", name) or reads_as_package(str(pkg), reading, name)):
+            return str(pkg)
+    if reading != "npm":
+        return ""
+    spec = _js_spec_name(name)
+    for prefix in cfg.get("deny_package_prefixes") or []:
+        if str(prefix or "").strip() and spec.startswith(str(prefix).strip().lower()):
+            return str(prefix)
+    return ""
+
+
+# The deny rules a pack writes into .claude/settings.json for the forbidden packages: Claude Code refuses these installs
+# before the hook runs (defence in depth; the hook is the matcher). Until 2026-09-30 a rule read `Bash(npm install
+# expo*)`, which also matched `npm install export-to-csv` and `pip install stripe-mock`. A rule is now the name alone,
+# the name and more words (`expo *`: the space before `*` keeps the word whole), or the name with a version
+# (`expo@*`, `stripe==*`, `stripe>*`, `stripe[*`); a family is its prefix (`expo-*`), for the JS managers only.
+JS_INSTALL_RULES = ("npm install", "npm i", "pnpm add", "yarn add")
+PY_INSTALL_RULES = ("pip install", "uv add")
+
+
+def claude_deny_rules(cfg: dict) -> list[str]:
+    """`Bash(…)` deny rules for the installs of `deny_packages` and `deny_package_prefixes`, in that order."""
+    rules: list[str] = []
+    for pkg in [str(p).strip() for p in (cfg or {}).get("deny_packages") or [] if str(p or "").strip()]:
+        for manager in JS_INSTALL_RULES:
+            rules += [f"Bash({manager} {pkg})", f"Bash({manager} {pkg} *)", f"Bash({manager} {pkg}@*)"]
+        for manager in PY_INSTALL_RULES:
+            rules += [f"Bash({manager} {pkg})", f"Bash({manager} {pkg} *)"] + [f"Bash({manager} {pkg}{c}*)" for c in "=<>~["]
+    for prefix in [str(p).strip() for p in (cfg or {}).get("deny_package_prefixes") or [] if str(p or "").strip()]:
+        rules += [f"Bash({manager} {prefix}*)" for manager in JS_INSTALL_RULES]
+    return list(dict.fromkeys(rules))
+
+
+def legacy_deny_rules(cfg: dict) -> set[str]:
+    """The rules written before 2026-09-30 for the same packages (`Bash(npm install expo*)`): an installer that merges
+    into an existing .claude/settings.json drops them, or the prefix match would keep refusing `export-to-csv`."""
+    return {f"Bash({manager} {str(p).strip()}*)" for p in (cfg or {}).get("deny_packages") or [] if str(p or "").strip()
+            for manager in JS_INSTALL_RULES + PY_INSTALL_RULES}
+
+
+def trigger_hits(cfg: dict, text: str, path: str = "", *, file: str = "", shell: bool = False,
+                 prose: bool = False, statement: str = "", statement_base: str = "") -> list[tuple[str, str]]:
     """(kind, trigger) for every **blocking** Non-Goal trigger the text contains — the single place where a
     forbidden package, path, keyword or phrase is recognised. Pure: no I/O, no state, the config is read-only.
+
+    `path` is the file the text belongs to and is matched against the forbidden paths; `file` (default: `path`) only
+    gives the language a package is read in — `line_hits` passes it for one line without matching the path again.
+    `shell` says the text is a command the agent runs, `prose` that it is a sentence (a request, a commit message),
+    `statement` the joined statement a line belongs to (`statement_spans`) and `statement_base` that statement before
+    the change: all of them only change how a package is read (`package_hits`, 2026-09-30).
 
     `warn_keywords` are deliberately not here: they are a possible match for a human to judge, and a caller that
     reads this function is asking what stops a tool call. `warn_triggers` answers the other question.
@@ -1236,12 +2356,9 @@ def trigger_hits(cfg: dict, text: str, path: str = "") -> list[tuple[str, str]]:
     (`lumis/core/boundary_check.py`) so the pasted fragment is judged by exactly the matcher that will run in the
     repository — a studio answer the hook would not repeat is a lie about the guard."""
     low = (text or "").lower()
-    hits: list[tuple[str, str]] = []
-    for pkg in cfg.get("deny_packages", []):
-        if not pkg:
-            continue
-        if re.search(rf"(^|[\s'\"/@=])" + re.escape(pkg.lower()) + r"([\s'\"@=:]|$)", low) or f"import {pkg.lower()}" in low or f"from {pkg.lower()}" in low or f"require('{pkg.lower()}" in low or f'require("{pkg.lower()}' in low:
-            hits.append(("package", pkg))
+    hits: list[tuple[str, str]] = [("package", pkg) for pkg in
+                                   package_hits(cfg, text, file or path, shell=shell, prose=prose, statement=statement,
+                                                statement_base=statement_base)]
     slashed_path, slashed_text = str(path or "").replace("\\", "/").lower(), low.replace("\\", "/")
     for deny_path in cfg.get("deny_paths", []):
         if deny_path and (deny_path_pattern(deny_path).search(slashed_path) or deny_path_pattern(deny_path).search(slashed_text)):
@@ -1294,10 +2411,12 @@ def warn_triggers(cfg: dict, text: str) -> list[tuple[str, str]]:
             for kw in cfg.get("warn_keywords", []) or [] if kw and _keyword_found(kw, low, spelled)]
 
 
-def match_triggers(cfg: dict, text: str, path: str = "", kinds: tuple[str, ...] | None = None) -> list[str]:
+def match_triggers(cfg: dict, text: str, path: str = "", kinds: tuple[str, ...] | None = None,
+                   prose: bool = False) -> list[str]:
     """Non-Goal triggers in any text — a tool call's payload or the user's own prompt. One line per boundary.
-    `kinds` keeps only those kinds of hit (the prompt hook drops single-word keywords)."""
-    raw = [(f"{TRIGGER_LABELS[kind]} '{trigger}'", trigger) for kind, trigger in trigger_hits(cfg, text, path)
+    `kinds` keeps only those kinds of hit (the prompt hook drops single-word keywords); `prose` reads the text as a
+    sentence (the prompt hook: a package named in a request counts, `package_hits`)."""
+    raw = [(f"{TRIGGER_LABELS[kind]} '{trigger}'", trigger) for kind, trigger in trigger_hits(cfg, text, path, prose=prose)
            if kinds is None or kind in kinds]
     # one line per boundary: "forbidden dependency 'stripe', forbidden path 'billing/' → NG-1 "..." (set by the founder; ...)"
     grouped: dict[str, list[str]] = {}
@@ -1393,7 +2512,9 @@ LIBRARY_MODULES = frozenset({
 
 
 def _base_name(path: str) -> str:
-    return str(path or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    """The file's name, lower-cased — its last 255 characters: no file system has a longer one, and the name
+    patterns (`MANIFEST_FILE`, …) took seconds on a 100 KB name (third review of 30.09)."""
+    return str(path or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()[-255:]
 
 
 def is_option_context(path: str) -> bool:
@@ -1496,10 +2617,14 @@ def _library_module(modules: str, at: int) -> bool:
 
 
 def line_hits(cfg: dict, line: str, file: str = "", shell: bool = False,
-              technologies: frozenset | None = None) -> list[tuple[str, str, str, str]]:
+              technologies: frozenset | None = None, statement: str = "",
+              statement_base: str = "") -> list[tuple[str, str, str, str]]:
     """(kind, trigger, severity, why) for the Non-Goal triggers of one line of `file` (the file gives the language;
     it is not itself matched — a forbidden path of the file is the caller's). `shell` says the line is a shell
-    command. `technologies` is `technology_triggers(cfg)`, passed in by a caller that reads many lines. `severity`:
+    command. `technologies` is `technology_triggers(cfg)`, passed in by a caller that reads many lines. `statement` is
+    the statement this line starts when it runs over the next lines (`statement_spans`, joined): its packages count as
+    this line's (`RUN pip install \\` … `resend`), less those of `statement_base`, the statement before the change
+    (`statement_changes`). `severity`:
 
     - `block`: a blocking trigger on a line of code (or of a file whose language is not known, and in a command);
     - `noted`: a blocking trigger in a comment line of a code file, or anywhere in an ignore file — written down,
@@ -1509,13 +2634,16 @@ def line_hits(cfg: dict, line: str, file: str = "", shell: bool = False,
       library that spells another form of the word (`why` names it).
 
     Pure. Package names in an install command, a manifest or an import, forbidden paths, names written as code and
-    phrases are never weakened by `_foreign_name`; only a comment or an ignore file makes them `noted`."""
+    phrases are never weakened by `_foreign_name`; only a comment or an ignore file makes them `noted`. A package is
+    read in the language of `file` (a manifest's line as a declaration), a shell line as a command (`package_hits`,
+    2026-09-30)."""
     out: list[tuple[str, str, str, str]] = []
     comment = bool(file) and is_comment_line(file, line)
     ignore = bool(file) and is_ignore_file(file)
     low = ""
     context: bool | None = None
-    for kind, trigger in trigger_hits(cfg, line):
+    for kind, trigger in trigger_hits(cfg, line, file=file, shell=shell, statement=statement,
+                                      statement_base=statement_base):
         if ignore:
             out.append((kind, trigger, "noted", "an ignore file"))
             continue
@@ -1542,6 +2670,169 @@ def line_hits(cfg: dict, line: str, file: str = "", shell: bool = False,
 SEVERITY_ORDER = ("block", "warn", "noted")
 
 
+EDIT_OLD_KEYS = ("old_string", "old_str", "oldText", "old_text")
+# A line an Edit adds inside a statement it cannot see the start of, when the file around it cannot be read: only
+# the package name on it, and the backslash that continues the statement (`    resend \`), or the line right after
+# one. Read as that one name, the PyPI way (an npm scope the npm way) — never as a family.
+# (`(?:\s*(\\))?\s*$`, not `\s*(\\?)\s*$`: two `\s*` side by side split a run of spaces every way, and a line of
+# 100 KB of spaces never finished — third review of 30.09; group 2 is then "\\" or None)
+BARE_CONTINUATION_RE = re.compile(r"^\s+([A-Za-z0-9@][\w.\-/@]*(?:\[[^\]]*\])?(?:\s*[=<>!~]=?\s*[\w.*+!\-]+)?)(?:\s*(\\))?\s*$")
+
+
+def _candidate_statement(token: str) -> str:
+    """The install a bare package token stands for when the statement it continues is out of sight (`statement_changes`
+    reads it): its name, compared whole."""
+    name = _package_name(token)
+    return f"npm install {name}" if name.startswith("@") else f"pip install {name}"
+
+
+def _edits_of(tool_input: dict) -> list[tuple[str, str, bool, int]]:
+    """(old, new, replace_all, line) for the edits a tool call makes, in the order they apply — the call's own
+    `old_string`/`new_string` first, then its `edits` list — with the line of `text_of_tool_input`'s text where the
+    new text starts (-1 when it adds no text: a deletion)."""
+    out: list[tuple[str, str, bool, int]] = []
+    line = 0
+    for key in BODY_KEYS:  # the top-level parts, in the order `text_of_tool_input` joins them
+        part = str(tool_input.get(key, "") or "")
+        if not part:
+            continue
+        old = next((tool_input[k] for k in EDIT_OLD_KEYS if isinstance(tool_input.get(k), str)), None)
+        if key in EDIT_BODY_KEYS and old is not None and not out:
+            out.append((old, part, bool(tool_input.get("replace_all")), line))
+        line += part.count("\n") + 1
+    if not out:
+        old = next((tool_input[k] for k in EDIT_OLD_KEYS if isinstance(tool_input.get(k), str)), None)
+        if old is not None and any(isinstance(tool_input.get(k), str) for k in EDIT_BODY_KEYS):
+            out.append((old, "", bool(tool_input.get("replace_all")), -1))
+    for e in [x for x in (tool_input.get("edits") or []) if isinstance(x, dict)]:
+        old = next((e[k] for k in EDIT_OLD_KEYS if isinstance(e.get(k), str)), None)
+        parts = [str(e.get(k, "") or "") for k in EDIT_BODY_KEYS if str(e.get(k, "") or "")]
+        if old is not None and any(isinstance(e.get(k), str) for k in EDIT_BODY_KEYS):
+            out.append((old, parts[0] if parts else "", bool(e.get("replace_all")), line if parts else -1))
+        line += sum(p.count("\n") + 1 for p in parts)
+    return out
+
+
+def _window(text: str, at: int, end: int, middle: str) -> tuple[list[str], int, int]:
+    """(lines, first, last): `text` with `text[at:end]` replaced by `middle`, as the lines around it — up to
+    STATEMENT_MAX_LINES whole lines before and after, and never more than STATEMENT_MAX_CHARS * 2 characters on either
+    side, the partial lines joined to it — and where `middle`'s lines are among them. Bounded: the file is never split
+    whole (the third review of 30.09: 5 000 edits of a 5.5 MB file split it twice each, 75 s)."""
+    reach = STATEMENT_MAX_CHARS * 2
+    lo, hi = max(0, at - reach), min(len(text), end + reach)
+    ahead = text[lo:at].rsplit("\n", STATEMENT_MAX_LINES + 1)
+    behind = text[end:hi].split("\n", STATEMENT_MAX_LINES + 1)
+    if len(ahead) > STATEMENT_MAX_LINES + 1 or (lo > 0 and len(ahead) > 1):
+        ahead = ahead[1:]  # the first piece is not a whole line
+    if len(behind) > STATEMENT_MAX_LINES + 1 or (hi < len(text) and len(behind) > 1):
+        behind = behind[:-1]
+    body = middle.split("\n")
+    body[0] = ahead[-1] + body[0]
+    body[-1] = body[-1] + behind[0]
+    context_before = ahead[:-1]
+    lines = context_before + body + behind[1:]
+    return lines, len(context_before), len(context_before) + len(body) - 1
+
+
+def _read_for_packages(path: Path) -> tuple[str | None, str]:
+    """(the file's text, "") — or (None, why it was not read): not a file, unreadable, or larger than
+    PACKAGE_READ_MAX bytes (then it is not read at all: the edit is read as its own text)."""
+    try:
+        if not path.is_file():
+            return None, ""
+        if path.stat().st_size > PACKAGE_READ_MAX:
+            return None, f"context not read: {path.name} is larger than {PACKAGE_READ_MAX // 1_000_000} MB"
+        return path.read_text(encoding="utf-8", errors="replace"), ""
+    except Exception:
+        return None, ""
+
+
+def edit_statements(tool_name: str, tool_input: dict, unread: list[str] | None = None) -> dict[int, tuple[str, str]]:
+    """{line of the call's text: (statement, the statement before the change)} for every statement an Edit's new text
+    joins with lines of the file it does not itself write (review 30.09: a package added as a continuation line —
+    `    resend \\` under an existing `RUN pip install \\`, `            ws \\` in a multi-line `pnpm add` of a CI file,
+    `'ws'` into an open `require(` — was read on its own and passed). The file is read as it is on disk, each edit
+    applied in turn (as `manifest_additions` applies them); the statement goes to the first line of the new text it
+    covers, and its packages count less those the same stretch of the file named before the edit. A `replace_all` edit
+    is read at each place it lands, the first REPLACE_ALL_CONTEXT_MAX of them.
+
+    When the context is not available the edit is read as its own text: a bare package token on a line that continues a
+    statement the new text does not start (`BARE_CONTINUATION_RE`) is read as that one package
+    (`_candidate_statement`) — a forbidden one is refused; the dependency class holds anything else only in a manifest
+    (`manifest_additions`). That is so when the file cannot be read, when an edit's old text is not in it — and, bounded
+    since the third review of 30.09, when the file is larger than PACKAGE_READ_MAX bytes (not read at all), for the
+    edits past the first EDIT_CONTEXT_MAX, and for a `replace_all` that lands in more than REPLACE_ALL_CONTEXT_MAX
+    places. Each of those reasons is appended to `unread`: the caller reports it (a possible match, WARN). An Expo
+    `app.json` is read whole by `stack_document_change`, not here."""
+    tool_input = tool_input or {}
+    edits = _edits_of(tool_input)
+    if not edits or is_command(tool_name, tool_input):
+        return {}
+    notes = unread if unread is not None else []
+    _text, path = text_of_tool_input(tool_name, tool_input)
+    current: str | None = None
+    if path:
+        current, why = _read_for_packages(Path(path) if os.path.isabs(path) else project_root() / path)
+        if why:
+            notes.append(why)
+    out: dict[int, tuple[str, str]] = {}
+
+    def put(unit: int, statement: str, base: str) -> None:
+        had = out.get(unit)
+        out[unit] = (had[0] + "\n" + statement, had[1] + "\n" + base) if had else (statement, base)
+
+    def text_only(new_lines: list[str], offset: int) -> None:
+        seen_open = {x for a, b, _j in statement_spans(new_lines, path) for x in range(a, b + 1)
+                     if not BARE_CONTINUATION_RE.match(new_lines[a])}
+        for i, line in enumerate(new_lines):
+            m = BARE_CONTINUATION_RE.match(line)
+            continues = bool(m) and (m.group(2) == "\\" or (i > 0 and new_lines[i - 1].rstrip().endswith("\\")))
+            if continues and i not in seen_open:
+                put(offset + i, _candidate_statement(m.group(1)), "")
+
+    for number, (old, new, every, offset) in enumerate(edits):
+        scan_checkpoint()
+        new_lines = new.split("\n")
+        if number == EDIT_CONTEXT_MAX and current is not None:
+            notes.append(f"context not read for the edits past the first {EDIT_CONTEXT_MAX} of this call")
+            current = None
+        if current is not None and old and old in current:
+            if offset >= 0:
+                start, places = 0, 0
+                while places < (REPLACE_ALL_CONTEXT_MAX if every else 1):
+                    at = current.find(old, start)
+                    if at < 0:
+                        break
+                    places, start = places + 1, at + len(old)
+                    lines, first, last = _window(current, at, at + len(old), new)
+                    old_lines, _f, old_last = _window(current, at, at + len(old), old)
+                    delta = last - old_last
+                    if lines[first] != new_lines[0] or lines[last] != new_lines[-1]:
+                        # the edit starts or ends inside a line: the whole line is what the file will say
+                        put(offset, "\n".join(lines[first:last + 1]), "\n".join(old_lines[first:old_last + 1]))
+                    for a, b, joined in statement_spans(lines, path):
+                        if b < first or a > last or (a >= first and b <= last):
+                            continue  # outside the new text, or wholly inside it (read with the text itself)
+                        b_old = b - delta if b > last else old_last
+                        put(max(a, first) - first + offset, joined, "\n".join(old_lines[min(a, first):b_old + 1]))
+                if every and places == REPLACE_ALL_CONTEXT_MAX and current.find(old, start) >= 0:
+                    notes.append(f"context not read past the first {REPLACE_ALL_CONTEXT_MAX} places a replace_all "
+                                 "edit lands in")
+                    text_only(new_lines, offset)
+            current = current.replace(old, new) if every else current.replace(old, new, 1)
+            if len(current) > PACKAGE_READ_MAX:
+                notes.append(f"context not read: the file grows past {PACKAGE_READ_MAX // 1_000_000} MB")
+                current = None
+            continue
+        if not old:  # an edit that creates the file: its text is the whole file, read with the text itself
+            current = new if not current else None
+            continue
+        current = None  # this edit's context is gone, and so is every later one's
+        if offset >= 0:
+            text_only(new_lines, offset)
+    return out
+
+
 def judge_tool_input(cfg: dict, tool_name: str, tool_input: dict) -> dict[str, list[tuple[str, str, str]]]:
     """Every Non-Goal hit of a tool call, judged: `{"block" | "warn" | "noted": [(kind, trigger, why)]}`.
 
@@ -1553,26 +2844,58 @@ def judge_tool_input(cfg: dict, tool_name: str, tool_input: dict) -> dict[str, l
     Per trigger, as `check-diff` reports the same lines: `block` when any line blocks on it; otherwise `warn` when any
     line is a possible match; `noted` lists every trigger a comment line or an ignore file writes down and no line
     blocks on — it may also be in `warn`, and both are shown. A Write is only "written down" when `block` and `warn`
-    are both empty (`main`): a comment never hides a line of code that carries the same trigger (review 2026-09-29)."""
+    are both empty (`main`): a comment never hides a line of code that carries the same trigger (review 2026-09-29).
+
+    `unread` lists what was not read for packages, each with its reason (the content past PACKAGE_READ_MAX, the file
+    around an Edit when it is larger than that, the edits past EDIT_CONTEXT_MAX…): the caller reports it as a possible
+    match (WARN, exit 1), never as a pass in silence. The reading looks at the clock (`scan_checkpoint`) line by line."""
     text, path = text_of_tool_input(tool_name, tool_input)
-    judged: dict[str, list[tuple[str, str, str]]] = {s: [] for s in SEVERITY_ORDER}
+    judged: dict[str, list] = {s: [] for s in SEVERITY_ORDER}
+    unread: list[str] = []
     shell = is_command(tool_name, tool_input)
     if shell:
         units, file = [_command_without_data(text)], ""
     else:
         units, file = str(text or "").split("\n"), path
         judged["block"] += [(kind, trigger, "") for kind, trigger in trigger_hits(cfg, "", path)]
+    scan_progress(0, len(units))
+    if len(str(text or "")) > PACKAGE_READ_MAX:
+        unread.append(f"the content past {PACKAGE_READ_MAX // 1_000_000} MB ({len(str(text)):,} characters) was not "
+                      "read for packages: not read past 1 MB")
     whole = "\n".join(units)
+    # a statement over several lines (`RUN pip install \`, `require(` … `)`) is read at its first line; one an Edit's
+    # new text joins with lines of the file around it (`edit_statements`) at the first new line it covers, with the
+    # statement as it was before the edit to subtract
+    from_edits: dict[int, tuple[str, str]] = {}
+    if not shell:
+        from_edits = {k: v for k, v in edit_statements(tool_name, tool_input, unread).items() if 0 <= k < len(units)}
+        document = stack_document_change(tool_name, tool_input)
+        if document is not None:  # app.json / pubspec.yaml are read whole, less what they named before
+            judged["block"] += [("package", t, "") for t in package_hits(cfg, "", file, statement=document[0],
+                                                                        statement_base=document[1])]
     # only the triggers the whole text holds are read line by line: a long file costs one pass per trigger found
-    found = {t for _k, t in trigger_hits(cfg, whole)} | {t for _k, t in warn_triggers(cfg, whole)}
+    found = {t for _k, t in trigger_hits(cfg, whole, file=file, shell=shell)} | {t for _k, t in warn_triggers(cfg, whole)}
+    for k, (joined, base) in from_edits.items():
+        found |= set(package_hits(cfg, units[k], file, statement=joined, statement_base=base))
     if found:
+        statements: dict[int, tuple[str, str]] = {}
+        if not shell:
+            statements = {first: (joined, "") for first, _last, joined in statement_spans(units, file)}
+            for k, (joined, base) in from_edits.items():
+                had = statements.get(k)
+                statements[k] = (joined + ("\n" + had[0] if had else ""), base)
         narrow = dict(cfg)
-        for key in ("deny_packages", "deny_paths", "keywords", "warn_keywords"):
+        for key in ("deny_packages", "deny_package_prefixes", "deny_paths", "keywords", "warn_keywords"):
             narrow[key] = [t for t in cfg.get(key) or [] if t in found]
         technologies = technology_triggers(cfg)  # from the whole config: the narrowed one lost unmatched packages
-        for unit in units:
-            for kind, trigger, severity, why in line_hits(narrow, unit, file, shell=shell, technologies=technologies):
+        for k, unit in enumerate(units):
+            scan_progress(k, len(units))
+            scan_checkpoint()
+            joined, base = statements.get(k, ("", ""))
+            for kind, trigger, severity, why in line_hits(narrow, unit, file, shell=shell, technologies=technologies,
+                                                          statement=joined, statement_base=base):
                 judged[severity].append((kind, trigger, why))
+    scan_progress(len(units), len(units))
     blocked = {str(trigger).lower() for _k, trigger, _w in judged["block"]}
     for severity in SEVERITY_ORDER:
         kept, seen = [], set()
@@ -1583,7 +2906,13 @@ def judge_tool_input(cfg: dict, tool_name: str, tool_input: dict) -> dict[str, l
             seen.add(low)
             kept.append((kind, trigger, why))
         judged[severity] = kept
+    judged["unread"] = list(dict.fromkeys(unread))
     return judged
+
+
+def unread_lines(judged: dict) -> list[str]:
+    """The warning lines for what a call's reading left unread for packages (`judge_tool_input`'s `unread`)."""
+    return [f"possible match: part of this change was not read ({why})" for why in judged.get("unread") or []]
 
 
 def _hit_order(cfg: dict):
@@ -1631,8 +2960,11 @@ def check_data_mentions(cfg: dict, tool_name: str, tool_input: dict) -> list[str
     if not is_command(tool_name, tool_input):
         return []
     command = str((tool_input or {}).get("command", ""))
-    outside = {trigger for _kind, trigger in trigger_hits(cfg, _command_without_data(command))}
-    return render_hits(cfg, [(kind, trigger, "") for kind, trigger in trigger_hits(cfg, command) if trigger not in outside])
+    # the data is prose: a commit message names a package in a sentence (`package_hits`, 2026-09-30); what the command
+    # itself names in the same words is not data
+    outside = {trigger for _kind, trigger in trigger_hits(cfg, _command_without_data(command), prose=True)}
+    return render_hits(cfg, [(kind, trigger, "") for kind, trigger in trigger_hits(cfg, command, prose=True)
+                             if trigger not in outside])
 
 
 def possible_line(cfg: dict, trigger: str, why: str = "") -> str:
@@ -1664,30 +2996,44 @@ def check_warn_markers(cfg: dict, tool_name: str, tool_input: dict) -> list[str]
 # docstring said "curriculum" — in the founder's own repository. Function words carry no boundary; adjacent content
 # words inside one clause make a phrase, which is what actually blocks; a short boundary is its own words; a lone
 # word out of a long sentence is a hint for a human and only warns; an item of an enumeration is a boundary of its own.
+#
+# The table carries the free guard pack's corrections since 2026-09-30 (they were `GUARD_PACK_LEXICON_FIXES`, applied
+# to that pack's config only, while this hook was frozen): no `services/`, `plugins/`, `contracts/` (ordinary folders of
+# web apps), no `kotlin` (a highlighter's language list, a Kotlin backend); `com.android.application`, `kotlin android`
+# for an Android build; `create-expo-app`; the SDKs that were not refused (`smtplib`, `fastapi-mail`, `onelogin`,
+# `saml2`, `paypalrestsdk`, `python-socketio`, …); `web socket`, `send mail`, `resend.emails`, `django.core.mail`.
+# `expo`, `ws`, `resend` and `pika` stay packages: the free pack dropped them only because a package was matched as a
+# prefix, and a package is matched as a whole name now (`package_hits`). `packages_prefix` names a family of packages
+# (`expo-camera`, `@expo/vector-icons`, `react-native-maps`): a config lists them under `deny_package_prefixes`.
 CAPABILITY_TRIGGERS = {
     "crypto": {"match": ["crypto", "web3", "blockchain", "крипт", "блокчейн", "токен", "smart contract", "смарт-контракт"],
-               "packages": ["web3", "ethers", "solana", "wagmi", "viem", "bitcoinlib", "hardhat", "truffle"], "paths": ["contracts/", "web3/"],
+               "packages": ["web3", "ethers", "solana", "wagmi", "viem", "bitcoinlib", "hardhat", "truffle"], "paths": ["web3/"],
                "keywords": ["web3", "solidity", "ethereum", "metamask", "erc20", "smart contract", "wallet connect"]},
     "microservices": {"match": ["microservice", "микросервис", "kafka", "rabbitmq"],
-                      "packages": ["kafka-python", "aiokafka", "pika", "celery", "grpcio", "nameko"], "paths": ["services/"],
+                      "packages": ["kafka-python", "aiokafka", "pika", "celery", "grpcio", "nameko"], "paths": [],
                       "keywords": ["kafka", "rabbitmq", "grpc", "consul", "istio", "service mesh"]},
     "native_mobile": {"match": ["ios", "android", "native mobile", "мобильн", "flutter", "react native"],
-                      "packages": ["react-native", "expo", "flutter", "capacitor", "cordova"], "paths": ["ios/", "android/"],
-                      "keywords": ["react native", "swiftui", "kotlin", "xcode", "android studio"]},
+                      "packages": ["react-native", "expo", "flutter", "capacitor", "cordova", "create-expo-app"],
+                      "packages_prefix": ["expo-", "@expo/", "react-native-", "@react-native/"], "paths": ["ios/", "android/"],
+                      "keywords": ["react native", "swiftui", "xcode", "android studio", "com.android.application", "kotlin android"]},
     "open_banking": {"match": ["open banking", "банковск", "core ledger", "psd2"],
                      "packages": ["plaid", "tink", "truelayer"], "paths": [], "keywords": ["open banking", "psd2", "plaid", "core ledger"]},
     "payments": {"match": ["payment", "платеж", "платёж", "billing", "эквайринг", "stripe"],
-                 "packages": ["stripe", "braintree", "adyen", "paypal-checkout"], "paths": ["billing/"], "keywords": ["stripe", "paypal", "braintree", "adyen"]},
+                 "packages": ["stripe", "braintree", "adyen", "paypal-checkout", "paypalrestsdk", "paypalcheckoutsdk"],
+                 "paths": ["billing/"], "keywords": ["stripe", "paypal", "braintree", "adyen"]},
     "complex_auth": {"match": ["saml", "sso", "ldap", "enterprise auth", "kerberos"],
-                     "packages": ["python3-saml", "ldap3", "keycloak"], "paths": [], "keywords": ["saml", "ldap", "kerberos", "keycloak"]},
+                     "packages": ["python3-saml", "ldap3", "keycloak", "onelogin", "pysaml2", "saml2"], "paths": [],
+                     "keywords": ["saml", "ldap", "kerberos", "keycloak"]},
     "websockets": {"match": ["websocket", "вебсокет", "realtime", "real-time"],
-                   "packages": ["socket.io", "ws", "websockets", "socketio"], "paths": [], "keywords": ["websocket", "socket.io"]},
+                   "packages": ["socket.io", "ws", "websockets", "socketio", "python-socketio", "flask-socketio"], "paths": [],
+                   "keywords": ["websocket", "socket.io", "web socket"]},
     "email": {"match": ["email sending", "рассылк", "newsletter", "smtp"],
-              "packages": ["nodemailer", "sendgrid", "resend", "mailgun"], "paths": [], "keywords": ["smtp", "sendgrid", "mailgun"]},
+              "packages": ["nodemailer", "sendgrid", "resend", "mailgun", "smtplib", "aiosmtplib", "fastapi-mail", "flask-mail"],
+              "paths": [], "keywords": ["smtp", "sendgrid", "mailgun", "resend.emails", "send mail", "django.core.mail"]},
     "multi_tenancy": {"match": ["multi-tenan", "multitenan", "мультитенант", "team accounts", "organizations", "командн"],
-                      "packages": [], "paths": ["tenants/", "organizations/"], "keywords": ["tenant_id", "organization_id", "workspace_id", "rbac"]},
+                      "packages": [], "paths": ["tenants/", "organizations/"], "keywords": ["tenant_id", "organization_id", "workspace_id", "multi-tenancy", "multi-tenant", "multitenancy", "multitenant"]},
     "marketplace": {"match": ["marketplace", "маркетплейс", "plugin store", "adapter sdk"],
-                    "packages": [], "paths": ["marketplace/", "plugins/"], "keywords": ["marketplace", "plugin registry", "adapter sdk"]},
+                    "packages": [], "paths": ["marketplace/"], "keywords": ["marketplace", "plugin registry", "adapter sdk"]},
     "llm_grading": {"match": ["llm grading", "llm-оцен", "llm оцен", "ai grading", "auto-grade", "оценка ответов"],
                     "packages": [], "paths": [], "keywords": ["grade_with_llm", "llm_score", "ai_grader"]},
 }
@@ -2093,6 +3439,9 @@ JS_VALUE_FLAGS = {"--registry", "--prefix", "-w", "--workspace", "--filter", "-F
 OTHER_VALUE_FLAGS = {"-v", "--version", "--source", "--git", "--branch", "--rev", "--path", "--features", "-F", "--package", "-p",
                      "--group", "-G", "--registry", "--vers", "--rename"}
 CONDA_VALUE_FLAGS = {"-c", "--channel", "-n", "--name", "-p", "--prefix", "--file", "--solver", "--repodata-fn"}
+# `rye add resend --features x`: rye's own options with a value, besides pip's (third review of 30.09)
+RYE_VALUE_FLAGS = PIP_VALUE_FLAGS | {"--features", "--optional", "--git", "--url", "--path", "--branch", "--rev", "--tag",
+                                     "--pyproject"}
 # An unknown long flag followed by one of these words: the word is the flag's value, not a package
 # (`--omit dev`, `--loglevel error`, `--exists-action w`).
 FLAG_VALUE_WORDS = {"dev", "prod", "production", "development", "optional", "peer", "error", "warn", "silent", "info",
@@ -2100,7 +3449,7 @@ FLAG_VALUE_WORDS = {"dev", "prod", "production", "development", "optional", "pee
 # manager -> subcommands that name a package to add. The same manager with no package named (`npm install`,
 # `pip install -r requirements.txt`, `uv sync`, `bundle install`) installs what is already declared: not a change.
 ADD_SUBCOMMANDS = {
-    "pip": {"install"}, "uv": {"add"}, "poetry": {"add"}, "pipenv": {"install"},
+    "pip": {"install"}, "uv": {"add"}, "poetry": {"add"}, "pipenv": {"install"}, "pdm": {"add"}, "rye": {"add"},
     "npm": {"install", "i", "add", "in"}, "pnpm": {"add", "install", "i"}, "yarn": {"add"}, "bun": {"add", "a", "install", "i"},
     "expo": {"install"}, "cargo": {"add"}, "go": {"get"}, "gem": {"install"}, "bundle": {"add"}, "composer": {"require"},
     "conda": {"install"}, "mamba": {"install"}, "micromamba": {"install"},
@@ -2178,71 +3527,81 @@ def _exe_name(token: str) -> str:
     return exe
 
 
+_SHELL_SPECIAL_RE = re.compile(r"[\"'`&|;\n]")
+
+
 def _split_shell(text: str) -> list[tuple[str, str]]:
     """(segment, the separator in front of it) for a shell line, split on `;`, `&&`, `||`, `|`, `&` and newlines —
     outside quotes. `echo "done; git push later" >> NOTES.txt` is one command, not two; `>|`, `2>&1`, `&>` are
-    redirects, `git push&` is a push sent to the background (audit 2026-09-23)."""
+    redirects, `git push&` is a push sent to the background (audit 2026-09-23). It jumps from one quote or separator
+    character to the next (`_SHELL_SPECIAL_RE`): the walk one character at a time took 0.4 s per call on a 1 MB command,
+    and a call reads a command about eight times (third review of 30.09)."""
     s = str(text or "")
     out: list[tuple[str, str]] = []
-    buf: list[str] = []
     sep = ""
-    quote = ""
-    i = 0
-    while i < len(s):
+    start = pos = 0
+    while True:
+        m = _SHELL_SPECIAL_RE.search(s, pos)
+        if not m:
+            break
+        i = m.start()
         ch = s[i]
-        if quote:
-            buf.append(ch)
-            if ch == quote:
-                quote = ""
-            i += 1
-            continue
         if ch in "'\"`":
-            quote = ch
-            buf.append(ch)
-            i += 1
+            close = s.find(ch, i + 1)
+            if close < 0:
+                break  # an unclosed quote runs to the end, part of the last segment
+            pos = close + 1
             continue
         pair = s[i:i + 2]
         prev = s[i - 1] if i else ""
         if pair in ("&&", "||"):
-            out.append(("".join(buf), sep))
-            buf, sep = [], pair
-            i += 2
+            out.append((s[start:i], sep))
+            sep, start = pair, i + 2
+        elif ch == "|" and prev != ">":
+            out.append((s[start:i], sep))
+            sep, start = "|", i + (2 if pair == "|&" else 1)
+        elif ch == "&" and prev not in "<>" and s[i + 1:i + 2] != ">":
+            out.append((s[start:i], sep))
+            sep, start = "&", i + 1
+        elif ch in ";\n":
+            out.append((s[start:i], sep))
+            sep, start = ch, i + 1
+        else:  # a `|` or `&` of a redirect (`>|`, `2>&1`, `&>`): part of the segment
+            pos = i + 1
             continue
-        if ch == "|" and prev != ">":
-            out.append(("".join(buf), sep))
-            buf, sep = [], "|"
-            i += 2 if pair == "|&" else 1
-            continue
-        if ch == "&" and prev not in "<>" and s[i + 1:i + 2] != ">":
-            out.append(("".join(buf), sep))
-            buf, sep = [], "&"
-            i += 1
-            continue
-        if ch in ";\n":
-            out.append(("".join(buf), sep))
-            buf, sep = [], ch
-            i += 1
-            continue
-        buf.append(ch)
-        i += 1
-    out.append(("".join(buf), sep))
+        pos = start
+    out.append((s[start:], sep))
     return [(seg, sep) for seg, sep in out if seg.strip()]
 
 
 def _shell_tokens(segment: str) -> list[str]:
     """Words of one command with the quotes taken off and quoted spaces kept: `"C:\\Program Files\\Git\\bin\\git.exe"
     push` is two words, `cp a.txt "../my dir/"` is three. Backslashes are not escapes here — on Windows they are
-    the path separator."""
-    import shlex
-
-    try:
-        lex = shlex.shlex(str(segment or ""), posix=True)
-        lex.whitespace_split = True
-        lex.escape = ""
-        lex.commenters = ""
-        return [t for t in lex if t]
-    except ValueError:  # an unbalanced quote: the plain split is the best reading left
-        return [t.strip("'\"`") for t in str(segment or "").split() if t.strip("'\"`")]
+    the path separator. The reading `shlex` gives in POSIX mode with no escape and no comments, in one pass: shlex
+    grows a token one character at a time, and a command of one 1 MB word took 23 s (third review of 30.09)."""
+    s = str(segment or "")
+    out: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    for ch in s:
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                buf.append(ch)
+        elif ch in "'\"":
+            quote = ch
+        elif ch in " \t\r\n":
+            if buf:
+                out.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if quote:  # an unbalanced quote: the plain split is the best reading left
+        return [t.strip("'\"`") for t in s.split() if t.strip("'\"`")]
+    if buf:
+        out.append("".join(buf))
+    return out
 
 
 def _start_process(tokens: list[str]) -> list[str]:
@@ -2303,20 +3662,35 @@ def _bare_command(tokens: list[str]) -> list[str]:
     return tokens
 
 
-def _command_words(text: str, depth: int = 0) -> list[list[str]]:
+def _xargs_runs_a_manager(segment: str, exe: str) -> bool:
+    """The segment is `xargs [options] <manager> …` fed by the pipe (not `-a <file>`: `_xargs_program`, the reading
+    the tamper check gives xargs) and the program is a package manager or a package runner — the only case where the
+    words the pipe carries are read as that command's arguments."""
+    raw = _shell_tokens(segment)
+    if not raw or _exe_name(raw[0]) != "xargs":
+        return False
+    prog, from_file = _xargs_program(raw[1:])
+    manager = _manager_exe(prog)
+    return (not from_file and manager == _manager_exe(exe)
+            and (manager in ADD_SUBCOMMANDS or manager in MANAGER_READINGS or manager in NPX_RUNNERS
+                 or manager in ("pipx", "uvx") or bool(re.match(r"^(?:pip|python|py)\d*(?:\.\d+)?$", manager))))
+
+
+def _command_words(text: str, depth: int = 0, sudo_values: bool = False) -> list[list[str]]:
     """The commands a shell line runs, as token lists: separators read outside quotes, wrappers opened (`bash -c`,
     `sudo`, `env X=1`), `eval` and a pipe into a shell read as the command they run, `$(…)` read too, and
-    `_bare_command` applied. What `cd` does to them is left to the caller."""
+    `_bare_command` applied. What `cd` does to them is left to the caller. `sudo_values` (the package reading only):
+    `sudo -u deploy pip install x` runs `pip install x`, not `deploy`."""
     out: list[list[str]] = []
     prev: list[str] = []
     for segment, sep in _split_shell(text):
         if depth < 2:
             for a, b in re.findall(r"\$\(([^()]*)\)|`([^`]*)`", segment):
                 if (a or b).strip():
-                    out += _command_words(a or b, depth + 1)
-        inner = _wrapped_command(segment)
+                    out += _command_words(a or b, depth + 1, sudo_values)
+        inner = _wrapped_command(segment, sudo_values)
         if inner and depth < 2:
-            out += _command_words(inner, depth + 1)
+            out += _command_words(inner, depth + 1, sudo_values)
             prev = []
             continue
         tokens = _bare_command(_shell_tokens(segment))
@@ -2325,20 +3699,27 @@ def _command_words(text: str, depth: int = 0) -> list[list[str]]:
             continue
         exe = _exe_name(tokens[0])
         if exe == "eval" and depth < 2:
-            out += _command_words(" ".join(tokens[1:]), depth + 1)
+            out += _command_words(" ".join(tokens[1:]), depth + 1, sudo_values)
             prev = []
             continue
         if (sep == "|" and exe in PIPE_SHELLS and all(t.startswith("-") for t in tokens[1:]) and prev
                 and _exe_name(prev[0]) in ("echo", "printf", "write-output") and depth < 2):
-            out += _command_words(" ".join(t for t in prev[1:] if not t.startswith("-")), depth + 1)
+            out += _command_words(" ".join(t for t in prev[1:] if not t.startswith("-")), depth + 1, sudo_values)
+        if sep == "|" and prev and _exe_name(prev[0]) in ("echo", "printf") and _xargs_runs_a_manager(segment, exe):
+            # `echo resend | xargs pip install`: xargs puts what the pipe carries after the command (review 30.09)
+            tokens = tokens + [w for t in prev[1:] if not t.startswith("-") for w in re.split(r"\s+|\\n", t) if w]
         out.append(tokens)
         prev = tokens
     return out
 
 
 def _package_name(token: str) -> str:
-    """`stripe>=5` -> stripe, `@scope/pkg@1.2` -> @scope/pkg, `serde@1` -> serde; a URL is kept as it is."""
+    """`stripe>=5` -> stripe, `@scope/pkg@1.2` -> @scope/pkg, `serde@1` -> serde, a PEP 508 direct reference
+    `resend @ https://…/resend-2.0.0.tar.gz` -> resend; any other URL is kept as it is."""
     t = token.strip()
+    direct = re.match(r"^([A-Za-z0-9][A-Za-z0-9._\-]*)\s*(?:\[[^\]]*\]\s*)?@\s*[A-Za-z][\w+.\-]*://", t)
+    if direct:
+        return direct.group(1)
     if "://" in t or t.startswith("git+"):
         return t[:120]
     if t.startswith("@"):
@@ -2346,6 +3727,7 @@ def _package_name(token: str) -> str:
     return re.split(r"[<>=!~\[;@:\s]", t, maxsplit=1)[0]
 
 
+@lru_cache(maxsize=8192)  # a long file compares the same few names against every package: one spelling each
 def _pep503(name: str) -> str:
     """One spelling per package for comparing names: lower case, runs of `-`, `_`, `.` as one `-` (PyPI's own rule).
     It never makes `fast-api` equal `fastapi`: those are two different projects."""
@@ -2362,8 +3744,9 @@ def _is_local_path(token: str) -> bool:
 
 
 def _named(args: list[str], value_flags: set[str]) -> list[str]:
-    """The positional arguments, with the value of each flag that takes one skipped. After a long flag this list
-    does not know, a word that is an ordinary flag value (`dev`, `error`, `w`) is taken as that flag's value."""
+    """The positional arguments, with the value of each flag that takes one skipped — a run of short flags too, when
+    its last one takes a value (`pdm add -dG test resend`: `test` is the group). After a long flag this list does not
+    know, a word that is an ordinary flag value (`dev`, `error`, `w`) is taken as that flag's value."""
     out: list[str] = []
     skip = False
     after_unknown = False
@@ -2372,7 +3755,7 @@ def _named(args: list[str], value_flags: set[str]) -> list[str]:
             skip = False
             continue
         if a.startswith("-"):
-            skip = a in value_flags
+            skip = a in value_flags or (bool(re.fullmatch(r"-[A-Za-z]{2,}", a)) and f"-{a[-1]}" in value_flags)
             after_unknown = not skip and a.startswith("--") and "=" not in a
             continue
         if after_unknown and a.lower() in FLAG_VALUE_WORDS:
@@ -2387,8 +3770,187 @@ def dependency_additions(command: str) -> list[str]:
     """The packages a shell command adds to the project, by name. Empty for an install of what is already declared,
     and for a tool installed for the whole machine (`npm install -g`)."""
     found: list[str] = []
-    for tokens in _command_words(command):
-        exe, rest = _exe_name(tokens[0]), tokens[1:]
+    for _manager, name in _installs(command):
+        if name not in found:
+            found.append(name)
+    return found
+
+
+def _machine_installs(exe: str, rest: list[str]) -> list[tuple[str, str]] | None:
+    """(manager, package) for an install for the whole machine (`pipx install|run|inject`, `uv tool install|run`,
+    `uvx`, `cargo install`, `go install|run`, `yarn global add`, a system package manager); None when the command is
+    not one of these forms."""
+    words = [a for a in rest if not a.startswith("-")]
+    low = [w.lower() for w in words]
+    names: list[str] | None = None
+    if exe == "pipx" and low[:1] and low[0] in ("install", "run"):
+        names = words[1:] if low[0] == "install" else words[1:2]
+    elif exe == "pipx" and low[:1] == ["inject"]:
+        names = words[2:]
+    elif exe == "uv" and low[:2] in (["tool", "install"], ["tool", "run"]):
+        names = words[2:3]
+    elif exe == "uvx":
+        names = words[:1]
+    elif exe == "cargo" and low[:1] == ["install"]:
+        names = words[1:]
+    elif exe == "go" and low[:1] in (["install"], ["run"]):
+        names = words[1:2]
+    elif exe == "yarn" and low[:2] == ["global", "add"]:
+        names = words[2:]
+    elif exe in SYSTEM_INSTALLERS and low[:1] and low[0] in ("install", "reinstall"):
+        names = words[1:]
+    if names is None:
+        return None
+    return [(exe, _package_name(n)) for n in names if n and not _is_local_path(n) and _package_name(n)]
+
+
+# The options a JS manager takes before its subcommand in a monorepo — `pnpm --filter web add ws`, `pnpm -C apps/web
+# add ws`, `yarn --cwd web add ws`, `npm --prefix web i ws`, `bun --cwd web add ws` — each with its value; and yarn's
+# `workspace <name>`, which runs the rest in one workspace (`yarn workspace web add ws`). Until the second review of 30.09 the first
+# word after the options was taken as the subcommand and these installs were not read (review 30.09).
+JS_GLOBAL_VALUE_FLAGS = {"--filter", "-F", "-C", "--dir", "--prefix", "--cwd", "-w", "--workspace", "--registry",
+                         "--loglevel", "--userconfig", "--cache"}
+
+
+def _manager_exe(token: str) -> str:
+    """The program a command word runs, as `_exe_name` reads it — and a shell variable named after a manager read as
+    that manager (`$PIP install resend`, `${NPM_BIN} i ws`, make's `$(PIP) install resend`): a Makefile or a CI script
+    that keeps the manager in a variable installs with it all the same."""
+    exe = _exe_name(token)
+    var = re.fullmatch(r"\$[{(]?([a-z_][a-z0-9_]*)[})]?", exe)
+    if var:
+        for manager in ("pnpm", "yarn", "npm", "pip"):
+            if manager in var.group(1):
+                return manager
+    return exe
+
+
+# Where a package is installed inside a container the project runs: `docker compose exec api pip install resend`,
+# `docker exec api pip install …`, `docker run --rm python:3.12 pip install …` — the command after the service, the
+# container or the image is the install, read like any other (review 30.09).
+CONTAINER_CLIS = {"docker", "podman", "nerdctl"}
+COMPOSE_CLIS = {"docker-compose", "podman-compose"}
+# every option of `docker run|exec` and `docker compose run|exec` that takes a value (the third review of 30.09: an
+# option missing here made its value the container, and the image the command)
+CONTAINER_VALUE_FLAGS = {"-v", "--volume", "-e", "--env", "--env-file", "-w", "--workdir", "--name", "-p", "--publish",
+                         "--network", "--net", "--network-alias", "--net-alias", "-u", "--user", "--entrypoint", "--mount",
+                         "--platform", "-l", "--label", "--label-file", "-h", "--hostname", "--domainname", "--add-host",
+                         "--cpus", "--cpu-period", "--cpu-quota", "--cpu-rt-period", "--cpu-rt-runtime", "-c",
+                         "--cpu-shares", "--cpuset-cpus", "--cpuset-mems", "-m", "--memory", "--memory-swap",
+                         "--memory-reservation", "--memory-swappiness", "--kernel-memory", "--gpus", "--device",
+                         "--device-cgroup-rule", "--device-read-bps", "--device-read-iops", "--device-write-bps",
+                         "--device-write-iops", "--blkio-weight", "--blkio-weight-device", "--pull", "--restart",
+                         "--log-driver", "--log-opt", "--cap-add", "--cap-drop", "--security-opt", "--ulimit",
+                         "--shm-size", "--tmpfs", "--dns", "--dns-option", "--dns-opt", "--dns-search", "--ipc", "--pid",
+                         "--pids-limit", "--uts", "--userns", "--cgroupns", "--cgroup-parent", "--runtime",
+                         "--volumes-from", "--volume-driver", "--expose", "--link", "--link-local-ip", "--cidfile", "-a",
+                         "--attach", "--detach-keys", "--index", "--stop-signal", "--stop-timeout", "--health-cmd",
+                         "--health-interval", "--health-retries", "--health-start-period", "--health-start-interval",
+                         "--health-timeout", "--ip", "--ip6", "--mac-address", "--isolation", "--oom-score-adj",
+                         "--storage-opt", "--sysctl", "--group-add", "--annotation"}
+# `poetry|uv|pdm|rye|pipenv|hatch run <command…>` and `conda|mamba|micromamba run -n <env> <command…>` run the command
+# in the project's environment: an install there is read like any other (the third review of 30.09), as is the command
+# after the `--` of `kubectl|oc exec <pod> -- <command…>`
+ENV_RUNNERS = {"poetry", "uv", "pdm", "rye", "pipenv", "hatch"}
+ENV_RUNNER_VALUE_FLAGS = {"--with", "--with-editable", "--with-requirements", "--python", "-p", "--package",
+                          "--directory", "--project", "--env-file", "--extra", "--group", "--index", "--default-index",
+                          "-C", "--venv", "-e", "--env"}
+CONDA_RUN_VALUE_FLAGS = {"-n", "--name", "-p", "--prefix", "--cwd"}
+COMPOSE_GLOBAL_VALUE_FLAGS = {"-f", "--file", "-p", "--project-name", "--profile", "--env-file", "--project-directory",
+                              "--ansi", "--progress", "--parallel"}
+
+
+def _skip_options(words: list[str], values: set[str]) -> list[str]:
+    i = 0
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if (words[i] in values and "=" not in words[i]) else 1
+    return words[i:]
+
+
+def _container_inner(tokens: list[str]) -> list[str] | None:
+    """The command a container CLI runs inside a container — `docker exec|run [options] <container|image> <command…>`,
+    `docker compose [options] exec|run [options] <service> <command…>` — or None for any other command (and for one that
+    names no command: the image's own)."""
+    exe, rest = _exe_name(tokens[0]) if tokens else "", list(tokens[1:])
+    if exe in CONTAINER_CLIS and rest[:1] and rest[0].lower() == "compose":
+        exe, rest = "docker-compose", rest[1:]
+    if exe in COMPOSE_CLIS:
+        rest = _skip_options(rest, COMPOSE_GLOBAL_VALUE_FLAGS)
+    elif exe in CONTAINER_CLIS:
+        if rest[:1] and rest[0].lower() == "container":
+            rest = rest[1:]
+    else:
+        return None
+    if not rest or rest[0].lower() not in ("exec", "run"):
+        return None
+    rest = _skip_options(rest[1:], CONTAINER_VALUE_FLAGS)
+    return rest[1:] if len(rest) > 1 else None
+
+
+def _runner_inner(tokens: list[str]) -> list[str] | None:
+    """The command a runner runs in its place — a container CLI (`_container_inner`), `poetry|uv|pdm|rye|pipenv|hatch
+    run …`, `conda|mamba|micromamba run -n <env> …`, `kubectl|oc exec … -- …` — or None."""
+    exe, rest = _exe_name(tokens[0]) if tokens else "", list(tokens[1:])
+    if exe in ENV_RUNNERS or exe in ("conda", "mamba", "micromamba"):
+        values = ENV_RUNNER_VALUE_FLAGS if exe in ENV_RUNNERS else CONDA_RUN_VALUE_FLAGS
+        rest = _skip_options(rest, values)
+        if rest[:1] and rest[0].lower() == "run":
+            return _skip_options(rest[1:], values) or None
+        return None
+    if exe in ("kubectl", "oc") and "exec" in [r.lower() for r in rest[:3]] and "--" in rest:
+        return rest[rest.index("--") + 1:] or None
+    return _container_inner(tokens)
+
+
+def _install_commands(command: str, depth: int = 0) -> list[list[str]]:
+    """`_command_words` (with `sudo`'s options read: `_command_words(sudo_values=True)`), with the command a runner
+    runs read in its place (`_runner_inner`: a container, an environment, a pod)."""
+    import shlex
+
+    out: list[list[str]] = []
+    for tokens in _command_words(command, sudo_values=True):
+        inner = _runner_inner(tokens)
+        if inner and depth < 3:
+            out += _install_commands(" ".join(shlex.quote(t) for t in inner), depth + 1)
+        else:
+            out.append(tokens)
+    return out
+
+
+def _after_global_options(exe: str, rest: list[str]) -> list[str]:
+    """The words of a manager's command from its subcommand on: the options before it skipped with their values (the
+    JS managers' `JS_GLOBAL_VALUE_FLAGS`, pip's `PIP_VALUE_FLAGS`), and `yarn workspace <name>` / `pnpm --filter`
+    taken off. `npm i -w apps/web ws` is unchanged: the subcommand comes first there."""
+    values = JS_GLOBAL_VALUE_FLAGS if exe in JS_RUNNERS else PIP_VALUE_FLAGS if exe in ("pip", "uv", "pdm", "rye") else set()
+    if exe == "pnpm":
+        values = values - {"-w"}  # pnpm's `-w` is `--workspace-root`, a switch
+    i = 0
+    while i < len(rest) and rest[i].startswith("-"):
+        i += 2 if (rest[i] in values and "=" not in rest[i]) else 1
+    rest = rest[i:]
+    if exe == "yarn" and len(rest) > 2 and rest[0].lower() == "workspace":
+        return _after_global_options(exe, rest[2:])
+    return rest
+
+
+def _npm_workspace_value_is_package(after: list[str]) -> bool:
+    """npm's `-w` takes the workspace (`npm i -w apps/web ws`), alone or at the end of a run of short flags (`-Pw`). When
+    its value is the last word, names no path (`@scope/x` is a name) and nothing else was named (`npm install -Pw ws`),
+    the word is read as the package: the reading that holds or refuses, not the one that passes (fourth review of 30.09)."""
+    last = after[-1] if after else ""
+    if len(after) < 2 or last.startswith("-") or "\\" in last or ("/" in last and not last.startswith("@")):
+        return False
+    return bool(re.fullmatch(r"-[A-Za-z]*w", after[-2]))
+
+
+def _installs(command: str, machine: bool = False) -> list[tuple[str, str]]:
+    """(manager, package) for every package a shell command installs by name — what `dependency_additions` reads,
+    with the manager that installs it. `machine` also takes what installs for the whole machine rather than the project
+    (`-g`, `yarn global add`, `pipx`, `uv tool`, `uvx`, `cargo install`, `go install`, `brew`/`apt`/`choco`/…): not a
+    dependency of this project, still an install of the package (the Non-Goal reading, 2026-09-30)."""
+    found: list[tuple[str, str]] = []
+    for tokens in _install_commands(command):
+        exe, rest = _manager_exe(tokens[0]), tokens[1:]
         if re.match(r"^(?:python|py)(?:\d+(?:\.\d+)?)?$", exe) and "-m" in rest:
             i = rest.index("-m")
             if i + 1 < len(rest) and re.match(r"^pip\d*(?:\.\d+)?$", rest[i + 1].lower()):
@@ -2403,35 +3965,48 @@ def dependency_additions(command: str) -> list[str]:
             words = [a for a in rest if not a.startswith("-")]
             low = [w.lower() for w in words]
             if low[:1] == ["add"] and "package" in low[1:3] and low.index("package") + 1 < len(words):
-                name = words[low.index("package") + 1]
-                if name not in found:
-                    found.append(name)
+                found.append(("dotnet", words[low.index("package") + 1]))
             continue
+        if machine:
+            elsewhere = _machine_installs(exe, rest)
+            if elsewhere is not None:
+                found += elsewhere
+                continue
         subs = ADD_SUBCOMMANDS.get(exe)
         if not subs:
             continue
+        given, low_rest = list(rest), [a.lower() for a in rest]
+        rest = _after_global_options(exe, rest)
         words = [a for a in rest if not a.startswith("-")]
         if not words or words[0].lower() not in subs:
             continue
-        low_rest = [a.lower() for a in rest]
-        if any(a in GLOBAL_INSTALL_FLAGS for a in low_rest) or any(
-                a == "--location" and low_rest[i + 1:i + 2] == ["global"] for i, a in enumerate(low_rest)):
+        # a lone `-g` (case matters: `pdm add -G dev x` names a group, third review of 30.09), `--global`,
+        # `--location=global` / `--location global`
+        if not machine and ("-g" in given or any(a in GLOBAL_INSTALL_FLAGS for a in low_rest if a != "-g")
+                            or any(a == "--location" and low_rest[i + 1:i + 2] == ["global"] for i, a in enumerate(low_rest))):
             continue  # a tool for the machine, not a dependency of this project
         after = rest[rest.index(words[0]) + 1:]
-        flags = PIP_VALUE_FLAGS if exe in ("pip", "uv", "poetry", "pipenv") else (
+        flags = RYE_VALUE_FLAGS if exe == "rye" else PIP_VALUE_FLAGS if exe in ("pip", "uv", "poetry", "pipenv", "pdm") else (
             JS_VALUE_FLAGS if exe in ("npm", "pnpm", "yarn", "bun", "expo") else
             CONDA_VALUE_FLAGS if exe in ("conda", "mamba", "micromamba") else OTHER_VALUE_FLAGS)
-        for arg in _named(after, flags):
+        if exe == "pnpm":
+            flags = flags - {"-w"}  # pnpm's `-w` is `--workspace-root`, a switch: `pnpm add -Dw ws` names ws
+        named = _named(after, flags)
+        if exe == "npm" and not named and _npm_workspace_value_is_package(after):
+            named = [after[-1]]
+        for arg in named:
             if _is_local_path(arg):
                 continue
             name = _package_name(arg)
-            if name and name.lower() not in INSTALLER_SELF and name not in found:
-                found.append(name)
+            if name and name.lower() not in INSTALLER_SELF:
+                found.append((exe, name))
     return found
 
 
 # --- what a dependency manifest declares ----------------------------------------------------------------------
-MANIFEST_FILE = re.compile(r"^(?:requirements[\w.\-]*\.(?:txt|in)|pyproject\.toml|package\.json|cargo\.toml|go\.mod|"
+# `requirements.txt`, `requirements-dev.in`, and since the second review of 30.09 a name with the word anywhere (`dev-requirements.txt`,
+# `test_requirements.txt`): pip reads any of them with `-r` (review 30.09)
+MANIFEST_FILE = re.compile(r"^(?:[\w.\-]*requirements[\w.\-]*\.(?:txt|in)|pyproject\.toml|package\.json|cargo\.toml|go\.mod|"
                            r"gemfile|composer\.json|pipfile)$", re.I)
 PACKAGE_JSON_DEPENDENCIES = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies", "require",
                              "require-dev")
@@ -2440,7 +4015,7 @@ MANIFEST_SKIP_DIRS = {"node_modules", ".git", ".venv", "venv", "env", "__pycache
 
 def _is_manifest(path: str) -> bool:
     parts = str(path or "").replace("\\", "/").rstrip("/").split("/")
-    return bool(MANIFEST_FILE.match(parts[-1])) or (len(parts) > 1 and parts[-2].lower() == "requirements"
+    return bool(MANIFEST_FILE.match(parts[-1][-255:])) or (len(parts) > 1 and parts[-2].lower() == "requirements"
                                                      and parts[-1].lower().endswith((".txt", ".in")))
 
 
@@ -2491,13 +4066,19 @@ def declared_names(text: str, filename: str) -> set[str]:
     elif base in ("pyproject.toml", "pipfile", "cargo.toml"):
         names = _toml_names(text)
     elif base == "go.mod":
-        names = set(re.findall(r"^\s*(?:require\s+)?([\w.\-]+\.[\w.\-]+/[^\s]+)\s+v\d", str(text or ""), re.M))
+        names = set(re.findall(r"^\s*(?:require\s+)?([\w\-]*(?:\.[\w\-]*)+/\S+)\s+v\d", str(text or ""), re.M))
     elif base == "gemfile":
         names = set(re.findall(r"^\s*gem\s+[\"']([^\"']+)[\"']", str(text or ""), re.M))
     else:  # requirements*.txt / *.in
         for raw in str(text or "").splitlines():
             line = raw.split(" #", 1)[0].strip()
-            if line and not line.startswith(("#", "-")) and not _is_local_path(line):
+            # a line continued with a backslash (pip-compile's `resend==2.0.0 \` before its `--hash=` lines) is the
+            # requirement without it: the backslash made it a Windows path and hid it (review 30.09)
+            line = line[:-1].rstrip() if line.endswith("\\") else line
+            egg = re.search(r"[#&]egg=([A-Za-z0-9][\w.\-]*)", raw)
+            if egg and line.startswith("-"):  # `-e git+https://…#egg=resend`
+                names.add(egg.group(1))
+            elif line and not line.startswith(("#", "-")) and not _is_local_path(line):
                 names.add(_package_name(line))
     return {_pep503(n) for n in names if n}
 
@@ -2516,7 +4097,8 @@ def project_declared_packages(root: Path) -> set[str]:
         files = []
     for p in files[:60]:
         try:
-            found |= declared_names(p.read_text(encoding="utf-8", errors="replace")[:400_000], p.name)
+            with p.open(encoding="utf-8", errors="replace") as fh:  # the head only: never the whole of a huge file
+                found |= declared_names(fh.read(400_000), p.name)
         except Exception:
             continue
     return found
@@ -2535,10 +4117,9 @@ def manifest_additions(tool_name: str, tool_input: dict) -> list[str]:
     if not path or not _is_manifest(path):
         return []
     target = Path(path) if os.path.isabs(path) else project_root() / path
-    try:
-        old = target.read_text(encoding="utf-8", errors="replace") if target.is_file() else ""
-    except Exception:
-        old = ""
+    # a manifest past PACKAGE_READ_MAX is not read: every name the change writes is then held as new (fail closed)
+    on_disk, _why = _read_for_packages(target)
+    readable, old = on_disk is not None, on_disk or ""
     content = next((tool_input[k] for k in ("content", "contents") if isinstance(tool_input.get(k), str)), None)
     if content is not None:
         new = content
@@ -2551,16 +4132,43 @@ def manifest_additions(tool_name: str, tool_input: dict) -> list[str]:
                 edits.append((o, n, bool(e.get("replace_all"))))
         if not edits:
             return []
+        name = path.replace("\\", "/").rsplit("/", 1)[-1]
         new = old
-        for o, n, every in edits:
+        for k, (o, n, every) in enumerate(edits):
             if not o and not new:
                 new = n
                 continue
             if not o or o not in new:
-                return []
+                if readable:
+                    return []  # an edit that would not apply to the file: the client refuses it anyway
+                # the file is not there to read (review 30.09): what the new text declares line by line and the old
+                # text did not is held, and every later edit is read the same way
+                added = set(declared_names(new, name) - declared_names(old, name))
+                for o2, n2, _every in edits[k:]:
+                    added |= _declared_by_lines(n2, name) - _declared_by_lines(o2, name)
+                return sorted(added)
             new = new.replace(o, n) if every else new.replace(o, n, 1)
     name = path.replace("\\", "/").rsplit("/", 1)[-1]
     return sorted(declared_names(new, name) - declared_names(old, name))
+
+
+# the keys of package.json / composer.json a line can hold that are not a dependency: a line read without its object
+# (`_declared_by_lines`) cannot see which object it is in
+MANIFEST_METADATA_KEYS = frozenset({"name", "version", "description", "main", "module", "types", "typings", "license",
+                                    "private", "type", "author", "homepage", "packagemanager", "browser", "bin", "files",
+                                    "keywords", "repository", "bugs", "url", "email", "sideeffects", "funding", "node",
+                                    "npm", "pnpm", "yarn", "php", "minimum-stability", "prefer-stable", "directory"})
+
+
+def _declared_by_lines(text: str, filename: str) -> set[str]:
+    """What the lines of a manifest fragment declare, read one by one (`manifest_line_uses`) — for an edit whose file
+    cannot be read — as `_pep503` names; a package.json key that is the manifest's own metadata is not one."""
+    if _base_name(filename) in ("package.json", "composer.json"):  # a key whose value is a version or a source
+        names = set(re.findall(r"\"([^\"\\\n]{1,214})\"\s*:\s*\"(?:[\^~<>=*\d][^\"]*|(?:latest|next|beta|canary)|"
+                               r"(?:workspace:|npm:|file:|link:|git|https?:|github:|dev-)[^\"\s]*)\"", str(text or "")))
+    else:
+        names = {n for line in str(text or "").split("\n") for _reading, n in manifest_line_uses(line, filename)}
+    return {_pep503(n) for n in names if n and str(n).lower() not in MANIFEST_METADATA_KEYS}
 
 
 def stack_packages(cfg: dict) -> set[str]:
@@ -2941,6 +4549,7 @@ def _command_write_targets(command: str) -> list[tuple[str, Path | None]]:
     cwd: Path | None = root
     out: list[tuple[str, Path | None]] = []
     for tokens in _command_words(command):
+        scan_checkpoint()
         exe = _exe_name(tokens[0])
         if exe in ("cd", "set-location", "sl", "pushd", "chdir"):
             nxt = [a for a in tokens[1:] if not a.startswith("-")]
@@ -2974,6 +4583,7 @@ def outside_root_writes(tool_name: str, tool_input: dict) -> list[str]:
     if is_command(tool_name, tool_input):
         found: list[str] = []
         for token, cwd in _command_write_targets(_command_without_data(str(tool_input.get("command", "")), files_too=True)):
+            scan_checkpoint()  # each target is resolved on disk: under the clock, like the tamper check's probes
             if _outside_root(token, cwd) and token not in found:
                 found.append(token)
         return found
@@ -2999,17 +4609,25 @@ def check_classes(cfg: dict, tool_name: str, tool_input: dict) -> list[tuple[str
         # what a command writes into a file (a Dockerfile, a workflow, notes.txt) is file content, judged like the same
         # content written with the Write tool — not a command this call runs
         text = _command_without_data(command, files_too=True)
-        candidates = dependency_additions(text)
+        installs = _installs(text)  # what `dependency_additions` reads, with the manager that reads each name
+        candidates = list(dict.fromkeys(name for _manager, name in installs))
+        readings: dict[str, str] = {}
+        for manager, name in installs:
+            readings.setdefault(name, MANAGER_READINGS.get(manager, "exact"))
         outbound = outbound_actions(text)
     else:
         candidates = manifest_additions(tool_name, tool_input)
+        reading = _manifest_reading(text_of_tool_input(tool_name, tool_input)[1])
+        readings = {name: reading for name in candidates}
     if candidates:
         # what the approved stack names, and what the project's manifests already declare, is not a new dependency;
-        # a package the Non-Goals forbid was refused before this check ran
+        # a package the Non-Goals forbid was refused before this check ran (read as that manager reads it: a family
+        # is npm's only, so `pip install expo-helpers` is held here)
         known = stack_packages(cfg) | project_declared_packages(project_root())
         denied = {_pep503(p) for p in cfg.get("deny_packages") or []}
         for pkg in candidates:
-            if _pep503(pkg) in denied or _pep503(pkg) in known:
+            if (_pep503(pkg) in denied or _pep503(pkg) in known
+                    or forbidden_package(cfg, pkg, readings.get(pkg, "exact"))):
                 continue
             hits.append(("dependency", pkg))
     hits += [("outbound", act) for act in outbound]
@@ -3030,11 +4648,15 @@ CLASS_REASONS = {
 CLASS_HIT = re.compile(r"^(?:dependency|outbound|outside_root)\s+'")
 
 
-def class_message(active: list[tuple[str, str]], blocking: bool) -> str:
+def class_message(active: list[tuple[str, str]], blocking: bool, skips: list[str] | tuple = ()) -> str:
+    """The refusal or the question for the class hits of one call, and the pre-commit skips held with them
+    (`pre_commit_skips`): those are not a class — `classes` does not set them, they are always asked."""
     head = ("⛔ LUMIS Scope Guard blocked this (.lumis/scope_guard.json → \"classes\"): " if blocking else
             "⏸ LUMIS Scope Guard holds this for the founder: ")
-    return (head + "; ".join(CLASS_REASONS[c](w) for c, w in active)
-            + ". Each class is set in .lumis/scope_guard.json → \"classes\" (allow | ask | block); the agent never changes it.")
+    reasons = [CLASS_REASONS[c](w) for c, w in active] + [pre_commit_skip_reason(s) for s in skips]
+    tail = (". Each class is set in .lumis/scope_guard.json → \"classes\" (allow | ask | block); the agent never changes it."
+            if active else ". The founder approves it once, or the commit goes through the check.")
+    return head + "; ".join(reasons) + tail
 
 
 # --- the local log: what the guard did, kept in the repository ------------------------------------------------
@@ -3069,7 +4691,8 @@ SECRET_PATTERNS = [
 
 def redact(text: str, limit: int = 160) -> str:
     """What was attempted, safe to keep in a file the user may commit: obvious secrets stripped, then truncated."""
-    out = " ".join(str(text or "").split())
+    # only a head far longer than what is kept is read: a 2.8 MB Write was redacted whole to keep 160 characters
+    out = " ".join(str(text or "")[:limit * 20 + 20_000].split())
     for pattern, replacement in SECRET_PATTERNS:
         out = pattern.sub(replacement, out)
     return out[:limit] + ("…" if len(out) > limit else "")
@@ -3088,7 +4711,7 @@ def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: lis
         "path": text_of_tool_input(tool_name, tool_input)[1][:200],
         # what the agent actually asked for: without it the log says "something was blocked" and no more
         # a refusal keeps more of the payload: the token that matched is usually past the first line of a heredoc
-        "attempted": redact(attempted or (tool_input or {}).get("command", ""), limit=600 if event in ("blocked", "tamper", "held") else 160),
+        "attempted": redact(attempted or (tool_input or {}).get("command", ""), limit=600 if event in ("blocked", "tamper", "held", "timeout") else 160),
         "hits": [h[:300] for h in hits if str(h).strip()][:8],
     }
     if observed:
@@ -3155,7 +4778,7 @@ def write_request(reason: str) -> int:
     # a `held` call (a dependency, a push, a write outside the project) is a request by nature; an observed event
     # stopped nothing, so there is no refusal to ask about
     events = [e for e in read_log({"log": ".lumis/guard.log"})
-              if e.get("event") in ("blocked", "tamper", "held") and not e.get("observed")]
+              if e.get("event") in ("blocked", "tamper", "held", "timeout") and not e.get("observed")]
     if not events:
         print("no refusal on record: nothing to request")
         return 1
@@ -3233,7 +4856,7 @@ def request_lines(root: Path, limit: int = 10) -> list[str] | None:
 
 def report(cfg: dict) -> int:
     entries = read_log(cfg)
-    counts = {"blocked": 0, "warned": 0, "possible": 0, "drift": 0, "tamper": 0}
+    counts = {"blocked": 0, "warned": 0, "possible": 0, "drift": 0, "tamper": 0, "timeout": 0}
     observed = 0
     for e in entries:
         if e.get("observed"):
@@ -3241,11 +4864,12 @@ def report(cfg: dict) -> int:
             continue
         counts[e.get("event", "")] = counts.get(e.get("event", ""), 0) + 1
     agents = sorted({str(e.get("agent") or "unknown") for e in entries})
-    stopped = counts.get("blocked", 0) + counts.get("tamper", 0)
+    stopped = counts.get("blocked", 0) + counts.get("tamper", 0) + counts.get("timeout", 0)
     print(f"LUMIS Scope Guard — {len(entries)} events in {cfg.get('log', '.lumis/guard.log')} · {fingerprints()}")
     # «blocked: 0» beside eighteen tamper refusals read as «the guard never stepped in» (field report 2026-09-22);
     # every kind is printed even at zero, so a missing word never has to be read as «not counted»
     print(f"  stopped: {stopped} (blocked: {counts.get('blocked', 0)} · tamper: {counts.get('tamper', 0)})"
+          f" · timeout (refused, not read in time): {counts.get('timeout', 0)}"
           f" · held: {counts.get('held', 0)} · asked: {counts.get('asked', 0)} · inspected: {counts.get('inspected', 0)}"
           f" · warned: {counts.get('warned', 0)} · possible: {counts.get('possible', 0)} · noted: {counts.get('noted', 0)}"
           f" · drift prompts: {counts.get('drift', 0)}"
@@ -3255,7 +4879,8 @@ def report(cfg: dict) -> int:
               + (" (observe mode records them and stops nothing but changes to the guard itself)" if guard_mode(cfg) == "observe" else ""))
     if counts.get("held"):
         print("  ('held' is a new dependency, a push or deploy, or a write outside the project, handed to you to approve —")
-        print("   `classes` in .lumis/scope_guard.json sets each to allow, ask or block. A decision, not a violation.)")
+        print("   `classes` in .lumis/scope_guard.json sets each to allow, ask or block; a commit that skips the LUMIS")
+        print("   pre-commit check is always asked. A decision, not a violation.)")
     if counts.get("possible"):
         print("  ('possible' is a single word out of a long Non-Goal sentence that turned up in a change: a match for you")
         print("   to judge, not a violation. Nothing was blocked; the word alone does not prove the boundary was crossed.)")
@@ -3332,6 +4957,17 @@ def doctor() -> int:
                 print("    (they still block on a line of code until you run `python scripts/scope_guard.py rebuild-markers`;"
                       " `--dry-run` shows the change first. A keyword that only a comment line or an ignore file names is"
                       " logged as `noted`, not blocked, whether you rebuild or not.)")
+            families = missing_package_families(cfg)
+            if families:
+                print("  · this config predates package families (hook 2026-09-30): packages whose name starts with "
+                      + ", ".join(f"'{p}'" for p in families) + " are not refused, only the packages it lists by name")
+                print("    (`python scripts/scope_guard.py rebuild-markers` adds them as `deny_package_prefixes`, next to"
+                      " re-deriving the markers; `--dry-run` shows every change first.)")
+            gained = lexicon_packages_missing(cfg)
+            if gained:
+                print(f"  · the lexicon has gained packages since this config's hook_version ({cfg.get('hook_version') or 'none'}"
+                      "), not refused here until they arrive with `python scripts/scope_guard.py rebuild-markers`: "
+                      + ", ".join(f"'{p}'" for p in gained[:12]) + ("…" if len(gained) > 12 else ""))
             if guard_mode(cfg) == "observe":
                 print("  · mode: observe — nothing is refused except a change to the guard itself; what would have been stopped is"
                       " logged (`python scripts/scope_guard.py observe off` to enforce)")
@@ -3396,6 +5032,8 @@ def doctor() -> int:
         else:
             print("  ✗ none of " + ", ".join(f"'{n}'" for n in names) + " is on PATH — the hook would fail to start")
             problems.append("no Python on PATH (" + ", ".join(names) + "); the agent cannot run the hook")
+    # the optional local checkpoint before each commit: one line, never a problem (hooks are not cloned with a repository)
+    print(pre_commit_doctor_line(root))
     # a link in place of the guard, or a guard living somewhere else, is a rewrite waiting to happen
     for rel in MANIFEST_FILES:
         p = root / rel
@@ -3506,7 +5144,10 @@ def rebaseline(root: Path) -> tuple[dict, Path | None]:
     target = root / MANIFEST
     target.parent.mkdir(parents=True, exist_ok=True)
     manifest = build_manifest(root)
-    target.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # LF on every OS (as `.gitattributes` checks it out): CRLF bytes written on Windows were fingerprinted, and every
+    # other clone's doctor then read the guard as changed (review 2026-10-01)
+    with open(target, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     return manifest, write_baseline(root, manifest["files"])
 
 
@@ -3552,7 +5193,8 @@ def set_observe(root: Path, on: bool) -> int:
         return 1
     cfg["mode"] = "observe" if on else "enforce"
     try:
-        path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:  # LF on every OS, like the manifest
+            fh.write(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
     except Exception as exc:
         print(f"could not write {path}: {exc}", file=sys.stderr)
         return 1
@@ -3604,6 +5246,35 @@ def _ng_order(bid: str) -> tuple:
 
 
 PRESERVED_ORIGINS = ("model", "founder")
+# The packages the capability lexicon gained, by the hook version that added them. `rebuild-markers` brings into an
+# older config the ones added after its `hook_version`, for the capabilities it records (`lexicon_packages_missing`);
+# a package the lexicon had when the config was written and the config no longer lists was taken out by the founder,
+# and stays out. Every entry is in CAPABILITY_TRIGGERS (a test pins it).
+LEXICON_PACKAGES_ADDED = {
+    "2026-09-30": {"native_mobile": ["create-expo-app"], "payments": ["paypalrestsdk", "paypalcheckoutsdk"],
+                   "complex_auth": ["onelogin", "pysaml2", "saml2"], "websockets": ["python-socketio", "flask-socketio"],
+                   "email": ["smtplib", "aiosmtplib", "fastapi-mail", "flask-mail"]},
+}
+
+
+def lexicon_packages_missing(cfg: dict) -> list[str]:
+    """The lexicon packages this config should list and does not: for each capability it records (`capabilities`),
+    those the lexicon added after its `hook_version` — every entry of LEXICON_PACKAGES_ADDED when it records no version
+    (written before versions existed, or by hand) or one that is not a YYYY-MM-DD date. Never one in `allowed_markers`, never one it already lists, never a
+    package of a capability the config does not record (a hand-written config with `"capabilities": {}` gets none).
+    Pure."""
+    cfg = cfg or {}
+    have = {str(p).strip().lower() for p in cfg.get("deny_packages") or []}
+    allowed = {str(w).strip().lower() for w in cfg.get("allowed_markers") or []}
+    version = str(cfg.get("hook_version") or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", version):
+        version = ""  # not a date (`"latest"`, `"z"`, a typo): older than every entry, so its packages ARE added
+    out: list[str] = []
+    for cap in [str(c) for c in (cfg.get("capabilities") or {})]:
+        candidates = [p for added, caps in sorted(LEXICON_PACKAGES_ADDED.items()) if added > version
+                      for p in caps.get(cap, []) if p in (CAPABILITY_TRIGGERS.get(cap) or {}).get("packages", [])]
+        out += [p for p in candidates if p.lower() not in have and p.lower() not in allowed and p not in out]
+    return out
 
 
 def derive_config_markers(cfg: dict) -> dict:
@@ -3624,8 +5295,14 @@ def derive_config_markers(cfg: dict) -> dict:
 
     keywords: list[str] = []
     warn_keywords: list[str] = []
-    packages: list[str] = list(cfg.get("deny_packages") or [])   # preserved verbatim: the founder may have added some
+    # kept as they are (the founder may have added some), plus what the lexicon gained since the config was written
+    # (`lexicon_packages_missing`, after the boundaries are matched below)
+    packages: list[str] = list(cfg.get("deny_packages") or [])
     paths: list[str] = list(cfg.get("deny_paths") or [])
+    # the package families (2026-09-30): kept as they are when the config has the key, taken from the lexicon for the
+    # capabilities matched here when it predates them
+    has_prefixes = "deny_package_prefixes" in cfg
+    prefixes: list[str] = [str(p) for p in (cfg.get("deny_package_prefixes") or [])] if has_prefixes else []
     trigger_sources: dict[str, str] = {}
     matched: dict[str, list[str]] = {}
     per_boundary: dict[str, dict] = {}
@@ -3639,7 +5316,9 @@ def derive_config_markers(cfg: dict) -> dict:
                 matched.setdefault(cap, []).append(text)
                 for t in spec["keywords"]:
                     added_block.append(t)
-                for t in spec["packages"] + spec["paths"] + spec["keywords"]:
+                if not has_prefixes:
+                    prefixes += list(spec.get("packages_prefix") or [])
+                for t in spec["packages"] + list(spec.get("packages_prefix") or []) + spec["paths"] + spec["keywords"]:
                     trigger_sources.setdefault(t.lower(), bid)
         # a marker the model proposed or the founder typed cannot be re-derived offline: it is kept by its origin
         for kw in old_keywords:
@@ -3667,11 +5346,15 @@ def derive_config_markers(cfg: dict) -> dict:
     # markers the founder had just rescued (review 2026-09-21).
     keywords = [k for k in dedupe(pinned + keywords) if k.lower() not in allowed or k in pinned]
     blocking_keywords = keywords[:320]
+    packages_added = lexicon_packages_missing(cfg)
+    packages += packages_added
     warn_only = [w for w in dedupe(warn_keywords) if w not in set(blocking_keywords) and w.lower() not in allowed][:240]
     return {
         "boundaries": boundaries, "per_boundary": per_boundary, "keywords": blocking_keywords,
         "warn_keywords": warn_only, "trigger_sources": trigger_sources, "capabilities": matched,
         "deny_packages": dedupe(packages), "deny_paths": dedupe(paths),
+        "deny_package_prefixes": dedupe(prefixes), "prefixes_added": [] if has_prefixes else dedupe(prefixes),
+        "packages_added": packages_added,
         "vocabulary_size": len(vocabulary), "vocabulary_stored": vocabulary_stored,
         "vocabulary_truncated": bool(cfg.get("vocabulary_truncated")),
         "cap_cut": len(keywords) - len(blocking_keywords),
@@ -3751,7 +5434,17 @@ def rebuild_markers(root: Path, dry_run: bool = False) -> int:
         print(f"  {bid}  \"{text[:110]}" + ("…\"" if len(text) > 110 else "\""))
         for line in rows[bid]:
             print(line)
-    if not rows:
+    if fresh["prefixes_added"]:
+        # a config written before 2026-09-30 has no package families; the lexicon's are added for what it matched
+        print("  + package families (deny_package_prefixes, hook 2026-09-30): "
+              + ", ".join(f"{p}…" for p in fresh["prefixes_added"])
+              + " — a package whose name starts with one is refused like the package itself")
+    if fresh["packages_added"]:
+        # the lexicon's packages added after the config's hook_version; one the founder took out earlier stays out
+        print(f"  + packages (deny_packages, the lexicon since {cfg.get('hook_version') or 'the start'}): "
+              + ", ".join(fresh["packages_added"])
+              + " — list one under \"allowed_markers\" to keep it out")
+    if not rows and not fresh["prefixes_added"] and not fresh["packages_added"]:
         print("  every boundary already carries exactly the markers today's rules derive — nothing to change.")
     downgraded = old_block & new_warn
     print(f"  ── totals: +{len(new_block - old_block)} blocking, -{len(old_block - new_block)} blocking "
@@ -3785,11 +5478,19 @@ def rebuild_markers(root: Path, dry_run: bool = False) -> int:
         "capabilities": fresh["capabilities"],
         "markers_rebuilt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if fresh["prefixes_added"]:  # a config that already has the key keeps it exactly as it is
+        rewritten["deny_package_prefixes"] = fresh["deny_package_prefixes"]
+    if fresh["packages_added"]:  # a union: every package the config lists stays
+        rewritten["deny_packages"] = fresh["deny_packages"]
+    # the config now carries what this hook's lexicon adds: its hook_version says so, and the next rebuild adds only
+    # what a later lexicon gains
+    rewritten["hook_version"] = HOOK_VERSION
     if origins:  # a preserved marker keeps its recorded origin; one this rebuild dropped no longer has an entry
         rewritten["marker_origins"] = {k: v for k, v in (cfg.get("marker_origins") or {}).items()
                                        if str(k).lower() in {t.lower() for t in fresh["keywords"] + fresh["warn_keywords"]}}
     try:
-        path.write_text(json.dumps({**cfg, **rewritten}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:  # LF on every OS, like the manifest
+            fh.write(json.dumps({**cfg, **rewritten}, ensure_ascii=False, indent=2) + "\n")
     except Exception as exc:
         print(f"could not write {path}: {exc}", file=sys.stderr)
         return 1
@@ -3822,6 +5523,19 @@ def downgraded_markers(cfg: dict) -> list[str]:
         return []
     warn_now = {str(w).lower() for w in fresh["warn_keywords"]}
     return sorted({str(k) for k in (cfg.get("keywords") or []) if " " not in str(k) and str(k).lower() in warn_now})
+
+
+# And for hook 2026-09-30: a config that predates `deny_package_prefixes` has no package families, so `expo-camera` and
+# `@expo/vector-icons` pass where `expo` itself is refused. Advice, never a failure: `rebuild-markers` adds them.
+def missing_package_families(cfg: dict) -> list[str]:
+    if "deny_package_prefixes" in (cfg or {}):
+        return []
+    out: list[str] = []
+    for cap in (cfg or {}).get("capabilities") or {}:
+        for prefix in (CAPABILITY_TRIGGERS.get(str(cap)) or {}).get("packages_prefix") or []:
+            if prefix not in out:
+                out.append(prefix)
+    return out
 
 
 # --- the second checkpoint: the same boundaries on a pull request diff -------------------------------------------
@@ -4029,6 +5743,96 @@ def diff_lines(lines: list[str], diff: bool) -> Iterator[tuple[int, str, int, st
         yield line_no, file_name, file_line, ("+" if kind == "added" else " " if kind == "context" else ""), body
 
 
+def diff_rows(lines: list[str], diff: bool) -> tuple[list[tuple[int, str, int, str, str]], dict[int, list[str]]]:
+    """(the rows `diff_lines` yields, {row index: the removed lines right before that row}): the old side of a change,
+    for `diff_row_statements` to know what a statement said before the change."""
+    rows: list[tuple[int, str, int, str, str]] = []
+    removed: dict[int, list[str]] = {}
+    pending: list[str] = []
+    for kind, line_no, file_name, file_line, body in _walk_diff(lines, diff):
+        if kind == "header":
+            pending = []
+            continue
+        if kind == "removed":
+            pending.append(body)
+            continue
+        if pending:
+            removed[len(rows)], pending = pending, []
+        rows.append((line_no, file_name, file_line, "+" if kind == "added" else " " if kind == "context" else "", body))
+    return rows, removed
+
+
+def diff_row_statements(rows: list[tuple[int, str, int, str, str]], signs: tuple = ("+", " ", ""),
+                        removed: dict[int, list[str]] | None = None,
+                        spans: dict[int, tuple[int, int]] | None = None) -> dict[int, tuple[str, str]]:
+    """{row index: (joined statement, the statement before the change)} for the rows `diff_lines` yields: a statement
+    written over several lines of one file (`statement_spans`: `RUN pip install \\` … `resend`, `require(` … `'ws'` …
+    `)`), given to its first row whose sign is in `signs` — the first added line for `check-diff` (`("+",)`: the
+    statement may start on a context line above it), the first line for the studio's paste. Rows of one file follow
+    each other when their file lines do (an unknown line, 0, is taken as following). The hook gives a Write's lines the
+    same statements (`judge_tool_input`).
+
+    For `check-diff` (`removed` given, from `diff_rows`) the statement before the change is its context lines and the
+    lines the change removed between its first and its last row — never a removed line above its first row, and never
+    one of another hunk or another file (the third review of 30.09: a removed comment just above the statement, a
+    removed line at the top of the next file, a comment changed 30 lines away in a `-U0` diff all hid the added
+    package): a package it already named is not the added line's (`statement_changes`). And when a stretch of rows
+    starts inside a statement whose first line the diff does not show — its first row is a bare package token that
+    continues a statement (`BARE_CONTINUATION_RE`) — each added bare token of that statement is read as that one package
+    (`_candidate_statement`), as the hook reads an Edit whose file it cannot see. An Expo `app.json` whose rows make a
+    whole JSON document (a new file, a file the hunk shows whole) is read as one (`stack_config_uses`).
+
+    `spans` (optional) receives {row given a statement: (its first row, its last row)}, so a finding can be reported
+    at the row that names the package (`line_findings`)."""
+    out: dict[int, tuple[str, str]] = {}
+    ci = removed is not None
+    got = removed or {}
+
+    def put(row: int, statement: str, base: str, first: int, last: int) -> None:
+        had = out.get(row)
+        out[row] = (had[0] + "\n" + statement, had[1] or base) if had else (statement, base)
+        if spans is not None:
+            lo, hi = spans.get(row, (first, last))
+            spans[row] = (min(lo, first), max(hi, last))
+
+    def before(a: int, b: int) -> str:
+        """Rows a..b as they were: their context lines, and the lines removed between row a and row b."""
+        base: list[str] = []
+        for x in range(a, b + 1):
+            if x > a:
+                base += got.get(x, [])
+            if rows[x][3] != "+":
+                base.append(rows[x][4])
+        return "\n".join(base)
+
+    k, n = 0, len(rows)
+    while k < n:
+        j = k
+        while (j + 1 < n and rows[j + 1][1] == rows[k][1]
+               and (not rows[j][2] or not rows[j + 1][2] or rows[j + 1][2] == rows[j][2] + 1)):
+            j += 1
+        found = statement_spans([rows[x][4] for x in range(k, j + 1)], rows[k][1])
+        for first, last, joined in found:
+            target = next((k + x for x in range(first, last + 1) if rows[k + x][3] in signs), None)
+            if target is None:
+                continue
+            put(target, joined, before(k + first, k + last) if ci else "", k + first, k + last)
+        if _base_name(rows[k][1]) in DOCUMENT_NAMES:
+            target = next((x for x in range(k, j + 1) if rows[x][3] in signs), None)
+            if target is not None:
+                whole = "\n".join(rows[x][4] for x in range(k, j + 1))
+                put(target, whole, ("\n".join(got.get(k, [])) + "\n" + before(k, j)) if ci else "", k, j)
+        if ci and BARE_CONTINUATION_RE.match(rows[k][4]) and rows[k][2] != 1:
+            lead = next(((first, last) for first, last, _j in found if first == 0), (0, 0))
+            for x in range(lead[0], lead[1] + 1):
+                row = rows[k + x]
+                m = BARE_CONTINUATION_RE.match(row[4])
+                if row[3] == "+" and m and (m.group(2) == "\\" or (x > 0 and rows[k + x - 1][4].rstrip().endswith("\\"))):
+                    put(k + x, _candidate_statement(m.group(1)), "", k + x, k + x)
+        k = j + 1
+    return out
+
+
 def scan_fragment(cfg: dict, fragment: str, path: str = "", *, max_chars: int = MAX_CHARS, max_lines: int = MAX_LINES,
                   max_hits: int = MAX_HITS) -> dict:
     """The whole reading of a pasted fragment or diff: ``{hits, possible, lines_checked, truncated}``.
@@ -4094,8 +5898,11 @@ def scan_fragment(cfg: dict, fragment: str, path: str = "", *, max_chars: int = 
             if not add(kind, trigger, 0, str(path), file_name=str(path), severity=severity):
                 return result()
     technologies = technology_triggers(cfg)
-    for line_no, file_name, file_line, _sign, body in diff_lines(lines, diff):
-        for kind, trigger, severity, why in line_hits(cfg, body, file_name or str(path or ""), technologies=technologies):
+    rows = list(diff_lines(lines, diff))
+    statements = diff_row_statements(rows)
+    for r, (line_no, file_name, file_line, _sign, body) in enumerate(rows):
+        for kind, trigger, severity, why in line_hits(cfg, body, file_name or str(path or ""), technologies=technologies,
+                                                      statement=statements.get(r, ("", ""))[0]):
             if not add(kind, trigger, line_no, body.strip(), file_name, file_line, severity=severity, why=why):
                 return result()
     return result()
@@ -4222,7 +6029,8 @@ CI_COMMENT_MARKER = "<!-- lumis-boundary-check -->"
 # What a pull request diff is read up to. A diff cut by these limits is INCOMPLETE (exit 1) unless the part read
 # already holds a BLOCK: a check that skipped the tail of a diff must not pass a required check, and padding a pull
 # request in front of a crossing must not turn a BLOCK into a WARN (review 2026-09-28). The findings list stops at
-# CI_MAX_HITS warnings; past it every added line is still read for a BLOCK.
+# CI_MAX_HITS warnings; past it every added line is still read for a BLOCK. CI_MAX_LINES counts added and removed lines
+# only — context lines and headers are bounded by the number of hunks (`_change_lines_cut`, third review of 30.09).
 CI_MAX_CHARS = 5_000_000
 CI_MAX_LINES = 50_000
 CI_MAX_HITS = 2_000
@@ -4239,6 +6047,7 @@ BINARY_SUFFIXES = (
     ".ods", ".odp", ".sqlite", ".sqlite3", ".db", ".npy", ".npz", ".pkl", ".pickle", ".parquet", ".onnx", ".pt",
     ".pth", ".h5", ".keras", ".tflite", ".pb", ".dat", ".iso", ".dmg", ".apk", ".ipa", ".aab")
 CI_MAX_REREAD = 200
+CI_CONTEXT_LINES = 3  # the lines of context `git diff` gives each hunk: where an added line's statement starts
 # A pull request comment holds 65 536 characters; the full list is in report.json and the Security tab.
 MD_MAX_ROWS = 60
 MD_MAX_CHARS = 60_000
@@ -4302,8 +6111,11 @@ CHECK_DIFF_USAGE = """LUMIS boundary check — scripts/scope_guard.py check-diff
   --diff <file>                a unified diff from a file instead (or pipe one on stdin), judged against the
                                config in the working tree; new directories, dependencies and the boundary diff
                                need git mode and are listed as not checked
+  --staged                     the staged change (`git diff --cached` against HEAD; the empty tree before the
+                               first commit), judged against the config in HEAD — the pre-commit check
   --root <dir>                 the repository (default: the project root)
-  --markdown <file>            write the report there too (it is always printed)
+  --format markdown|text       what is printed: the markdown report (the default) or a short text for a terminal
+  --markdown <file>            write the markdown report there too, whatever --format prints
   --sarif <file>               SARIF 2.1.0 for GitHub code scanning
   --json <file>                the same report for machines
 Added lines only: a removal never crosses a boundary. Exit 0 PASS or WARN · 2 BLOCK · 1 could not run, or the diff
@@ -4607,8 +6419,36 @@ def _ci_finding(cfg: dict, verdict: str, kind: str, *, rule_id: str = "", trigge
             "excerpt": str(excerpt or ""), "message": str(message or ""), "observed": False, "lifted_in_pr": False}
 
 
+def _change_lines_cut(lines: list[str], max_changes: int) -> tuple[int, int]:
+    """(how many diff lines are read, how many added and removed lines the whole diff has): the diff is read up to
+    its `max_changes`-th added or removed line. Context lines and headers are not counted — git gives each hunk at most
+    2 × CI_CONTEXT_LINES of them — so three lines of context do not make a diff INCOMPLETE three times sooner (the third
+    review of 30.09). A line counts inside a hunk (after an `@@` line, until the next `diff --git`); the `--- a/x` /
+    `+++ b/x` headers before a file's first hunk do not."""
+    changes, cut = 0, len(lines)
+    in_hunk = False
+    for i, line in enumerate(lines):
+        if line.startswith("@@"):
+            in_hunk = True
+        elif line.startswith("diff --git "):
+            in_hunk = False
+        elif in_hunk and line[:1] in ("+", "-"):
+            changes += 1
+            if changes == max_changes + 1:
+                cut = i
+    return cut, changes
+
+
+def _names_trigger(body: str, trigger: str, family: bool, quoted: bool = False) -> bool:
+    """The line names the package `trigger` (spelled the `_pep503` way): as a whole name, or as the start of one for a
+    family (`deny_package_prefixes`); `quoted`: right after a quote (`from 'resend'`, `"resend": "^2"`)."""
+    norm, t = _pep503(body), _pep503(trigger)
+    head = r"['\"`]" if quoted else r"(?<![a-z0-9])"
+    return bool(t) and bool(re.search(head + re.escape(t) + ("" if family else r"(?![a-z0-9])"), norm))
+
+
 def line_findings(cfg: dict, diff_text: str, *, max_chars: int = CI_MAX_CHARS, max_lines: int = CI_MAX_LINES,
-                  max_hits: int = CI_MAX_HITS) -> tuple[list[dict], dict]:
+                  max_hits: int = CI_MAX_HITS, deadline: float = 0.0) -> tuple[list[dict], dict]:
     """Findings on the ADDED lines of a diff; a `-` line never violates anything. A blocking trigger in code is a
     BLOCK, in a document or a test it is `noted` (the hook's own exemption: writing a boundary down is inside it), and
     so it is in a comment line of a code file or an ignore file; a keyword found only inside another tool's option (in
@@ -4620,19 +6460,28 @@ def line_findings(cfg: dict, diff_text: str, *, max_chars: int = CI_MAX_CHARS, m
 
     The list of warnings stops at `max_hits`; past it every added line is still read for a BLOCK, so a pull request
     cannot hide a crossing behind a flood of warnings (review 2026-09-28). The walk stops early only after `max_hits`
-    BLOCK findings — the verdict is BLOCK by then.
-    Returns (findings, {lines_read, added_lines, total_lines, cut, dropped, stopped, capped, truncated}): `cut` — the
-    text was longer than `max_chars` / `max_lines` and its tail was not read; `dropped` — warnings not listed past the
-    cap; `stopped` — the walk ended at `lines_read` after the BLOCK cap; `truncated` — not read to its end."""
+    BLOCK findings — the verdict is BLOCK by then — or past `deadline` (time.monotonic(); default: the start of this
+    call + CI_SCAN_BUDGET_SECONDS): then the diff was not read to its end and the verdict is INCOMPLETE unless the part
+    read holds a BLOCK. `max_lines` counts added and removed lines, not context (`_change_lines_cut`). A package named
+    on a later row of a multi-line statement is reported at that row when it is an added one. An added line longer than
+    PACKAGE_READ_MAX is read for packages up to there, and the rest is a possible match (WARN), as in the hook.
+    Returns (findings, {lines_read, added_lines, total_lines, cut, dropped, stopped, timed_out, capped, truncated}):
+    `cut` — the text was longer than `max_chars` / `max_lines` and its tail was not read; `dropped` — warnings not
+    listed past the cap; `stopped` — the walk ended at `lines_read` after the BLOCK cap or the deadline (`timed_out`);
+    `truncated` — not read to its end."""
     raw = str(diff_text or "")
     text = raw[:max_chars]
     all_lines = diff_text_lines(text)
-    lines = all_lines[:max_lines]
+    read_to, changes = _change_lines_cut(all_lines, max_lines)
+    lines = all_lines[:read_to]
     findings: list[dict] = []
     added = walked = dropped = blocks = 0
-    stopped = False
+    stopped = timed_out = False
+    deadline = deadline or (time.monotonic() + CI_SCAN_BUDGET_SECONDS)
     kinds: dict[str, tuple[str, bool, bool]] = {}  # header name -> (path, guard file, prose)
     technologies = technology_triggers(cfg)
+    families = {str(p).strip().lower() for p in cfg.get("deny_package_prefixes") or [] if str(p or "").strip()}
+    placed: set[tuple[str, str, int]] = set()  # (trigger, file, line) already reported: a moved hit is not repeated
 
     def keep(finding: dict) -> None:
         nonlocal dropped, blocks
@@ -4644,7 +6493,15 @@ def line_findings(cfg: dict, diff_text: str, *, max_chars: int = CI_MAX_CHARS, m
         else:
             dropped += 1
 
-    for line_no, file_name, file_line, sign, body in diff_lines(lines, True):
+    rows, removed = diff_rows(lines, True)
+    # a statement over several lines, at its first added line — less what it said before the change: a context line
+    # only locates the statement an added line belongs to, it never makes a finding of its own
+    spans: dict[int, tuple[int, int]] = {}
+    statements = diff_row_statements(rows, ("+",), removed, spans)
+    for r, (line_no, file_name, file_line, sign, body) in enumerate(rows):
+        if time.monotonic() > deadline:
+            stopped = timed_out = True
+            break
         walked = line_no
         if sign != "+":
             continue
@@ -4660,15 +6517,34 @@ def line_findings(cfg: dict, diff_text: str, *, max_chars: int = CI_MAX_CHARS, m
         # the hook's own reading of one line (`line_hits`): a comment of a code file and an ignore file write a
         # boundary down; a keyword only inside another tool's option (a CI file, a lockfile or a manifest, never a
         # technology) or a library's module name is a possible match
-        for kind, trigger, severity, why in line_hits(cfg, body, path, technologies=technologies):
+        statement, statement_base = statements.get(r, ("", ""))
+        for kind, trigger, severity, why in line_hits(cfg, body, path, technologies=technologies,
+                                                      statement=statement, statement_base=statement_base):
             if trigger.lower() in seen:
                 continue
             seen.add(trigger.lower())
             hits.append({"kind": kind, "trigger": trigger, "severity": severity, "why": why, "line": file_line})
-        excerpt = redact(body, EXCERPT_LEN)
+        if len(body) > PACKAGE_READ_MAX and not prose:
+            keep(_ci_finding(cfg, "WARN", "possible", trigger="(not read)", file=path, file_line=file_line,
+                             excerpt=redact(body, EXCERPT_LEN),
+                             message=f"possible match: this added line is {len(body):,} characters long and was read "
+                                     f"for packages only up to {PACKAGE_READ_MAX // 1_000_000} MB — not read past 1 MB"))
         for hit in drop_noise(hits):
             kind, trigger = hit["kind"], hit["trigger"]
-            where = {"trigger": trigger, "trigger_kind": kind, "file": path, "file_line": file_line, "excerpt": excerpt}
+            at_line, at_body = file_line, body
+            if kind == "package" and r in spans:  # the row of the statement that names the package, if an added one
+                lo, hi = spans[r]
+                added_rows = [x for x in range(lo, hi + 1) if rows[x][3] == "+" and rows[x][1] == file_name]
+                family = trigger.lower() in families
+                named = next((x for x in added_rows if _names_trigger(rows[x][4], trigger, family, quoted=True)),
+                             next((x for x in added_rows if _names_trigger(rows[x][4], trigger, family)), None))
+                if named is not None:
+                    at_line, at_body = rows[named][2], rows[named][4]
+            if at_line and (trigger.lower(), path, at_line) in placed:
+                continue
+            placed.add((trigger.lower(), path, at_line))
+            where = {"trigger": trigger, "trigger_kind": kind, "file": path, "file_line": at_line,
+                     "excerpt": redact(at_body, EXCERPT_LEN)}
             if hit["severity"] == "warn":
                 if not prose:  # the hook says nothing about a possible match in a document, and neither does this
                     keep(_ci_finding(cfg, "WARN", "possible", message=possible_line(cfg, trigger, hit["why"]), **where))
@@ -4684,15 +6560,15 @@ def line_findings(cfg: dict, diff_text: str, *, max_chars: int = CI_MAX_CHARS, m
         if not prose:
             for arch in architecture_text_hits(cfg, path, body):
                 keep(_ci_finding(cfg, "WARN", "architecture", rule_id="LUMIS-ARCH", trigger=arch, file=path,
-                                 file_line=file_line, excerpt=excerpt, message=arch))
+                                 file_line=file_line, excerpt=redact(body, EXCERPT_LEN), message=arch))
         if blocks >= max_hits:
             stopped = True
             break
     total = len(diff_text_lines(raw))
-    cut = len(raw) > max_chars or len(all_lines) > max_lines
+    cut = len(raw) > max_chars or changes > max_lines
     return findings, {"lines_read": walked if stopped else len(lines), "added_lines": added, "total_lines": total,
-                      "cut": cut, "dropped": dropped, "stopped": stopped, "capped": bool(dropped or stopped),
-                      "truncated": cut or stopped}
+                      "changed_lines": changes, "cut": cut, "dropped": dropped, "stopped": stopped,
+                      "timed_out": timed_out, "capped": bool(dropped or stopped), "truncated": cut or stopped}
 
 
 def path_findings(cfg: dict, changed: list[dict]) -> list[dict]:
@@ -4756,7 +6632,8 @@ def _added_lines(diff_text: str, paths: set[str]) -> dict[str, list[tuple[int, s
     out: dict[str, list[tuple[int, str]]] = {}
     if not paths:
         return out
-    for _line_no, file_name, file_line, sign, body in diff_lines(diff_text_lines(diff_text)[:CI_MAX_LINES], True):
+    lines = diff_text_lines(diff_text)
+    for _line_no, file_name, file_line, sign, body in diff_lines(lines[:_change_lines_cut(lines, CI_MAX_LINES)[0]], True):
         path = _ci_path(file_name)
         if sign == "+" and path in paths:
             out.setdefault(path, []).append((file_line, body))
@@ -4792,7 +6669,7 @@ def dependency_findings(cfg: dict, manifests: list[dict] | None, base_declared: 
         path = str(m.get("path") or "")
         new = declared_names(str(m.get("head_text") or ""), path) - declared_names(str(m.get("base_text") or ""), path)
         for package in sorted(new):
-            if package in denied or package in known:
+            if package in denied or package in known or forbidden_package(cfg, package, _manifest_reading(path)):
                 continue
             file_line, body = _line_of_package(added.get(path, []), package)
             tail = (" — held for the reviewer (classes.dependency: ask)" if verdict == "ask"
@@ -4845,8 +6722,8 @@ def guard_file_findings(changed: list[dict], first_install: bool = False) -> lis
 # edit to it can weaken the guard as surely as a lifted boundary (review 2026-09-28): a directory added to
 # architecture.top_level is never a new bounded context, a package named in `stack` is never held, `"log": ""` turns
 # the hook's journal off. `note` and `generated` are prose and a timestamp.
-CONFIG_KEYS_OWN = ("boundaries", "non_goals", "mode", "classes", "deny_packages", "deny_paths", "keywords",
-                   "warn_keywords", "revision", "note", "generated")
+CONFIG_KEYS_OWN = ("boundaries", "non_goals", "mode", "classes", "deny_packages", "deny_package_prefixes", "deny_paths",
+                   "keywords", "warn_keywords", "revision", "note", "generated")
 CONFIG_KEY_HINTS = {
     "log": "the hook's journal",
     "stack": "the approved stack: a package it names is not held",
@@ -4961,7 +6838,7 @@ def config_changes(base_cfg: dict, head_cfg: dict) -> dict:
         if class_verdict(base_cfg, name) != class_verdict(head_cfg, name):
             settings.append({"key": f"classes.{name}", "old": class_verdict(base_cfg, name), "new": class_verdict(head_cfg, name)})
     triggers: list[dict] = []
-    for key in ("deny_packages", "deny_paths", "keywords", "warn_keywords"):
+    for key in ("deny_packages", "deny_package_prefixes", "deny_paths", "keywords", "warn_keywords"):
         old = {str(x) for x in base_cfg.get(key) or [] if str(x).strip()}
         new = {str(x) for x in head_cfg.get(key) or [] if str(x).strip()}
         if old != new:
@@ -5016,7 +6893,8 @@ def classify_diff(cfg: dict, diff_text: str, changed: list[dict], *, base_dirs: 
                   head_cfg: dict | None = None, before_cfg: dict | None = None, head_cfg_error: str = "",
                   first_install: bool = False, truncated_input: bool = False, total_lines: int = 0,
                   binary_reread: list[str] | tuple = (),
-                  max_chars: int = CI_MAX_CHARS, max_lines: int = CI_MAX_LINES, max_hits: int = CI_MAX_HITS) -> dict:
+                  max_chars: int = CI_MAX_CHARS, max_lines: int = CI_MAX_LINES, max_hits: int = CI_MAX_HITS,
+                  deadline: float = 0.0) -> dict:
     """The whole verdict on one diff, pure. `cfg` is the config in force (the base's), `changed` the file list
     (`parse_name_status` / `changed_files_from_diff`). What needs git — `base_dirs`, `manifests`, `head_cfg` — is
     None when there was none, and the report then lists that check under "Not checked" instead of passing it.
@@ -5024,7 +6902,7 @@ def classify_diff(cfg: dict, diff_text: str, changed: list[dict], *, base_dirs: 
     config it ends with. `head_cfg_error` says why there is none to compare with — the pull request deletes the
     config or leaves it unreadable — and is a BLOCK: after merge the hook would read no boundaries at all.
     `binary_reread` are the files git printed as binary that git mode diffed again as text (their lines are in
-    `diff_text`)."""
+    `diff_text`). `deadline` (time.monotonic()) bounds the reading of the added lines (`line_findings`)."""
     changed = [{"status": str(c.get("status") or "M")[:1].upper(), "path": str(c.get("path") or "").replace("\\", "/"),
                 "old_path": str(c.get("old_path") or "").replace("\\", "/")} for c in (changed or []) if c.get("path")]
     read_text = str(diff_text or "")[:max_chars]
@@ -5032,7 +6910,8 @@ def classify_diff(cfg: dict, diff_text: str, changed: list[dict], *, base_dirs: 
     reread = [p for p in (binary_reread or ()) if p]
     unread_binary = [p for p in marks["binary"] if p not in set(reread)]
     submodules = marks["submodule"]
-    findings, stats = line_findings(cfg, diff_text, max_chars=max_chars, max_lines=max_lines, max_hits=max_hits)
+    findings, stats = line_findings(cfg, diff_text, max_chars=max_chars, max_lines=max_lines, max_hits=max_hits,
+                                    deadline=deadline)
     findings += path_findings(cfg, changed)
     context, context_reason = new_context_findings(cfg, changed, base_dirs, submodules)
     findings += context
@@ -5089,11 +6968,16 @@ def classify_diff(cfg: dict, diff_text: str, changed: list[dict], *, base_dirs: 
                            + ", ".join(unread_binary[:10]) + (", …" if len(unread_binary) > 10 else ""))
     if truncated:
         read = stats["lines_read"]
-        if stats["stopped"]:
+        if stats.get("timed_out"):
+            not_checked.append(f"the rest of the diff: the check did not finish reading within "
+                               f"{CI_SCAN_BUDGET_SECONDS} s and stopped at diff line {read} of {total} — the rest was "
+                               "not judged, so the result is INCOMPLETE (exit 1) unless the part read holds a BLOCK")
+        elif stats["stopped"]:
             not_checked.append(f"the rest of the diff: the check stopped at diff line {read} of {total} after "
                                f"{max_hits} BLOCK findings")
         else:
-            not_checked.append(f"the diff is larger than the check reads: {read} of {total} diff lines read — the "
+            not_checked.append(f"the diff is larger than the check reads: {read} of {total} diff lines read (the "
+                               f"check reads {max_lines:,} added and removed lines and {max_chars:,} characters) — the "
                                "rest was not judged, so the result is INCOMPLETE (exit 1) unless the part read holds a "
                                "BLOCK")
     if stats["dropped"]:
@@ -5442,22 +7326,110 @@ def render_error_json(reason: str) -> dict:
             "findings": [], "boundary_changes": {}, "not_checked": [], "diff": {}, "error": str(reason or "")}
 
 
+# --- the same result for a terminal (`--format text`: what the pre-commit check prints, hook 2026-10-01) -----------
+TEXT_WARNINGS_SHOWN = 5
+TEXT_ROW_MAX = 300
+TEXT_LIMITS = ("It reads the added lines as text — words, paths, packages, new top-level directories — not meaning: "
+               "a review aid, not a security boundary.")
+
+
+def _text_row(f: dict) -> str:
+    """`path:line  NG-n boundary text — what matched: the line`, on one line."""
+    where = _md_flat(str(f.get("file") or "") + (f":{f['file_line']}" if f.get("file_line") else ""), 200)
+    boundary = " ".join(x for x in (str(f.get("rule_id") or ""), str(f.get("boundary_text") or "")) if x)
+    # a guard-file BLOCK carries its reason in the message (deleted, not valid JSON, the hook changed): the trigger
+    # label alone said only "guard file '…'" (review 2026-10-01)
+    guard_block = f.get("rule_id") == "LUMIS-GUARD-FILES" and f.get("verdict") == "BLOCK" and f.get("message")
+    reason = str(f.get("message") or "").replace("in this pull request", "in this change").replace("in this PR", "in this change")
+    row = f"{boundary} — {reason if guard_block else _trigger_label(f)}"
+    if f.get("excerpt") and f.get("excerpt") != f.get("file") and not guard_block:
+        row += f": {f['excerpt']}"
+    if f.get("lifted_in_pr"):
+        row += " (this change removes the boundary; the lift takes effect once it is committed)"
+    return f"{where}  {_md_flat(row, TEXT_ROW_MAX)}"
+
+
+def render_text(result: dict, meta: dict, note: str = "") -> str:
+    """The report for a person at a terminal: the verdict, each BLOCK as `path:line  NG-n boundary — what matched`, the
+    warnings counted with the first few shown, then one line on how to go on. Plain text: no markdown, no table."""
+    findings = result.get("findings") or []
+    verdict = str(result.get("verdict") or "")
+    staged = meta.get("input") == "staged"
+    files, added = int(result.get("files_changed") or 0), int(result.get("added_lines") or 0)
+    lines = [f"LUMIS boundary check — {verdict} ({_counts_line(findings)})",
+             f"  {_md_flat(meta.get('input_name') or meta.get('input') or 'diff', 120)} · {files} file{'' if files == 1 else 's'}"
+             f" · {added} added line{'' if added == 1 else 's'} read · against .lumis/scope_guard.json "
+             f"({_md_flat(meta.get('config_source') or 'working tree', 120)})"]
+    if note:
+        lines.append(f"  {note}")
+    if meta.get("mode") == "observe":
+        lines.append("  mode: observe — nothing is blocked except a change to the guard itself (\"would block\" below)")
+    for f in findings:
+        if f.get("verdict") == "BLOCK":
+            lines.append("  BLOCK " + _text_row(f))
+    warns = [f for f in findings if f.get("verdict") == "WARN"]
+    if warns:
+        shown = warns[:TEXT_WARNINGS_SHOWN]
+        lines.append(f"  WARN: {len(warns)}" + (f" — the first {len(shown)}:" if len(warns) > len(shown) else ":"))
+        lines += [f"  WARN {_warn_label(f)} " + _text_row(f) for f in shown]
+    if verdict == "INCOMPLETE":
+        lines.append("  The change was not read to its end and the part read holds no BLOCK: the rest was not judged "
+                     "(exit 1 — not a PASS). Split the change, or review the unread part by hand"
+                     + (" (one oversized file, a regenerated lockfile say: the founder commits it with `git commit "
+                        "--no-verify`)." if staged else "."))
+    elif verdict == "WARN" and not warns:
+        # a WARN with no WARN row: what was left unread (a submodule, a binary file) is the reason — say it
+        unread = [r for r in (result.get("not_checked") or []) if r.startswith(("submodules (", "binary files in"))]
+        lines += [f"  not read: {_md_flat(r, TEXT_ROW_MAX)}" for r in unread[:3]]
+    commit = "the commit" if staged else "the change"
+    if verdict in ("BLOCK", "INCOMPLETE"):
+        blocks = [f for f in findings if f.get("verdict") == "BLOCK"]
+        guard = [f for f in blocks if f.get("rule_id") == "LUMIS-GUARD-FILES"]
+        skip = (" `git commit --no-verify` skips this check; the pull request check still reads the diff." if staged else "")
+        if blocks and len(guard) == len(blocks):
+            # the guard's own files are not a boundary: lifting one, or committing the config alone, changes nothing
+            lines.append("To go on: this is a change to the guard itself, not a boundary crossing — the founder "
+                         + ("commits it with `git commit --no-verify` and confirms it on the pull request." if staged
+                            else "confirms it on the pull request.") + " " + TEXT_LIMITS)
+        else:
+            lines.append(f"To go on: fix the {'staged ' if staged else ''}change; or the founder lifts the boundary (LUMIS "
+                         "Amend, or an edit of .lumis/scope_guard.json committed on its own)."
+                         + (" A change to the guard's own files is the founder's to confirm." if guard else "")
+                         + skip + " " + TEXT_LIMITS)
+    else:
+        lines.append(("A WARN does not stop " + commit + ". " if verdict == "WARN" else "") + TEXT_LIMITS)
+    return "\n".join(lines) + "\n"
+
+
+def render_error_text(reason: str, staged: bool = False) -> str:
+    return (f"LUMIS boundary check could not run: {_md_flat(reason, 600)}\n"
+            "  This is not a PASS: nothing was checked" + (" — the commit is refused (exit 1). Fix the cause, or skip "
+                                                          "the check once with `git commit --no-verify`; the pull "
+                                                          "request check still reads the diff." if staged else
+                                                          " (exit 1).") + "\n")
+
+
 # --- check-diff: the command ---------------------------------------------------------------------------------------
-CHECK_DIFF_VALUE_FLAGS = ("--base", "--head", "--diff", "--root", "--markdown", "--sarif", "--json")
+CHECK_DIFF_VALUE_FLAGS = ("--base", "--head", "--diff", "--root", "--markdown", "--sarif", "--json", "--format")
+CHECK_DIFF_FORMATS = ("markdown", "text")
 
 
 def parse_check_diff_args(argv: list[str]) -> dict:
     """The flags of `check-diff`, read by hand: argparse exits 2 on a bad flag, and 2 means BLOCK here. A problem is
     returned in `error` (exit 1, "could not run"), after every output path has been read, so the report of the
     failure still lands where it was asked for."""
-    opts: dict = {key: "" for key in ("base", "head", "diff", "root", "markdown", "sarif", "json")}
-    opts.update(help=False, error="")
+    opts: dict = {key: "" for key in ("base", "head", "diff", "root", "markdown", "sarif", "json", "format")}
+    opts.update(help=False, staged=False, error="")
     args = [str(a) for a in (argv or [])]
     i = 0
     while i < len(args):
         a = args[i]
         if a in ("--help", "-h", "help"):
             opts["help"] = True
+            i += 1
+            continue
+        if a == "--staged":
+            opts["staged"] = True
             i += 1
             continue
         name, eq, value = a.partition("=")
@@ -5477,8 +7449,12 @@ def parse_check_diff_args(argv: list[str]) -> dict:
         i += 1
     if not opts["error"] and opts["base"] and opts["diff"]:
         opts["error"] = "--base and --diff are two different inputs: give one of them"
+    if not opts["error"] and opts["staged"] and (opts["base"] or opts["head"] or opts["diff"]):
+        opts["error"] = "--staged reads the staged change against HEAD: it takes no --base, --head or --diff"
     if not opts["error"] and opts["head"] and not opts["base"]:
         opts["error"] = "--head needs --base"
+    if not opts["error"] and opts["format"] and opts["format"] not in CHECK_DIFF_FORMATS:
+        opts["error"] = f"--format {opts['format']}: markdown or text"
     return opts
 
 
@@ -5496,10 +7472,10 @@ def _guard_output(target: str, root: Path) -> bool:
     return _clean_path(rel) in names
 
 
-def _git(cwd: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+def _git(cwd: Path, *args: str, timeout: int = 120, stdin: str | None = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout)
+                              errors="replace", timeout=timeout, input=stdin)
     except FileNotFoundError:
         raise CheckDiffError("git is not installed or not on PATH") from None
     except subprocess.TimeoutExpired:
@@ -5595,38 +7571,75 @@ def _skipped_manifest(path: str) -> bool:
     return any(p.startswith(".") or p.lower() in MANIFEST_SKIP_DIRS for p in parts)
 
 
-def git_inputs(root: Path, base: str, head: str = "HEAD") -> dict:
+GIT_SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+# How the report names the two sides of the change it read, per input: a pull request (`--base`) or the staged change
+# (`--staged`, the pre-commit check), whose "head" is the index.
+GIT_SIDES = {
+    False: {"change": "this pull request", "on_base": "on the base ref", "base_short": "base",
+            "on_head": "in the head commit", "in_change": "in this pull request"},
+    True: {"change": "the staged change", "on_base": "in HEAD", "base_short": "HEAD",
+           "on_head": "in the staged change", "in_change": "in the staged change"},
+}
+
+
+def git_inputs(root: Path, base: str, head: str = "HEAD", *, staged: bool = False) -> dict:
     """Everything `classify_diff` needs, from git: the diff `<base>...<head>` (added lines from the merge base), the
     changed files, the base's top-level directories, the manifests before and after, what the base already declares,
     the config in force (the base's; the PR's own only on a first install) and, when the PR changes the config, the
-    config before and after it. The only function that runs git; every failure is a CheckDiffError (exit 1)."""
-    for ref in (base, head):
-        if not ref or ref.startswith("-") or len(ref) > 256 or any(ch.isspace() or ord(ch) < 32 for ch in ref):
-            raise CheckDiffError(f"'{ref}' is not a git ref this check will hand to git")
+    config before and after it. The only function that runs git; every failure is a CheckDiffError (exit 1).
+
+    `staged` (the pre-commit check, hook 2026-10-01): the same reading of the staged change — `git diff --cached`
+    against HEAD with the same flags, the empty tree before the first commit. HEAD is the base and the merge base; the
+    index is the head: a manifest after the change and the staged config are read from the index (`:path`), never from
+    the working tree, so a file staged in part is judged as it will be committed. `base` and `head` are not read."""
+    if not staged:
+        for ref in (base, head):
+            if not ref or ref.startswith("-") or len(ref) > 256 or any(ch.isspace() or ord(ch) < 32 for ch in ref):
+                raise CheckDiffError(f"'{ref}' is not a git ref this check will hand to git")
     top = _git(root, "rev-parse", "--show-toplevel")
     if top.returncode != 0 or not top.stdout.strip():
         raise CheckDiffError(f"{root} is not inside a git repository ({_first_line(top.stderr) or 'git rev-parse failed'})")
     cwd = Path(top.stdout.strip())
+    sides = GIT_SIDES[bool(staged)]
 
     def commit(ref: str) -> str:
         res = _git(cwd, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
         sha = res.stdout.strip()
-        if res.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", sha):
+        if res.returncode != 0 or not GIT_SHA_RE.fullmatch(sha):
             raise CheckDiffError(f"'{ref}' is not a commit in this repository — fetch it (actions/checkout with "
                                  "fetch-depth: 0) or check the name")
         return sha
 
-    base_sha, head_sha = commit(base), commit(head)
-    mb = _git(cwd, "merge-base", base_sha, head_sha)
-    merge_base = mb.stdout.strip().splitlines()[0] if (mb.returncode == 0 and mb.stdout.strip()) else ""
-    if not merge_base:
-        raise CheckDiffError("no merge base between the base and the head — fetch the full history (actions/checkout "
-                             "with fetch-depth: 0)")
-    span = f"{base_sha}...{head_sha}"
+    born = True
+    if staged:
+        res = _git(cwd, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+        base_sha = res.stdout.strip()
+        if res.returncode != 0 or not GIT_SHA_RE.fullmatch(base_sha):
+            # no commit yet: the first commit is judged against the empty tree (its id depends on the hash function)
+            born = False
+            empty = _git(cwd, "hash-object", "-t", "tree", "--stdin", stdin="")
+            base_sha = empty.stdout.strip()
+            if empty.returncode != 0 or not GIT_SHA_RE.fullmatch(base_sha):
+                raise CheckDiffError("`git hash-object` could not name the empty tree: " + _first_line(empty.stderr))
+        head_sha = ""  # the index: `<rev>:<path>` with no rev is `:<path>`, the staged blob
+        merge_base = base_sha
+        span = ["--cached", base_sha]
+    else:
+        base_sha, head_sha = commit(base), commit(head)
+        mb = _git(cwd, "merge-base", base_sha, head_sha)
+        merge_base = mb.stdout.strip().splitlines()[0] if (mb.returncode == 0 and mb.stdout.strip()) else ""
+        if not merge_base:
+            raise CheckDiffError("no merge base between the base and the head — fetch the full history (actions/checkout "
+                                 "with fetch-depth: 0)")
+        span = [f"{base_sha}...{head_sha}"]
+    head_name = head_sha[:7] or "the index"
     plain = ["-c", "core.quotepath=off", "-c", "diff.relative=false", "diff", "--no-color", "--no-ext-diff"]
-    lines_args = ["--no-textconv", "--unified=0", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/"]
-    diff_text, total_lines, cut = _git_diff_stream(cwd, plain + lines_args + [span], CI_MAX_CHARS)
-    names = _git(cwd, *plain, "--name-status", "-z", "--find-renames", span)
+    # three lines of context (the second review of 30.09): only ADDED lines are judged; a context line only shows which statement an
+    # added line continues (`    resend \` under `RUN pip install \`, review 30.09). CI_MAX_CHARS counts the diff as
+    # fetched; CI_MAX_LINES only its added and removed lines (`_change_lines_cut`, third review of 30.09).
+    lines_args = ["--no-textconv", f"--unified={CI_CONTEXT_LINES}", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/"]
+    diff_text, total_lines, cut = _git_diff_stream(cwd, plain + lines_args + span, CI_MAX_CHARS)
+    names = _git(cwd, *plain, "--name-status", "-z", "--find-renames", *span)
     if names.returncode != 0:
         raise CheckDiffError("`git diff --name-status` failed: " + _first_line(names.stderr))
     changed = parse_name_status(names.stdout)
@@ -5638,7 +7651,7 @@ def git_inputs(root: Path, base: str, head: str = "HEAD") -> dict:
         olds = {c["path"]: c["old_path"] for c in changed if c.get("old_path")}
         spec = list(dict.fromkeys(q for p in reread for q in (p, olds.get(p, "")) if q))
         extra, extra_lines, extra_cut = _git_diff_stream(
-            cwd, ["--literal-pathspecs"] + plain + ["--text"] + lines_args + [span, "--", *spec],
+            cwd, ["--literal-pathspecs"] + plain + ["--text"] + lines_args + span + ["--", *spec],
             max(0, CI_MAX_CHARS - len(diff_text.encode("utf-8"))))
         diff_text = diff_text + ("" if not diff_text or diff_text.endswith("\n") else "\n") + extra
         total_lines += extra_lines
@@ -5658,8 +7671,8 @@ def git_inputs(root: Path, base: str, head: str = "HEAD") -> dict:
     before_cfg: dict | None = None
     head_cfg_error = ""
     if not first_install:
-        cfg = _parse_config(str(base_raw), f"{config} on the base ref ({base_sha[:7]})")
-        source = f"base {base_sha[:7]}"
+        cfg = _parse_config(str(base_raw), f"{config} {sides['on_base']} ({base_sha[:7]})")
+        source = f"{sides['base_short']} {base_sha[:7]}"
         if config in touched:
             before_raw = _git_blob(cwd, merge_base, config)
             try:
@@ -5668,22 +7681,38 @@ def git_inputs(root: Path, base: str, head: str = "HEAD") -> dict:
                 before_cfg = cfg
             head_raw = _git_blob(cwd, head_sha, config)
             if head_raw is None:  # after merge the hook reads no boundary: the same BLOCK as an unreadable config
-                head_cfg_error = f"this pull request deletes {config}"
+                head_cfg_error = f"{sides['change']} deletes {config}"
             else:
                 try:
-                    head_cfg = _parse_config(head_raw, f"{config} in this pull request ({head_sha[:7]})")
+                    head_cfg = _parse_config(head_raw, f"{config} {sides['in_change']} ({head_name})")
                 except CheckDiffError as exc:
                     head_cfg_error = str(exc)
+        if staged and head_cfg is not None:
+            # a merge commit concluded by hand (a conflict): when the staged config is the merged branch's, committed
+            # there, its boundaries judge — a lift committed on main is not refused again in every branch that merges
+            # main (review 2026-10-01). A clean merge runs no pre-commit hook at all (git runs pre-merge-commit).
+            merging = _git(cwd, "rev-parse", "--verify", "--quiet", "MERGE_HEAD^{commit}")
+            merge_sha = merging.stdout.strip()
+            if merging.returncode == 0 and GIT_SHA_RE.fullmatch(merge_sha):
+                theirs = _git_blob(cwd, merge_sha, config)
+                try:
+                    same = theirs is not None and json.loads(theirs) == json.loads(str(head_raw))
+                except ValueError:
+                    same = False
+                if same:
+                    cfg = head_cfg
+                    source = (f"the merged commit {merge_sha[:7]}: the staged config is the one committed there "
+                              f"(HEAD {base_sha[:7]} has another)")
     else:
         head_raw = _git_blob(cwd, head_sha, config)
         if head_raw is not None:
-            cfg = _parse_config(head_raw, f"{config} in this pull request ({head_sha[:7]})")
-            source = "this pull request: no config on the base ref, first install"
+            cfg = _parse_config(head_raw, f"{config} {sides['in_change']} ({head_name})")
+            source = f"{sides['change']}: no config {sides['on_base']}, first install"
         else:
-            cfg = _read_config_file(root, missing=f"no {config} on the base ref, in the head commit or in {root} — "
+            cfg = _read_config_file(root, missing=f"no {config} {sides['on_base']}, {sides['on_head']} or in {root} — "
                                                   "nothing to check against. Install the guard first (the LUMIS guard "
                                                   "ZIP, or `python lumis_guard.py init`).")
-            source = "working tree: no config on the base ref or in the head commit"
+            source = f"working tree: no config {sides['on_base']} or {sides['on_head']}"
 
     manifests: list[dict] = []
     for ch in changed:
@@ -5708,7 +7737,7 @@ def git_inputs(root: Path, base: str, head: str = "HEAD") -> dict:
         declared |= declared_names(_git_blob(cwd, base_sha, p, 400_000) or "", p)
 
     commits: list[dict] = []
-    if touched & set(GUARD_CONTRACT_FILES):
+    if touched & set(GUARD_CONTRACT_FILES) and not staged:  # a staged change has no commits of its own yet
         log = _git(cwd, "log", "--no-color", "--no-show-signature", "--format=%h%x09%an%x09%s", f"{base_sha}..{head_sha}",
                    "--", *GUARD_CONTRACT_FILES)
         for line in (log.stdout.splitlines() if log.returncode == 0 else [])[:10]:
@@ -5718,9 +7747,12 @@ def git_inputs(root: Path, base: str, head: str = "HEAD") -> dict:
     return {"cfg": cfg, "diff_text": diff_text, "changed": changed, "base_dirs": base_dirs, "manifests": manifests,
             "base_declared": frozenset(declared), "head_cfg": head_cfg, "before_cfg": before_cfg,
             "head_cfg_error": head_cfg_error, "first_install": first_install, "truncated_input": cut,
-            "total_lines": total_lines, "binary_reread": reread, "config_source": source, "input": "git",
-            "input_name": f"{base}...{head}",
-            "base": base_sha, "head": head_sha, "merge_base": merge_base, "config_commits": commits}
+            "total_lines": total_lines, "binary_reread": reread, "config_source": source,
+            "input": "staged" if staged else "git",
+            "input_name": ((f"staged changes against HEAD {base_sha[:7]}" if born else
+                            "staged changes, no commit yet (against the empty tree)") if staged else f"{base}...{head}"),
+            "base": base_sha, "head": head_sha, "merge_base": merge_base, "config_commits": commits,
+            "note": "nothing is staged: nothing to check" if (staged and not changed) else ""}
 
 
 def _text_inputs(root: Path, diff_path: str) -> dict:
@@ -5757,12 +7789,15 @@ def _write_report(target: str, text: str) -> bool:
         return False
 
 
-def _check_diff_failed(reason: str, outputs: dict, refused: set) -> int:
+def _check_diff_failed(reason: str, outputs: dict, refused: set, fmt: str = "markdown", staged: bool = False) -> int:
     """Exit 1, said plainly. The markdown and the JSON are written where they were asked for (never over a guard
     file); SARIF is not: an empty upload would close the open code-scanning alerts as if the code were fixed."""
     markdown = render_error_markdown(reason)
-    print(markdown, end="")
-    sys.stderr.write(f"LUMIS boundary check could not run: {reason}\n")
+    if fmt == "text":  # one plain statement for a terminal, on stdout like the report it replaces
+        print(render_error_text(reason, staged), end="")
+    else:
+        print(markdown, end="")
+        sys.stderr.write(f"LUMIS boundary check could not run: {reason}\n")
     data = json.dumps(render_error_json(reason), ensure_ascii=False, indent=2) + "\n"
     for key, target in outputs.items():
         if key in refused or key == "sarif":
@@ -5775,7 +7810,9 @@ def check_diff(argv: list[str]) -> int:
     """`python scripts/scope_guard.py check-diff …` — exit 0 PASS or WARN, 2 BLOCK, 1 could not run or INCOMPLETE
     (the diff was not read to its end; no SARIF then either: a partial upload would close the alerts of the unread
     part as if they were fixed). Never writes the guard's log, never records a baseline; writes nothing but the
-    reports it was asked for."""
+    reports it was asked for. The reading of the added lines stops CI_SCAN_BUDGET_SECONDS after the start: INCOMPLETE.
+    `--staged` reads the staged change against HEAD (the pre-commit check); `--format text` prints `render_text`."""
+    deadline = time.monotonic() + CI_SCAN_BUDGET_SECONDS
     opts = parse_check_diff_args(argv)
     if opts["help"] and not opts["error"]:
         print(CHECK_DIFF_USAGE)
@@ -5783,6 +7820,8 @@ def check_diff(argv: list[str]) -> int:
     root = Path(opts["root"]) if opts["root"] else project_root()
     outputs = {key: opts[key] for key in ("markdown", "sarif", "json") if opts[key]}
     refused = {key for key, target in outputs.items() if _guard_output(target, root)}
+    # the markdown report stays what check-diff prints unless a terminal format is asked for: CI is untouched
+    fmt = opts["format"] if opts["format"] in CHECK_DIFF_FORMATS else "markdown"
     try:
         if opts["error"]:
             raise CheckDiffError(opts["error"])
@@ -5791,7 +7830,12 @@ def check_diff(argv: list[str]) -> int:
                                  + ", ".join(f"--{key} {outputs[key]}" for key in sorted(refused)))
         if not root.is_dir():
             raise CheckDiffError(f"--root {root} is not a directory")
-        inputs = git_inputs(root, opts["base"], opts["head"] or "HEAD") if opts["base"] else _text_inputs(root, opts["diff"])
+        if opts["staged"]:
+            inputs = git_inputs(root, "", staged=True)
+        elif opts["base"]:
+            inputs = git_inputs(root, opts["base"], opts["head"] or "HEAD")
+        else:
+            inputs = _text_inputs(root, opts["diff"])
         cfg = inputs["cfg"]
         result = classify_diff(cfg, inputs["diff_text"], inputs["changed"], base_dirs=inputs.get("base_dirs"),
                                manifests=inputs.get("manifests"), base_declared=inputs.get("base_declared") or frozenset(),
@@ -5800,7 +7844,7 @@ def check_diff(argv: list[str]) -> int:
                                first_install=bool(inputs.get("first_install")),
                                truncated_input=bool(inputs.get("truncated_input")),
                                total_lines=int(inputs.get("total_lines") or 0),
-                               binary_reread=inputs.get("binary_reread") or ())
+                               binary_reread=inputs.get("binary_reread") or (), deadline=deadline)
         meta = report_meta(cfg, config_source=inputs["config_source"], input_kind=inputs["input"],
                            input_name=inputs["input_name"], base=inputs.get("base", ""), head=inputs.get("head", ""),
                            merge_base=inputs.get("merge_base", ""),
@@ -5811,17 +7855,594 @@ def check_diff(argv: list[str]) -> int:
         reports = {"markdown": markdown,
                    "sarif": json.dumps(render_sarif(result, cfg), ensure_ascii=False, indent=2) + "\n",
                    "json": json.dumps(render_json(result, meta), ensure_ascii=False, indent=2) + "\n"}
+        printed = markdown if fmt == "markdown" else render_text(result, meta, note=str(inputs.get("note") or ""))
     except CheckDiffError as exc:
-        return _check_diff_failed(str(exc), outputs, refused)
+        return _check_diff_failed(str(exc), outputs, refused, fmt, bool(opts["staged"]))
     except Exception as exc:  # a crash must read as "could not run", never as a verdict (a traceback exits 1 anyway)
-        return _check_diff_failed(f"internal error in check-diff ({type(exc).__name__}: {exc})", outputs, refused)
-    print(markdown, end="")
+        return _check_diff_failed(f"internal error in check-diff ({type(exc).__name__}: {exc})", outputs, refused,
+                                  fmt, bool(opts["staged"]))
+    print(printed, end="")
     code = VERDICT_EXIT.get(str(result["verdict"]), 1)
     for key, target in outputs.items():
         if key == "sarif" and code == 1:
             continue
         _write_report(target, reports[key])
     return code
+
+
+# --- the pre-commit check: the same boundaries on the staged change (hook 2026-10-01) ---------------------------------
+# A third checkpoint between the hook and the pull request: `git commit` reads the staged change with `check-diff
+# --staged` and refuses the commit on BLOCK — whoever commits, an agent in any client or a person, a GUI client too. It
+# is local: hooks are not cloned with a repository (each clone installs it once), `git commit --no-verify` skips it,
+# and the pull request check reads the diff again. A review aid, not a security boundary. The free pack ships only
+# scripts/scope_guard.py, so the hook writes the git hook itself: one constant, the same bytes from the mode and from
+# the skill's `init --pre-commit`. POSIX sh, because Git for Windows runs hooks through its own sh too; the
+# interpreter is probed (`python3` may be the Microsoft Store stub on Windows, which exists and does not run).
+PRE_COMMIT_MARKER = "# lumis-boundary-check"
+PRE_COMMIT_SCRIPT = """#!/bin/sh
+# lumis-boundary-check
+# LUMIS boundary check before each commit - written by `python scripts/scope_guard.py install-pre-commit`, removed by
+# `python scripts/scope_guard.py install-pre-commit --uninstall`. Do not edit: a reinstall writes it again.
+# It reads the staged change against .lumis/scope_guard.json as committed (HEAD) and refuses the commit on BLOCK.
+# It runs the working tree's scripts/scope_guard.py (the pull request check runs the base commit's copy).
+# A review aid, not a security boundary: it runs on this machine only, `git commit --no-verify` skips it, and the pull
+# request check reads the diff again.
+root=$(git rev-parse --show-toplevel) || exit 1
+cd "$root" || exit 1
+# the hooks folder serves every branch and worktree: one that never had the guard, or carries an older copy, is let
+# through with a note, not refused
+if [ ! -f scripts/scope_guard.py ]; then
+  if ! git cat-file -e HEAD:scripts/scope_guard.py 2>/dev/null; then
+    echo "LUMIS boundary check: this branch has no scripts/scope_guard.py - the staged change was not checked; the commit goes on." >&2
+    exit 0
+  fi
+  echo "LUMIS boundary check: scripts/scope_guard.py is in HEAD but not in the working tree, so the staged change was not checked - commit refused." >&2
+  echo "Restore the file, remove this hook ($0), or skip the check once: git commit --no-verify" >&2
+  exit 1
+fi
+if ! grep -q -e 'check-diff --staged' scripts/scope_guard.py; then
+  echo "LUMIS boundary check: this branch carries a scripts/scope_guard.py older than hook 2026-10-01 (no --staged mode) - the staged change was not checked; the commit goes on." >&2
+  exit 0
+fi
+for py in python3 python; do
+  if command -v "$py" >/dev/null 2>&1 && "$py" -c "import sys; sys.exit(sys.version_info < (3, 9))" >/dev/null 2>&1; then
+    exec "$py" -X utf8 scripts/scope_guard.py check-diff --staged --format text --root "$root"
+  fi
+done
+if command -v py >/dev/null 2>&1 && py -3 -c "import sys; sys.exit(sys.version_info < (3, 9))" >/dev/null 2>&1; then
+  exec py -3 -X utf8 scripts/scope_guard.py check-diff --staged --format text --root "$root"
+fi
+echo "LUMIS boundary check: no Python 3.9+ found (python3, python or py -3), so the staged change was not checked - commit refused." >&2
+echo "Put Python 3.9+ on PATH, or skip the check once: git commit --no-verify" >&2
+exit 1
+"""
+# what goes into a pre-commit hook that is not ours (and into husky's): the check, its exit code passed on
+PRE_COMMIT_LINE = "python3 scripts/scope_guard.py check-diff --staged --format text || exit $?"
+PRE_COMMIT_FRAMEWORK_SNIPPET = """  - repo: local
+    hooks:
+      - id: lumis-boundary-check
+        name: LUMIS boundary check
+        entry: python scripts/scope_guard.py check-diff --staged --format text
+        language: system
+        pass_filenames: false
+        always_run: true"""
+PRE_COMMIT_USAGE = """LUMIS pre-commit check — scripts/scope_guard.py install-pre-commit [--uninstall] [--root <dir>]
+  writes the git pre-commit hook (where `git rev-parse --git-path hooks` says: core.hooksPath and linked worktrees
+  included) that runs `scripts/scope_guard.py check-diff --staged --format text` before each commit and refuses the
+  commit on BLOCK, or when the check could not run. A pre-commit hook that is not ours is never overwritten: the line
+  to add to it is printed (exit 1). With the pre-commit framework (.pre-commit-config.yaml) or husky (.husky/) the
+  snippet for that tool is printed instead, nothing is written (exit 0). --uninstall removes our file and nothing else.
+Local only: hooks are not cloned with a repository (each clone installs it once; a hooks folder inside the working
+tree, `core.hooksPath .githooks`, is committed instead), `git commit --no-verify` skips it, and the pull request check
+reads the diff again. A review aid, not a security boundary."""
+
+
+def _git_top_and_hooks(root: Path) -> tuple[Path, Path] | None:
+    """(the top of the working tree, the folder git runs its hooks from) — `git rev-parse --git-path hooks` follows
+    core.hooksPath and a linked worktree's common directory. None outside a repository, or without git."""
+    try:
+        res = subprocess.run(["git", "rev-parse", "--show-toplevel", "--git-path", "hooks"], cwd=str(root),
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+    if res.returncode != 0 or len(out) < 2:
+        return None
+    top = Path(out[0])
+    hooks = Path(os.path.expanduser(out[1]))
+    if hooks.is_absolute():
+        return top, hooks
+    # a relative answer is relative to where git ran; a relative core.hooksPath is printed as configured, relative to
+    # the top of the working tree, where git runs the hooks: asked again from there when `root` is a subfolder
+    if os.path.normcase(os.path.realpath(top)) != os.path.normcase(os.path.realpath(root)):
+        return _git_top_and_hooks(top) if top.is_dir() and top != Path(root) else None
+    return top, top / hooks
+
+
+def _is_our_pre_commit(path: Path) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096).decode("utf-8", "replace")
+    except OSError:
+        return False
+    return any(line.strip() == PRE_COMMIT_MARKER for line in head.splitlines()[:10])
+
+
+def pre_commit_state(root: Path) -> tuple[str, Path | None]:
+    """("ours" | "foreign" | "absent" | "no-git", the pre-commit path git would run)."""
+    found = _git_top_and_hooks(root)
+    if found is None:
+        return "no-git", None
+    target = found[1] / "pre-commit"
+    if not os.path.lexists(target):
+        return "absent", target
+    return ("ours" if target.is_file() and _is_our_pre_commit(target) else "foreign"), target
+
+
+def _hooks_folder_is_shared(top: Path, hooks: Path) -> bool:
+    """True when git's hooks folder lies outside this repository's working tree and its git directory: a global or
+    shared core.hooksPath, which every other repository using it runs too."""
+    try:
+        res = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=str(top), capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    common = Path(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else top / ".git"
+    folder = os.path.normcase(os.path.realpath(hooks))
+    for inside in (top, common if common.is_absolute() else top / common):
+        holder = os.path.normcase(os.path.realpath(inside))
+        if folder == holder or folder.startswith(holder.rstrip("\\/") + os.sep):
+            return False
+    return True
+
+
+def install_pre_commit(root: Path, uninstall: bool = False) -> tuple[str, str]:
+    """Writes (or removes) our pre-commit hook; returns (what happened, the path). Installing: "written", "updated" (an
+    older copy of ours), "unchanged", "framework" / "husky" (that tool runs the hooks: nothing written), "foreign" (a
+    pre-commit hook that is not ours: left as it is), "subfolder" (the guard is not at the top of the working tree:
+    the path is that top), "shared" (the hooks folder is outside the repository), "no-git". Removing: "removed",
+    "absent", "kept" (not ours: left as it is), "no-git". Written as bytes, LF only, and made executable where the OS
+    has the bit."""
+    state, target = pre_commit_state(root)
+    if state == "no-git" or target is None:
+        return "no-git", ""
+    if uninstall:
+        if state != "ours":
+            return ("absent" if state == "absent" else "kept"), str(target)
+        target.unlink()
+        return "removed", str(target)
+    text = PRE_COMMIT_SCRIPT.encode("utf-8")
+    top = (_git_top_and_hooks(root) or (Path(root), Path(root)))[0]
+    # the script runs scripts/scope_guard.py from the top of the working tree: a pack in a subfolder (a monorepo app)
+    # would refuse every commit there with "not in this repository" (review 2026-10-01)
+    if not (top / "scripts" / "scope_guard.py").is_file():
+        return "subfolder", str(top)
+    # a global or shared core.hooksPath serves other repositories too: never written there
+    if _hooks_folder_is_shared(top, target.parent):
+        return "shared", str(target)
+    if state == "ours" and target.read_bytes() == text:
+        return "unchanged", str(target)
+    if state != "ours":
+        if (top / ".pre-commit-config.yaml").is_file():
+            return "framework", str(target)
+        if (top / ".husky").is_dir():
+            return "husky", str(target)
+        if state == "foreign":
+            return "foreign", str(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(text)
+    try:
+        os.chmod(target, os.stat(target).st_mode | 0o111)
+    except OSError:
+        pass  # Windows has no execute bit; Git for Windows runs the hook without one
+    return ("updated" if state == "ours" else "written"), str(target)
+
+
+def _hooks_file_in_work_tree(hook_file: Path) -> tuple[str, str] | None:
+    """(the file, its folder) relative to the top of the working tree when the hooks folder lies inside the working
+    tree (`.githooks/pre-commit`, `.githooks`); None for `.git/hooks`, a folder elsewhere, or without git."""
+    try:
+        res = subprocess.run(["git", "rev-parse", "--is-inside-work-tree", "--show-toplevel"], cwd=str(hook_file.parent),
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+        out = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if res.returncode != 0 or len(out) < 2 or out[0] != "true":
+            return None
+        rel = os.path.relpath(os.path.realpath(hook_file), os.path.realpath(out[1])).replace("\\", "/")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return None if rel.startswith("..") else (rel, rel.rsplit("/", 1)[0] if "/" in rel else ".")
+
+
+def pre_commit_report(state: str, where: str) -> tuple[int, list[str]]:
+    """The exit code and the lines `install-pre-commit` prints (the skill's `init --pre-commit` prints the same)."""
+    local = ("Local only: hooks are not cloned with a repository, so each clone runs `python scripts/scope_guard.py "
+             "install-pre-commit` once; `git commit --no-verify` skips it; the pull request check reads the diff again. "
+             "A review aid, not a security boundary.")
+    done = {"written": "installed", "updated": "updated (it was an older LUMIS copy)", "unchanged": "already installed"}
+    if state in done:
+        in_tree = _hooks_file_in_work_tree(Path(where))
+        if in_tree:  # untracked, `git clean -fd` or `git stash -u` takes it away; committed, teammates get it
+            local =(f"This hooks folder is inside the working tree: commit the file (`git add {in_tree[0]} && git "
+                     f"commit`). Teammates get it with the repository once they run `git config core.hooksPath "
+                     f"{in_tree[1]}` in their clone, and `git clean` / `git stash -u` leave a tracked file alone. "
+                     "`git commit --no-verify` skips it; the pull request check reads the diff again. A review aid, "
+                     "not a security boundary.")
+        return 0, [f"pre-commit check {done[state]}: {where} — each `git commit` here reads the staged change against "
+                   ".lumis/scope_guard.json as committed and refuses the commit on BLOCK (or when the check could not "
+                   "run).", local]
+    if state == "foreign":
+        return 1, [f"{where} already exists and is not the LUMIS check: left as it is. Add this line to it (python "
+                   "or py -3 where python3 is not the interpreter):", f"  {PRE_COMMIT_LINE}"]
+    if state == "framework":
+        return 0, ["This repository uses the pre-commit framework (.pre-commit-config.yaml): not installed by us. Add "
+                   "this under `repos:` in .pre-commit-config.yaml, then run `pre-commit install`:",
+                   PRE_COMMIT_FRAMEWORK_SNIPPET]
+    if state == "husky":
+        return 0, ["This repository uses husky (.husky/): not installed by us. Add this line to .husky/pre-commit "
+                   "(python or py -3 where python3 is not the interpreter):", f"  {PRE_COMMIT_LINE}"]
+    if state == "subfolder":
+        return 1, [f"scripts/scope_guard.py is not at the top of this repository ({where}): git runs the pre-commit "
+                   "hook from there, and the check reads scripts/scope_guard.py and .lumis/scope_guard.json there. "
+                   "Nothing was written."]
+    if state == "shared":
+        return 1, [f"{where} is outside this repository (a global or shared core.hooksPath): other repositories run "
+                   "their hooks from that folder too, so nothing was written. To use the check here, give this "
+                   "repository its own hooks folder (`git config core.hooksPath .githooks`), run install-pre-commit "
+                   "again, and commit .githooks/pre-commit."]
+    if state == "removed":
+        return 0, [f"pre-commit check removed: {where}"]
+    if state == "kept":
+        return 1, [f"{where} is not the LUMIS check: left as it is (--uninstall removes only our own file)"]
+    if state == "absent":
+        return 0, ["no LUMIS pre-commit check is installed here: nothing to remove"]
+    return 1, ["not inside a git repository (or git was not found): nothing was written. Run it in the repository."]
+
+
+def pre_commit_command(argv: list[str]) -> int:
+    """`python scripts/scope_guard.py install-pre-commit [--uninstall] [--root <dir>]`."""
+    args = [str(a) for a in (argv or [])]
+    if any(a in ("--help", "-h", "help") for a in args):
+        print(PRE_COMMIT_USAGE)
+        return 0
+    root, uninstall, i = project_root(), False, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--uninstall":
+            uninstall, i = True, i + 1
+        elif a == "--root" and i + 1 < len(args):
+            root, i = Path(args[i + 1]), i + 2
+        elif a.startswith("--root="):
+            root, i = Path(a.split("=", 1)[1]), i + 1
+        else:
+            print(f"unknown argument {a}\n{PRE_COMMIT_USAGE}", file=sys.stderr)
+            return 1
+    code, lines = pre_commit_report(*install_pre_commit(root, uninstall=uninstall))
+    for line in lines:
+        print(line)
+    return code
+
+
+def pre_commit_doctor_line(root: Path) -> str:
+    """One line for `doctor`: installed / not installed / another hook is in the way."""
+    state, target = pre_commit_state(root)
+    if state == "ours":
+        stale = target is not None and target.read_bytes() != PRE_COMMIT_SCRIPT.encode("utf-8")
+        return (f"  ✓ pre-commit check installed ({target})"
+                + (" — an older LUMIS copy: `python scripts/scope_guard.py install-pre-commit` updates it" if stale else ""))
+    if state == "foreign":
+        return (f"  – pre-commit check not installed: another pre-commit hook is in the way ({target}); "
+                "`python scripts/scope_guard.py install-pre-commit` prints the line to add to it")
+    if state == "absent":
+        return ("  – pre-commit check not installed (optional, local: `python scripts/scope_guard.py install-pre-commit`)")
+    return "  – pre-commit check: not a git repository here (or git was not found)"
+
+
+# The pre-tool hook guards the pre-commit check it installed against an agent that DRIFTS, not an adversary: the
+# pull request check is the server-side one, and this is a review aid, not a security boundary. Only where OUR
+# pre-commit is installed (`installed_pre_commit`); everywhere else every call is judged exactly as before.
+# It holds the plain spellings of a commit past the check for the founder (ask, never `classes`): `git commit
+# --no-verify` / `-n` (also inside `-anm`), `git -c core.hooksPath=… commit` and `--config-env core.hooksPath=…`, a
+# `git commit` in a command that sets a GIT_CONFIG_* variable, a `git config` write of core.hooksPath (set or unset,
+# any scope), `git commit-tree`, and a write to this repository's own `.git/config` or `config.worktree`. It refuses as
+# `tamper` a direct delete, move, overwrite or chmod of our file named by its path, or of the folder that holds it;
+# `install-pre-commit --uninstall` names the hook script, so it is refused like every other founder-only word.
+# Not seen, on purpose (docs/BOUNDARY_CHECK_CI.md, "Limits"): config includes, HOME / XDG_CONFIG_HOME pointing git at
+# another config, a script writing git's config, a glob or variable that hides the name, aliases, other plumbing,
+# `git clean` / `git stash -u` of an untracked hooks folder in the working tree. `doctor` shows whether the check is
+# in place, and the pull request check reads the diff whatever happened locally.
+_HOOKS_MENTION_RE = re.compile(r"pre-commit|hook|\.git(?![\w.\-])", re.I)
+_COMMIT_MENTION_RE = re.compile(r"\bcommit\b|hookspath|\.git[\\/]config\b|config\.worktree\b", re.I)
+# a GIT_CONFIG_* variable set in the command (`X=… git`, `export`, `env`, PowerShell's `$env:`): it adds config git
+# reads before the repository's own, core.hooksPath included
+_GIT_CONFIG_ENV_RE = re.compile(r"(?<![\w-])GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM)\s*=", re.I)
+# commands that write only their last argument: `cp -r .git/hooks /tmp/backup` reads the hooks folder
+DESTINATION_LAST = {"cp", "copy", "copy-item", "cpi", "install", "rsync", "scp"}
+GIT_COMMIT_VALUE_SHORT = "mFcCt"   # `-m <msg>`, `-F <file>`, `-c|-C <commit>`, `-t <file>`: the rest is the value
+GIT_COMMIT_OPTIONAL_SHORT = "Su"   # `-S[<keyid>]`, `-u[<mode>]`: what follows in the same word is their value
+GIT_COMMIT_VALUE_LONG = ("--message", "--file", "--author", "--date", "--template", "--cleanup", "--fixup", "--squash",
+                         "--reuse-message", "--reedit-message", "--trailer", "--pathspec-from-file")
+PRE_COMMIT_SKIP_REASONS = {
+    "git commit --no-verify": "this commits past the LUMIS pre-commit check: the staged change is not read against the "
+                              "boundaries",
+    "git -c core.hooksPath commit": "this commit runs its hooks from another folder: the LUMIS pre-commit check does not run",
+    "git config core.hooksPath": "this changes where git looks for hooks: the LUMIS pre-commit check may stop running",
+    "git commit with GIT_CONFIG_*": "this commit runs with config set through GIT_CONFIG_* variables, which can move "
+                                    "its hooks to another folder: the LUMIS pre-commit check may not run",
+    "git commit-tree": "this writes a commit without `git commit`: no pre-commit hook runs, the LUMIS check included",
+    "write to git's config file": "this writes this repository's own git config file directly, where core.hooksPath "
+                                  "can move the hooks away from the LUMIS pre-commit check",
+}
+
+
+def installed_pre_commit(root: Path | None = None) -> Path | None:
+    """Our pre-commit file where it is installed for `root` (default: the project), else None. It runs git, so the
+    callers ask only when the call could concern it."""
+    scan_checkpoint()
+    try:
+        state, target = pre_commit_state(root or project_root())
+    except Exception:
+        return None
+    return target if state == "ours" else None
+
+
+def _as_absolute(token: str, base: str) -> str:
+    """A cleaned path (`_clean_path`) made absolute against `base` (cleaned too); Git Bash's `/c/…` is `c:/…`."""
+    t = str(token or "")
+    if os.name == "nt" and re.match(r"^/[a-z](?:/|$)", t):
+        t = t[1] + ":" + (t[2:] or "/")
+    if re.match(r"^[a-z]:/", t) or t.startswith("/"):
+        return t
+    if t.startswith("~/"):
+        return _clean_path(os.path.expanduser("~") + t[1:])
+    return _clean_path(base + "/" + t)
+
+
+def _archive_only_reads(exe: str, raw_args: list[str]) -> bool:
+    """`tar czf x.tgz .git`, `zip -r x.zip .git`, `7z a x.7z .git`: an archiver creating an archive reads its inputs."""
+    if exe == "zip":
+        return True
+    if exe in ("7z", "7za"):
+        return raw_args[:1] == ["a"]
+    # tar's mode comes first: `czf`, `-czf`, `--create`
+    return exe == "tar" and bool(raw_args) and bool(re.fullmatch(r"--create|-?[A-Za-z]*c[A-Za-z]*", raw_args[0]))
+
+
+def pre_commit_tamper(command: str = "", paths: list[str] | tuple = ()) -> list[str]:
+    """`["<path> (the LUMIS pre-commit check)"]` when a file tool's paths name our pre-commit file, or a shell command
+    names it by its path (or a glob that matches it) to delete, move, overwrite or chmod it — or removes or moves the
+    folder that holds it — else []. A copy or a move writes only its last argument; an archiver creating an archive and
+    a git command other than rm/mv/checkout/restore/clean/reset only read. Reading never reaches here (check_tamper
+    returns before)."""
+    if not _HOOKS_MENTION_RE.search(str(command or "") + "\n" + "\n".join(str(p) for p in paths)):
+        return []
+    root = project_root()
+    hook = installed_pre_commit(root)
+    if hook is None:
+        return []
+    real = os.path.realpath(hook)
+    base = _clean_path(os.path.realpath(root))
+    target = _clean_path(real)
+    try:
+        rel = os.path.relpath(real, os.path.realpath(root)).replace("\\", "/")
+    except ValueError:  # another drive on Windows
+        rel = ""
+    label = f"{rel if rel and not rel.startswith('..') else real} (the LUMIS pre-commit check)"
+    holders = {_clean_path(os.path.dirname(real))}
+    git_dir = os.path.dirname(os.path.dirname(real))
+    if os.path.basename(os.path.dirname(real)).lower() == "hooks" and _clean_path(git_dir) != base:
+        holders.add(_clean_path(git_dir))  # `.git` itself; never the project root (`cp -r . backup` is no rewrite)
+
+    def reaches(raw: str, folder_too: bool) -> bool:
+        raw = re.sub(r"^\d*>+", "", raw)  # `echo x >.git/hooks/pre-commit`: the redirect glued to its target
+        if not raw:
+            return False
+        p = _as_absolute(_clean_path(raw), base)
+        if p == target or (folder_too and p in holders):
+            return True
+        if any(ch in p for ch in GLOB_CHARS):  # `rm .git/hooks/*`, `rm .git/hooks/pre-comm?t` (review 2026-10-01)
+            return _glob_matches(target, p) or (folder_too and any(_glob_matches(h, p) for h in holders))
+        try:
+            candidate = raw if os.path.isabs(raw) else os.path.join(str(root), raw)
+            return os.path.lexists(candidate) and _clean_path(os.path.realpath(candidate)) == target
+        except (OSError, ValueError):
+            return False
+
+    for raw in paths:
+        if raw and reaches(str(raw), False):
+            return [label]
+    if command:
+        # `(cd .git/hooks && rm -f pre-commit)`: the subshell's parentheses off, its `cd` applies like any other
+        text = re.sub(r"(?<![$\w])\(|\)(?=\s*(?:$|[;&|\n]))", " ", command)
+        raw_segments = [[w.strip("'\"`") for w in s.split()] for s in SEGMENT_SPLIT.split(text) if s.strip()]
+        raw_segments = [w for w in raw_segments if _exe_name(w[0]) != "cd"]  # command_segments drops `cd` too
+        for (exe, args, _prefix), raw in zip(command_segments(text), raw_segments):
+            if exe == "find":
+                if _find_reaches_pre_commit(raw[1:], base, target):
+                    return [label]
+                continue
+            if _archive_only_reads(exe, raw[1:]) or (exe == "git" and not any(a in GIT_MUTATORS for a in args[:2])):
+                continue
+            if any(reaches(a, exe in DIR_MUTATORS) for a in (args[-1:] if exe in DESTINATION_LAST else args)):
+                return [label]
+        if PRE_COMMIT_BY_VARIABLE.search(command):
+            return [f"{label} (named in the command text)"]
+    return []
+
+
+# `rm $(git rev-parse --git-path hooks)/pre-commit`, `H=.git/hooks; rm $H/pre-commit`, `rm -rf "$(git rev-parse
+# --git-dir)/hooks"`: the hook file spelled through a substitution or a variable, which no path comparison resolves
+# (review 2026-10-01). Both spellings count only in a segment that runs a remover, a mover or chmod:
+# `$BIN/pre-commit run --all-files` is the pre-commit framework's own program. A command that is only a look never
+# reaches here (check_tamper returns before).
+PRE_COMMIT_BY_VARIABLE = re.compile(
+    r"\b(?:rm|rmdir|mv|chmod|unlink|remove-item|ri|del|rd)\b[^;&|\n]*(?:"
+    r"\$(?:\{?\w+\}?|\([^)]*\))[\"']?/(?:hooks/)?pre-commit(?![\w.\-])"
+    r"|\$\(\s*git\s+rev-parse[^)]*"
+    r"(?:--git-path\s+[\"']?hooks|--git-dir|--git-common-dir)[^)]*\)[\"']?(?:/hooks)?/?[\"']?(?:\s|$))",
+    re.I)
+
+
+def _find_reaches_pre_commit(args: list[str], base: str, target: str) -> bool:
+    """`find .git/hooks -delete`, `find .git -name pre-commit -delete`, `find . -exec rm {} +`: a find whose start
+    holds the hook file, whose name filter (if any) can match it, and whose action rewrites. `find . -name '*.pyc'
+    -delete` does not reach it."""
+    low = [a.lower() for a in args]
+    mutating = "-delete" in low or any(a in ("-exec", "-execdir", "-ok", "-okdir") and i + 1 < len(low)
+                                       and low[i + 1].rsplit("/", 1)[-1] in FIND_MUTATORS for i, a in enumerate(low))
+    if not mutating:
+        return False
+    starts = low[: next((i for i, a in enumerate(low) if a.startswith("-")), len(low))] or ["."]
+    names = [low[i + 1] for i, a in enumerate(low) if a in ("-name", "-iname") and i + 1 < len(low)]
+    paths = [low[i + 1] for i, a in enumerate(low) if a in ("-path", "-ipath", "-wholename") and i + 1 < len(low)]
+    for start in starts:
+        st = _as_absolute(_clean_path(start), base).rstrip("/")
+        if not (target == st or target.startswith(st + "/")):
+            continue
+        shown = start.rstrip("/") + target[len(st):]  # the path as find prints it: `.git/hooks/pre-commit`
+        if not names and not paths:
+            return True
+        if any(fnmatch.fnmatchcase(target.rsplit("/", 1)[-1], n) for n in names) \
+                or any(fnmatch.fnmatchcase(shown, p) for p in paths):
+            return True
+    return False
+
+
+def _commit_skips_verify(after: list[str]) -> bool:
+    """`git commit` arguments that skip the pre-commit hook: `--no-verify` (or an abbreviation git accepts), `-n`,
+    also inside a cluster (`-nm`, `-anm "msg"`). A value is not a flag: `-m "-n"`, `-m -n`, `--message=-n`, `-mn`
+    (the message "n"); `--no-edit` is another option; nothing after `--` is an option."""
+    i = 0
+    while i < len(after):
+        a = after[i]
+        i += 1
+        if a == "--":
+            return False
+        if a.startswith("--"):
+            name = a.split("=", 1)[0].lower()
+            if len(name) >= len("--no-veri") and "--no-verify".startswith(name):
+                return True
+            if "=" not in a and len(name) > 3 and any(v.startswith(name) for v in GIT_COMMIT_VALUE_LONG):
+                i += 1  # the value is the next word
+            continue
+        if a.startswith("-") and len(a) > 1:
+            cluster = a[1:]
+            for j, ch in enumerate(cluster):
+                if ch == "n":
+                    return True
+                if ch in GIT_COMMIT_VALUE_SHORT:
+                    if j == len(cluster) - 1:
+                        i += 1  # `-m <msg>`: the next word is the value
+                    break
+                if ch in GIT_COMMIT_OPTIONAL_SHORT:
+                    break
+    return False
+
+
+def _config_env_hooks_path(args: list[str]) -> bool:
+    """`git --config-env=core.hooksPath=VAR …` / `git --config-env core.hooksPath=VAR …`: the `-c` setting with its
+    value read from a variable."""
+    for i, a in enumerate(args):
+        if not a.startswith("-"):
+            return False
+        value = a.split("=", 1)[1] if a.lower().startswith("--config-env=") else (
+            args[i + 1] if a.lower() == "--config-env" and i + 1 < len(args) else "")
+        if value.split("=", 1)[0].lower() == "core.hookspath":
+            return True
+    return False
+
+
+def _git_config_candidates(words: list[str]) -> list[str]:
+    """The words that could be a git config file by their name (`config`, `config.worktree`), a glued redirect off."""
+    out = []
+    for w in words:
+        p = re.sub(r"^\d*>+", "", str(w or "").strip().strip("'\"`"))
+        if p.replace("\\", "/").rsplit("/", 1)[-1].lower() in ("config", "config.worktree"):
+            out.append(p)
+    return out
+
+
+def _is_own_git_config(paths: list[str]) -> bool:
+    """True when one of `paths` (relative ones against the project) is THIS repository's own config or
+    `config.worktree` as `git rev-parse --git-path` names them (the common git dir's config, a linked worktree's own
+    config.worktree) — resolved and case-normalised. Not ~/.gitconfig, a fixture named `.gitconfig`, another tree's
+    `.git/config`."""
+    if not paths:
+        return False
+    root = project_root()
+    try:
+        res = subprocess.run(["git", "rev-parse", "--git-path", "config", "--git-path", "config.worktree"],
+                             cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+        norm = lambda p: os.path.normcase(os.path.realpath(root / os.path.expanduser(p.strip())))
+        own = {norm(line) for line in res.stdout.splitlines() if line.strip()} if res.returncode == 0 else set()
+        return any(norm(p) in own for p in paths)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def pre_commit_skips(tool_name: str, tool_input: dict) -> list[str]:
+    """What in a call steps around OUR pre-commit check, where it is installed — the plain spellings only: "git
+    commit --no-verify", "git -c core.hooksPath commit" (`--config-env` too), "git commit with GIT_CONFIG_*", "git
+    config core.hooksPath" (any write of that key), "git commit-tree", "write to git's config file" (this repository's
+    own, by a shell command or a file tool). [] for any other call, and wherever ours is not installed — the git
+    question (`installed_pre_commit`) is asked only when the call has such a step."""
+    tool_input = tool_input or {}
+    if not is_command(tool_name, tool_input):
+        if is_read_only_tool(tool_name, tool_input):
+            return []
+        targets = [p for p in [text_of_tool_input(tool_name, tool_input)[1]] + destination_paths(tool_name, tool_input) if p]
+        named = _git_config_candidates(targets)
+        if named and installed_pre_commit() is not None and _is_own_git_config(named):
+            return ["write to git's config file"]
+        return []
+    command = str(tool_input.get("command", ""))
+    if not _COMMIT_MENTION_RE.search(command) or is_read_only_command(command):
+        return []
+    # a commit message and a heredoc body are data; the `-m ""` left in their place keeps a word, so `-m` does not
+    # take the next flag as its value
+    text = re.sub(r"(?<=\s)(?:\"\"|'')(?=\s|$)", "_", _command_without_data(command, files_too=True))
+    env_config = bool(_GIT_CONFIG_ENV_RE.search(text))
+    found: list[str] = []
+    config_words: list[str] = []  # what a non-git command writes: `>> .git/config`, `sed -i … .git/config`, `cp x …`
+    for tokens in _command_words(text):
+        if tokens[:1] == ["&"]:
+            tokens = tokens[1:]  # PowerShell's call operator: `& git commit -n`
+        # `$(git commit-tree …)` inside another git command is one word list with the substitution's words in it
+        if any(t.lower() == "commit-tree" and _exe_name(prev.lstrip("$(")) == "git" for prev, t in zip(tokens, tokens[1:])):
+            if "git commit-tree" not in found:
+                found.append("git commit-tree")
+        if not tokens:
+            continue
+        exe = _exe_name(tokens[0])
+        if exe != "git":
+            # a copy or a move writes only its last word: `cp .git/config /tmp/x` reads it
+            config_words += _git_config_candidates(tokens[-1:] if exe in DESTINATION_LAST | {"mv", "move", "move-item", "mi"}
+                                                   else tokens[1:])
+            continue
+        sub, after, settings = _git_subcommand(tokens[1:])
+        hit = ""
+        if sub == "commit" and _commit_skips_verify(after):
+            hit = "git commit --no-verify"
+        elif sub == "commit" and (any(s.split("=", 1)[0].lower() == "core.hookspath" for s in settings)
+                                  or _config_env_hooks_path(tokens[1:])):
+            hit = "git -c core.hooksPath commit"
+        elif sub == "commit" and env_config:
+            hit = "git commit with GIT_CONFIG_*"
+        elif sub == "commit-tree":
+            hit = "git commit-tree"
+        elif sub == "config" and git_config_writes(after) and _git_config_key(after).lower() == "core.hookspath":
+            hit = "git config core.hooksPath"  # set or unset, any scope, any value: a rare extra ask, never a wrong pass
+        if hit and hit not in found:
+            found.append(hit)
+    if not (found or config_words) or installed_pre_commit() is None:
+        return []
+    if _is_own_git_config(config_words):
+        found.append("write to git's config file")
+    return found
+
+
+def pre_commit_skip_reason(what: str) -> str:
+    return (f"pre-commit '{what}' — " + PRE_COMMIT_SKIP_REASONS.get(what, "this steps around the LUMIS pre-commit check")
+            + "; skipping it is the founder's decision, not the agent's")
 
 
 def parse_args(argv: list[str]) -> tuple[str, str]:
@@ -5847,11 +8468,32 @@ USAGE = """LUMIS Scope Guard — scripts/scope_guard.py <mode>
   observe on|off    founder only, from the founder's own terminal: record without refusing
   write-manifest    founder only: re-baseline the guard files after an Amend or a deliberate edit
   rebuild-markers   founder only: re-derive the markers from the boundaries ([--dry-run])
-  check-diff        the same boundaries on a diff (CI): --base <ref> [--head <ref>] | --diff <file> | stdin; exit 2 = BLOCK
+  check-diff        the same boundaries on a diff (CI): --base <ref> [--head <ref>] | --diff <file> | stdin; exit 2 = BLOCK;
+                    --staged: the staged change against HEAD (the pre-commit check); --format text for a terminal
+  install-pre-commit  founder only: write the git pre-commit hook that runs check-diff --staged ([--uninstall])
   pre-tool, prompt  run by the client's hooks, never by hand"""
 
 
+def refuse_unfinished(cfg: dict, agent: str, tool_name: str, tool_input: dict) -> int:
+    """The call whose reading ran past SCAN_BUDGET_SECONDS: refused (exit 2) and logged as `timeout` — a guard that
+    cannot finish must not pass what it did not read. In observe mode it is recorded and let through, like every
+    other refusal there."""
+    read, total = _SCAN["read"], _SCAN["total"]
+    message = (f"⛔ LUMIS Scope Guard could not finish reading this change within {SCAN_BUDGET_SECONDS:g} s ({read} lines "
+               f"read of {total}): refused, not passed. Split the change, or run the guard on the file directly.")
+    attempted = text_of_tool_input(tool_name, tool_input)[0] or str((tool_input or {}).get("command", ""))
+    reason = [f"not read within {SCAN_BUDGET_SECONDS:g} s ({read} of {total} lines)"]
+    if guard_mode(cfg) == "observe":
+        sys.stderr.write("👁 OBSERVE (nothing blocked): would have refused this — " + message + "\n")
+        log_event(cfg, "timeout", tool_name, tool_input, reason, agent, attempted=attempted, observed=True)
+        return 1
+    emit_denial(agent, message)
+    log_event(cfg, "timeout", tool_name, tool_input, reason, agent, attempted=attempted)
+    return 2
+
+
 def main() -> int:
+    started = time.monotonic()  # the budget counts from here (`start_scan_budget`)
     mode, agent = parse_args(sys.argv)
     cfg = load_config()
     if mode in ("--help", "-h", "help"):
@@ -5859,6 +8501,8 @@ def main() -> int:
         return 0
     if mode == "check-diff":  # CI and a read-only look: no log line, no baseline, nothing written but the named reports
         return check_diff(sys.argv[2:])
+    if mode == "install-pre-commit":  # the founder's, from their own terminal; the hook refuses it to the agent (tamper)
+        return pre_commit_command(sys.argv[2:])
     if mode == "report":
         return report(cfg)
     if mode == "request":
@@ -5897,7 +8541,7 @@ def main() -> int:
         # it" on any hit, a lone word included, and the founder's agent refused ordinary work because a word of a
         # Non-Goal sentence was in the request (2026-09-23). Only what names the boundary itself counts here: a
         # forbidden package, a forbidden path, a multi-word phrase. The hook still refuses the tool call that crosses.
-        asked = match_triggers(cfg, prompt, kinds=("package", "path", "phrase"))
+        asked = match_triggers(cfg, prompt, kinds=("package", "path", "phrase"), prose=True)
         if asked:
             print(
                 "🔎 LUMIS Scope Guard: this request mentions a boundary from CONSTITUTION.md — "
@@ -5916,6 +8560,21 @@ def main() -> int:
             )
             log_event(cfg, "drift", "prompt", {}, [f"drift phrase '{p}'" for p in phrases[:4]], agent, attempted=prompt)
         return 0
+    start_scan_budget(SCAN_BUDGET_SECONDS, started)
+    try:
+        code = pre_tool(cfg, agent, tool_name, tool_input)
+        if code != 2:
+            scan_checkpoint()  # the parts no reader watches (the classes, the warnings) count against the budget too
+        return code
+    except ScanBudgetExceeded:
+        return refuse_unfinished(cfg, agent, tool_name, tool_input)
+    finally:
+        stop_scan_budget()
+
+
+def pre_tool(cfg: dict, agent: str, tool_name: str, tool_input: dict) -> int:
+    """The verdict on one tool call (`main`, pre-tool mode): the exit code, with the refusal, the question or the
+    warnings written. Reads under the clock `main` armed: a reading past the budget raises ScanBudgetExceeded."""
     command = str((tool_input or {}).get("command", ""))
     attempted_text, tool_path = text_of_tool_input(tool_name, tool_input)
     # the two exemptions a block already has: looking is not doing, and writing a boundary down is inside it.
@@ -5936,6 +8595,14 @@ def main() -> int:
             + ". A single word out of a Non-Goal sentence, or a word found only inside another tool's option or a "
               "library's module name, is a hint, not proof: if this really is the feature the founder ruled out, stop and ask; "
               "if it is ordinary work, carry on — nothing is blocked.")
+    # what the reading left unread for packages (a text past 1 MB, the file around an Edit past 1 MB, the edits past
+    # the cap): a possible match with its reason — a WARN, never a pass in silence (third review of 30.09)
+    unread = [] if (looking or documenting) else unread_lines(judged)
+    if unread:
+        warnings.append("🔎 LUMIS Scope Guard — possible match, for you to judge: part of this change was not read for "
+                        "packages (" + "; ".join(judged.get("unread") or []) + "). A forbidden package named there "
+                        "would not be seen: check that part yourself, or split the change. Nothing is blocked.")
+    possible = marker_hits + unread
     design_hits = check_design(cfg, tool_name, tool_input)
     if design_hits:
         warnings.append(
@@ -5953,10 +8620,16 @@ def main() -> int:
         )
     tampered, touched_rules = check_tamper(tool_name, tool_input)
     if tampered:  # refusing the write is a mechanism; telling the agent not to touch the guard is only a promise
+        # the git pre-commit file is not written by Amend: its own tail names who writes it (review 2026-10-01)
+        only_pre_commit = all("(the LUMIS pre-commit check)" in t for t in tampered)
         emit_denial(agent,
                     "⛔ LUMIS Scope Guard blocked a change to the guard itself: " + ", ".join(tampered)
-                    + ". The boundaries are lifted by the founder through LUMIS Amend, which regenerates these files together — "
-                    "not by editing the hook, its config or the constitution. Ask the founder instead of working around it.")
+                    + (". That file is written by the founder with `python scripts/scope_guard.py install-pre-commit` "
+                       "and removed with its `--uninstall`, from the founder's own terminal — not by the agent. "
+                       if only_pre_commit else
+                       ". The boundaries are lifted by the founder through LUMIS Amend, which regenerates these files "
+                       "together — not by editing the hook, its config or the constitution. ")
+                    + "Ask the founder instead of working around it.")
         log_event(cfg, "tamper", tool_name, tool_input, [f"write to {f}" for f in tampered], agent, attempted=attempted_text or command)
         return 2
     leaks = secret_leaks(attempted_text or command, tool_path)
@@ -6022,10 +8695,13 @@ def main() -> int:
         log_event(cfg, "blocked", tool_name, tool_input, hits, agent, attempted=attempted_text)
         return 2
     active = [(c, w) for c, w in check_classes(cfg, tool_name, tool_input) if class_verdict(cfg, c) != "allow"]
-    if active:
+    # a commit that steps around the LUMIS pre-commit check (`--no-verify`, `-n`, another hooks folder) where it is
+    # installed: held for the founder like a class set to `ask`, whatever `classes` says (hook 2026-10-01)
+    skips = pre_commit_skips(tool_name, tool_input)
+    if active or skips:
         blocking = any(class_verdict(cfg, c) == "block" for c, _w in active)
-        message = class_message(active, blocking)
-        labels = [f"{c} '{w}'" for c, w in active]
+        message = class_message(active, blocking, skips)
+        labels = [f"{c} '{w}'" for c, w in active] + [f"pre-commit '{s}'" for s in skips]
         # "asked" is taken — it is the prompt hook's event — so a call handed to the founder is `held`
         event = "blocked" if blocking else "held"
         if observing:
@@ -6039,15 +8715,16 @@ def main() -> int:
             return 2
         return emit_ask(agent, message)
     if noted:
-        if in_notes and marker_hits:  # a possible match on a line of the same Write is its own record (2026-09-29)
-            log_event(cfg, "possible", tool_name, tool_input, marker_hits, agent, attempted=attempted_text)
+        if (in_notes and marker_hits) or unread:  # a possible match on a line of the same Write is its own record
+            log_event(cfg, "possible", tool_name, tool_input, (marker_hits if in_notes else []) + unread, agent,
+                      attempted=attempted_text)
         return 1  # otherwise the `noted` line is the record; a documented boundary adds no warned/possible lines
     if design_hits or arch_hits:
         log_event(cfg, "warned", tool_name, tool_input, design_hits + arch_hits, agent, attempted=attempted_text)
-    if marker_hits:
+    if possible:
         # its own event: `warned` is the visual contract and the architecture, `possible` is a boundary word that
         # may or may not mean anything. The Amend question "lift or keep?" must not be argued by a maybe.
-        log_event(cfg, "possible", tool_name, tool_input, marker_hits, agent, attempted=attempted_text)
+        log_event(cfg, "possible", tool_name, tool_input, possible, agent, attempted=attempted_text)
     return 1 if warnings else 0  # 1 = non-blocking: the warning is shown, the change proceeds
 
 

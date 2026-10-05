@@ -18,15 +18,20 @@ Prompts alone do not hold; this installs hooks that block the change before it h
   (`.github/hooks/lumis-scope-guard.json`) — all of them deny on exit code 2, so one script guards every agent — copies `scripts/scope_guard.py`,
   writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and marked sections in `.cursorrules` and `CLAUDE.md` (existing content is kept).
   Add `--observe` to install in observe mode (below). The output names the hook version, the mode and the classes:
-  `Hook 2026-09-29 · mode: enforce · classes: ...`.
+  `Hook 2026-10-01 · mode: enforce · classes: ...`.
   Add `--ci` to also write `.github/workflows/lumis-boundary-check.yml`, the same boundaries checked on every pull request
   (see "CI check" below). A different file already at that path is never overwritten: the LUMIS copy goes to
   `.github/lumis-boundary-check.lumis.yml` and the output says so. Without `--ci` the output says how to add it.
+  Add `--pre-commit` (or run `python scripts/scope_guard.py install-pre-commit` yourself) for the same check on the staged
+  change before each commit: local only — each clone installs it once, `git commit --no-verify` skips it, the pull request
+  check is the server-side one; a pre-commit hook that is not LUMIS's is never overwritten (the line to add is printed).
 - `/lumis-scope-guard check-diff` — run `python scripts/scope_guard.py check-diff --base <target branch>` from the repository
   and report the verdict and each finding it prints. Read-only: it reads git and prints; do not add `--markdown`, `--sarif` or
   `--json` (writing a file with the hook's command is refused to the agent).
 - `/lumis-scope-guard check <plan or diff>` — run `python <skill-dir>/scripts/lumis_guard.py check --text "<text>" --root <repo root>`
   and report every Non-Goal trigger and drift phrase it prints. Exit code 1 means a violation: do not proceed, ask the founder.
+  A plan is read as prose (a package named in a sentence counts, as in a request); a unified diff is read as code, each added
+  line in its file's language, as the pull request check reads it.
 - `/lumis-scope-guard doctor` — run `python <skill-dir>/scripts/scope_guard.py doctor --root <repo root>` (or `python scripts/scope_guard.py doctor`
   from the repository): checks that the hook script, `.lumis/scope_guard.json` and each agent's config are present and valid, and that the
   interpreter they call is on PATH. It checks the wiring only — whether your client actually honours the hook is proven by the self-test below.
@@ -60,6 +65,25 @@ carries it), a word found only inside another tool's command-line option in a sh
 (`--frozen-lockfile`; never in your own source, never for a technology the Non-Goal names: `--stripe-key` is refused), and a word
 found only in the import of a standard library module spelling another form of it (`from collections import`; your own
 `from app.billings import` is refused). The pull request check (below) reads each added line with the same function.
+
+A forbidden package is the whole name a line brings in (since hook 2026-09-30), never a word that starts with it: the
+specifier of a JS/TS import or `require` (`'expo'`, `'expo/config'`, `'@stripe/stripe-js'` for `stripe`; a local `./x` or
+`@/x` never), the top-level module of a Python import (`from stripe import …`, `import paypal_checkout` for
+`paypal-checkout`), the vendor's part of a Java/Kotlin/C#/Rust/PHP/Go/Ruby import (`com.stripe.Stripe`, `using Stripe;`,
+`use stripe::Client`; not `javax.xml.ws`, `use crate::ws` or your own `com.acme.api.ws`), the name a manifest line declares,
+the package an install command installs or runs (`pip install stripe`, `npx expo start`, `RUN ["pip", "install", "x"]`,
+`echo 'x==1' >> requirements.txt`, `pnpm --filter web add ws`, `docker compose exec api pip install x`, `\t@pip install x`
+in a Makefile, `$PIP install x`), and the package a forbidden stack's own config names (`"expo"` in `app.json`, a
+pubspec's `flutter:`, `<PackageReference Include="Stripe.net">`, `"npm:resend@2"` in `deno.json`). A statement over
+several lines (`RUN pip install \`, `require(` … `)`, `import { Resend }` … `from 'resend'`) is read as one; a line an
+Edit adds inside a statement the file already has (`    resend \` under `RUN pip install \`) is read with the file
+around it, and the pull request check reads it with the diff's context lines. So `import exportCsv from './exportCsv'`, `require('export-to-csv')`, `import export_utils` and `ws = wb.active` in
+code are not the packages `expo` and `ws`, and `npm install export-to-csv` is a new dependency like any other (held,
+`ask`). Families are named, not guessed: `deny_package_prefixes` (`expo-`, `@expo/`, `react-native-`, `@react-native/`
+for native mobile apps) refuses the npm packages `expo-notifications` and `react-native-maps`; `ws-client` is another
+package, and so is a PyPI `expo-helpers`. A config written before 2026-09-30 gets the families with `rebuild-markers`,
+and the packages the lexicon gained since its `hook_version` (`flask-mail`, `python-socketio`, …) — added to what it
+lists, never one under `allowed_markers` (`doctor` says so).
 
 `<skill-dir>` is the directory this SKILL.md lives in (for Claude Code: `.claude/skills/lumis-scope-guard` or `~/.claude/skills/lumis-scope-guard`).
 
@@ -180,7 +204,7 @@ is written), the file and line, the trigger and the line itself. No score and no
   added or reworded, which other key changed (`stack`, `architecture.top_level`, `log`…), in which commit, by whom, and the
   config's `revision` (`amend #n`). That is how a lift by LUMIS Amend arrives.
 - **Exit 1** means the check could not run (no config, no git, a ref that is not there), or the verdict is INCOMPLETE: the diff
-  is larger than the check reads (50 000 lines or 5 MB) and the part read holds no BLOCK. The report says so and never reads as
+  is larger than the check reads (50 000 added and removed lines, 5 MB, or 60 s of reading) and the part read holds no BLOCK. The report says so and never reads as
   a PASS.
 
 `init --ci` (and both LUMIS ZIPs) install the workflow `.github/workflows/lumis-boundary-check.yml`: on every pull request it
@@ -201,13 +225,23 @@ It is a review aid, not a security boundary. The spec is `docs/BOUNDARY_CHECK_CI
 
 ## Hook version
 
-The hook carries its release date (`HOOK_VERSION`, now `2026-09-29`) and the config records the version it was written for
+The hook carries its release date (`HOOK_VERSION`, now `2026-10-01`) and the config records the version it was written for
 (`hook_version`). `doctor` compares them. A config newer than the hook is a problem — `the hook in scripts/ is older than the
 config (…): copy scripts/scope_guard.py from the ZIP, then run write-manifest` — because the old hook would ignore the new keys
 in silence. A hook newer than the config is fine: keys the config lacks take their defaults. The fingerprint
-`hook 2026-09-29 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
+`hook 2026-10-01 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
 `request` writes. `2026-09-29` blocks only on high-precision evidence (see "What blocks and what warns"); a config written
-before it may still block a lone word, and `doctor` names those words with `rebuild-markers --dry-run`.
+before it may still block a lone word, and `doctor` names those words with `rebuild-markers --dry-run`. `2026-09-30` matches a
+forbidden package as a whole name and reads the package families (`deny_package_prefixes`); a config written before it keeps
+working (its packages are matched as whole names at once), and `doctor` names the families `rebuild-markers` would add.
+`2026-10-01` adds the pre-commit check; where it is installed, the hook holds the plain spellings of an agent's commit
+past it for you (`--no-verify`, `-n`, `-c` or `--config-env core.hooksPath=…`, a `git config` write of
+`core.hooksPath`, a `GIT_CONFIG_*` variable set in the command, a write to this repository's own `.git/config`, `git
+commit-tree`) and refuses a direct delete or overwrite of its file by path as `tamper`. It reads one command's text:
+config includes, `HOME` / `XDG_CONFIG_HOME` pointing git elsewhere, a script writing git's config, a glob or variable
+that hides the name, git aliases and other plumbing are not seen (the full list: "Limits" in `docs/BOUNDARY_CHECK_CI.md` of the LUMIS repository),
+and git runs no pre-commit hook for a merge, cherry-pick or rebase that applies without conflicts. `doctor` shows
+whether the check is in place, and the pull request check reads the diff whatever happened locally.
 
 ## What `report` shows
 

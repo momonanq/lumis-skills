@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LUMIS scope guard — standalone installer and checker (stdlib only).
 
-    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--root .] [--observe] [--ci]
+    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--root .] [--observe] [--ci] [--pre-commit]
     python lumis_guard.py check --text "the plan or diff to check" [--root .]
     python lumis_guard.py status [--root .]
 
@@ -9,7 +9,8 @@
 merged into an existing file), scripts/scope_guard.py (the hook), CONSTITUTION.md (Non-Goals and invariants verbatim)
 hook configs for Cursor / Codex / Windsurf / Copilot,
 and LUMIS sections in .cursorrules and CLAUDE.md (existing content kept); with `--ci` also
-.github/workflows/lumis-boundary-check.yml (the same boundaries checked on every pull request diff). `check` reports Non-Goal triggers and drift phrases in a text. No network, no model.
+.github/workflows/lumis-boundary-check.yml (the same boundaries checked on every pull request diff); with `--pre-commit`
+the git pre-commit hook that checks the staged change before each commit (the hook's own `install-pre-commit`). `check` reports Non-Goal triggers and drift phrases in a text. No network, no model.
 Same engine as https://lumis.tools/guard.
 
 Needs `scope_guard.py` in this same folder: the hook it installs is also where the boundary→markers derivation
@@ -111,6 +112,7 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
     which rules these are — `{"amend": 0, "at": <install date>}` here, the amendment number after a LUMIS Amend — and
     `check-diff` prints it in the pull request report."""
     packages: list[str] = []
+    prefixes: list[str] = []  # package families (2026-09-30): `expo-`, `@expo/`, … refused like the package itself
     paths: list[str] = []
     keywords: list[str] = []
     warn_keywords: list[str] = []
@@ -124,10 +126,11 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
         for cap, spec in CAPABILITY_TRIGGERS.items():
             if any(m in low for m in spec["match"]):
                 packages += spec["packages"]
+                prefixes += list(spec.get("packages_prefix") or [])
                 paths += spec["paths"]
                 keywords += spec["keywords"]
                 matched.setdefault(cap, []).append(ng)
-                for t in spec["packages"] + spec["paths"] + spec["keywords"]:
+                for t in spec["packages"] + list(spec.get("packages_prefix") or []) + spec["paths"] + spec["keywords"]:
                     trigger_sources.setdefault(t.lower(), b["id"])
         blocking, warning = markers_for(ng, vocabulary)
         for text in blocking:
@@ -141,7 +144,8 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
     # a marker that blocks is never also a warning: the stronger verdict wins, one trigger keeps one meaning
     warn_only = [w for w in dedupe(warn_keywords) if w not in set(blocking_keywords)][:240]
     return {"project": project, "generated": date.today().isoformat(), "source": "lumis-scope-guard skill",
-            "non_goals": non_goals, "boundaries": boundaries, "capabilities": matched, "deny_packages": dedupe(packages), "deny_paths": dedupe(paths),
+            "non_goals": non_goals, "boundaries": boundaries, "capabilities": matched, "deny_packages": dedupe(packages),
+            "deny_package_prefixes": dedupe(prefixes), "deny_paths": dedupe(paths),
             "keywords": blocking_keywords, "warn_keywords": warn_only,
             "trigger_sources": trigger_sources, "drift_phrases": list(DRIFT_PHRASES), "design_non_goals": [],
             "log": ".lumis/guard.log", "hook_version": guard.HOOK_VERSION,
@@ -209,19 +213,21 @@ def agent_hook_files(hook_path: str = "scripts/scope_guard.py") -> dict[str, dic
 
 
 def claude_settings(cfg: dict, existing: dict | None) -> dict:
-    deny: list[str] = []
-    for pkg in cfg.get("deny_packages", []):
-        deny += [f"Bash(npm install {pkg}*)", f"Bash(npm i {pkg}*)", f"Bash(pnpm add {pkg}*)", f"Bash(yarn add {pkg}*)", f"Bash(pip install {pkg}*)", f"Bash(uv add {pkg}*)"]
+    # the package rules are the hook's (`claude_deny_rules`): the name whole, never a prefix — `Bash(npm install expo*)`,
+    # written before 2026-09-30, also refused `npm install export-to-csv`, so a re-run drops those old rules below
+    deny: list[str] = guard.claude_deny_rules(cfg)
     # `Edit(path)` covers every file-editing tool; a `Write(path)` rule is never matched and only warns at start
     for path in cfg.get("deny_paths", []):
         deny.append(f"Edit({path}**)")
     for own in GUARD_SELF_PATHS:  # the guard's own files: refused by the client before the hook even runs
         deny.append(f"Edit({own})")
-    pre = {"matcher": HOOK_MATCHER, "hooks": [{"type": "command", "command": hook_command("pre-tool")}]}
-    prompt = {"hooks": [{"type": "command", "command": hook_command("prompt")}]}
+    # `timeout` 60 s: the hook refuses what it cannot finish reading in its own 20 s budget, below the client's limit
+    pre = {"matcher": HOOK_MATCHER, "hooks": [{"type": "command", "command": hook_command("pre-tool"), "timeout": 60}]}
+    prompt = {"hooks": [{"type": "command", "command": hook_command("prompt"), "timeout": 60}]}
     settings = dict(existing or {})
     perms = dict(settings.get("permissions") or {})
-    perms["deny"] = list(dict.fromkeys(list(perms.get("deny") or []) + deny))
+    legacy = guard.legacy_deny_rules(cfg)
+    perms["deny"] = list(dict.fromkeys([d for d in list(perms.get("deny") or []) if d not in legacy] + deny))
     settings["permissions"] = perms
     hooks = dict(settings.get("hooks") or {})
     for key, entry in (("PreToolUse", pre), ("UserPromptSubmit", prompt)):
@@ -291,6 +297,13 @@ def claude_md_section(project: str, non_goals: list[str], invariants: list[str],
     return "\n".join(lines)
 
 
+def write_lf(path: Path, text: str) -> None:
+    """Writes `text` with LF line ends on every OS: `write_text` turns each newline into CRLF on Windows, and the
+    manifest fingerprints the bytes on disk — a CRLF copy read as tampering in every other clone."""
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
 def upsert_block(path: Path, block: str, start_mark: str = MARK_START, end_mark: str = MARK_END) -> None:
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     if start_mark in text and end_mark in text:
@@ -298,7 +311,7 @@ def upsert_block(path: Path, block: str, start_mark: str = MARK_START, end_mark:
         text = text[:start] + block.rstrip("\n") + text[end:]
     else:
         text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
-    path.write_text(text, encoding="utf-8")
+    write_lf(path, text)
 
 
 def _recorded_fingerprint(root: Path, rel: str) -> str:
@@ -354,9 +367,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     project = (args.project or root.name).strip()[:60]
     cfg = guard_config(project, non_goals, stack, observe=bool(getattr(args, "observe", False)))
     (root / ".lumis").mkdir(parents=True, exist_ok=True)
-    (root / ".lumis" / "scope_guard.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_lf(root / ".lumis" / "scope_guard.json", json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
     # the log records what an agent attempted (secrets stripped): local evidence, shared deliberately, not by accident
-    (root / ".lumis" / ".gitignore").write_text("# local evidence, not telemetry: keep the guard log out of commits\nguard.log\n", encoding="utf-8")
+    write_lf(root / ".lumis" / ".gitignore", "# the config before `rebuild-markers`: a local backup\nscope_guard.prev.json\n"
+                                             "# local evidence, not telemetry: keep the guard log out of commits\nguard.log\n")
     (root / ".claude").mkdir(parents=True, exist_ok=True)
     settings_path = root / ".claude" / "settings.json"
     existing = None
@@ -365,9 +379,9 @@ def cmd_init(args: argparse.Namespace) -> int:
             existing = json.loads(settings_path.read_text(encoding="utf-8"))
         except Exception:
             existing = None
-    settings_path.write_text(json.dumps(claude_settings(cfg, existing), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_lf(settings_path, json.dumps(claude_settings(cfg, existing), ensure_ascii=False, indent=2) + "\n")
     (root / "scripts").mkdir(parents=True, exist_ok=True)
-    (root / "scripts" / "scope_guard.py").write_text((HERE / "scope_guard.py").read_text(encoding="utf-8"), encoding="utf-8")
+    write_lf(root / "scripts" / "scope_guard.py", (HERE / "scope_guard.py").read_text(encoding="utf-8"))
     for rel, content in agent_hook_files().items():  # Cursor, Codex, Windsurf, Copilot — same hook, same exit code 2
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -385,13 +399,13 @@ def cmd_init(args: argparse.Namespace) -> int:
                 merged = current
             except Exception:
                 merged = content
-        target.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_lf(target, json.dumps(merged, ensure_ascii=False, indent=2) + "\n")
     # the same boundaries on every pull request; written before the manifest below, so the manifest fingerprints it
     ci = install_ci_workflow(root) if getattr(args, "ci", False) else None
     const_path = root / "CONSTITUTION.md"
     if const_path.exists() and "LUMIS" not in const_path.read_text(encoding="utf-8"):
         const_path = root / "CONSTITUTION.lumis.md"  # never overwrite a hand-written constitution
-    const_path.write_text(constitution(project, non_goals, invariants, stack), encoding="utf-8")
+    write_lf(const_path, constitution(project, non_goals, invariants, stack))
     upsert_block(root / ".cursorrules", cursorrules_section(project, non_goals, invariants, stack))
     upsert_block(root / "CLAUDE.md", claude_md_section(project, non_goals, invariants, stack), MD_START, MD_END)
     # fingerprints of the guard's own files, read back from disk so newline handling cannot skew them
@@ -402,13 +416,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         target = root / rel
         if target.is_file() and rel not in (".lumis/guard.log", ".lumis/guard.manifest.json"):
             tracked[rel] = hashlib.sha256(target.read_bytes()).hexdigest()[:16]
-    (root / ".lumis" / "guard.manifest.json").write_text(json.dumps({
+    write_lf(root / ".lumis" / "guard.manifest.json", json.dumps({
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "algorithm": "sha256/16",
         "note": "Written at install and by LUMIS Amend. `scope_guard.py doctor` compares it; a mismatch means the "
                 "guard was edited outside Amend. This records tampering, it cannot prevent it.",
         "files": tracked,
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    }, ensure_ascii=False, indent=2) + "\n")
     # the same fingerprints, copied outside the repository by the installed hook (~/.lumis/baselines/<repo-id>/):
     # one edit of the repository can rewrite the hook and its manifest together, it cannot reach this copy
     import os
@@ -435,6 +449,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         done = {"written": "written", "updated": "updated (it was an older LUMIS copy)", "unchanged": "already up to date"}[ci[1]]
         print(f"  CI: {ci[0]} {done} — commit it with .lumis/ and scripts/; every pull request diff is then checked "
               "against the same boundaries (PASS / WARN / BLOCK, one PR comment, SARIF for the Security tab)")
+    # the staged change before each commit: the hook's own installer, the same bytes as `install-pre-commit` writes
+    if getattr(args, "pre_commit", False):
+        for line in guard.pre_commit_report(*guard.install_pre_commit(root))[1]:
+            print(f"  Pre-commit: {line}")
+    else:
+        print("  Pre-commit: add --pre-commit (or run `python scripts/scope_guard.py install-pre-commit`) to check the "
+              "staged change before each commit, locally")
     print("  Self-test: ask the agent to add something from the Non-Goals list — it must refuse or ask.")
     return 0
 
@@ -463,9 +484,19 @@ def cmd_check(args: argparse.Namespace) -> int:
     for kw in cfg.get("keywords", []):
         if kw and matches(kw):
             hits.append(f"Non-Goal keyword '{kw}'" + explain(cfg, kw))
-    for pkg in cfg.get("deny_packages", []):
-        if re.search(r"(^|[\s'\"/@=])" + re.escape(pkg.lower()) + r"([\s'\"@=:]|$)", low):
-            hits.append(f"forbidden dependency '{pkg}'" + explain(cfg, pkg))
+    # A plan is prose, read the way the hook reads a request: a package named in a sentence counts. A diff is code, read
+    # the way check-diff reads its added lines, by each file's language: a package is the whole name an import, a
+    # manifest line or an install brings in, so `ws = wb.active` is not the package `ws` (hook 2026-09-30, review 30.09)
+    if guard.looks_like_diff(text):
+        added: dict[str, list[str]] = {}
+        for _no, file_name, _file_line, sign, body in guard.diff_lines(guard.diff_text_lines(text), True):
+            if sign == "+":
+                added.setdefault(file_name, []).append(body)
+        packages = [p for file_name, bodies in added.items() for p in guard.package_hits(cfg, "\n".join(bodies), file=file_name)]
+    else:
+        packages = guard.package_hits(cfg, text, prose=True)
+    for pkg in dict.fromkeys(packages):
+        hits.append(f"forbidden dependency '{pkg}'" + explain(cfg, pkg))
     for dp in cfg.get("deny_paths", []):
         if dp and dp.lower() in low:
             hits.append(f"forbidden path '{dp}'" + explain(cfg, dp))
@@ -533,6 +564,9 @@ def main() -> int:
                    help="install in observe mode: record what would have been stopped, refuse nothing but changes to the guard")
     i.add_argument("--ci", action="store_true",
                    help="also write .github/workflows/lumis-boundary-check.yml: the same boundaries checked on every pull request diff")
+    i.add_argument("--pre-commit", action="store_true",
+                   help="also write the git pre-commit hook that checks the staged change before each commit (local: "
+                        "`git commit --no-verify` skips it)")
     i.set_defaults(fn=cmd_init)
     c = sub.add_parser("check")
     c.add_argument("--text", default="")
