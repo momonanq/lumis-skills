@@ -17,8 +17,8 @@ Prompts alone do not hold; this installs hooks that block the change before it h
   (`.cursor/hooks.json`), Codex (`.codex/hooks.json`), Windsurf (`.windsurf/hooks.json`) and Copilot
   (`.github/hooks/lumis-scope-guard.json`) — all of them deny on exit code 2, so one script guards every agent — copies `scripts/scope_guard.py`,
   writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and marked sections in `.cursorrules` and `CLAUDE.md` (existing content is kept).
-  Add `--observe` to install in observe mode (below). The output names the hook version, the mode and the classes:
-  `Hook 2026-10-01 · mode: enforce · classes: ...`.
+  Add `--observe` to install in observe mode, `--unattended` for the unattended profile (both below). The output names the
+  hook version, the mode, the profile and the classes: `Hook 2026-10-05 · mode: enforce · profile: attended · classes: ...`.
   Add `--ci` to also write `.github/workflows/lumis-boundary-check.yml`, the same boundaries checked on every pull request
   (see "CI check" below). A different file already at that path is never overwritten: the LUMIS copy goes to
   `.github/lumis-boundary-check.lumis.yml` and the output says so. Without `--ci` the output says how to add it.
@@ -35,7 +35,7 @@ Prompts alone do not hold; this installs hooks that block the change before it h
 - `/lumis-scope-guard doctor` — run `python <skill-dir>/scripts/scope_guard.py doctor --root <repo root>` (or `python scripts/scope_guard.py doctor`
   from the repository): checks that the hook script, `.lumis/scope_guard.json` and each agent's config are present and valid, and that the
   interpreter they call is on PATH. It checks the wiring only — whether your client actually honours the hook is proven by the self-test below.
-  It also prints the mode, the three classes and the hook's version against the `hook_version` the config was written for (see
+  It also prints the mode, the profile, the three classes and the hook's version against the `hook_version` the config was written for (see
   "Hook version" below).
 - `/lumis-scope-guard status` — which guard files exist, how many triggers are in force, and what the guard has done so far
   (`.lumis/guard.log`: blocked / held / warned / drift events, last five shown). `python scripts/scope_guard.py report` prints the full summary.
@@ -184,6 +184,17 @@ fingerprints. It is the founder's command: the hook refuses it to the agent as t
 it runs in a shell an agent client spawned (Claude Code's `CLAUDECODE`, Codex's `CODEX_SANDBOX`) — run it in a terminal of your
 own. `init --observe` installs in this mode.
 
+**Unattended profile** (since 2026-10-05), for runs nobody watches: `python scripts/scope_guard.py unattended on` (the
+founder's switch, refused to the agent like `observe`; `init --unattended` installs with it) makes every call that would be
+held — a class set to `ask`, a commit past the pre-commit check — a refusal with the same reasons (exit 2, in every client),
+logged `held` with `"unattended": true`; the agent can carry on with the rest, and `report` lists in the morning what was
+refused instead of asked. `allow`, `block`, Non-Goals and tamper are unchanged; observe mode still stops nothing.
+`unattended off` asks again. Every `observe` / `unattended` switch appends a `switched` line to the journal, which `report`
+lists and `doctor` names: the switch writes nothing in a shell that carries an agent client's marker, but a script an agent
+writes and runs can drop the marker, so a switch you did not make is worth a look. A re-run of `init` over an installed
+guard keeps the mode and the profile and, in an agent's shell, writes nothing. The spec is "The unattended profile" in
+`docs/SCOPE_GUARD_MODES.md` of the LUMIS repository.
+
 ## CI check: the same boundaries on every pull request
 
 The hook stops a tool call in the clients that load it. A pull request is where every change arrives — from any agent and
@@ -225,11 +236,11 @@ It is a review aid, not a security boundary. The spec is `docs/BOUNDARY_CHECK_CI
 
 ## Hook version
 
-The hook carries its release date (`HOOK_VERSION`, now `2026-10-01`) and the config records the version it was written for
+The hook carries its release date (`HOOK_VERSION`, now `2026-10-05`) and the config records the version it was written for
 (`hook_version`). `doctor` compares them. A config newer than the hook is a problem — `the hook in scripts/ is older than the
 config (…): copy scripts/scope_guard.py from the ZIP, then run write-manifest` — because the old hook would ignore the new keys
 in silence. A hook newer than the config is fine: keys the config lacks take their defaults. The fingerprint
-`hook 2026-10-01 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
+`hook 2026-10-05 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
 `request` writes. `2026-09-29` blocks only on high-precision evidence (see "What blocks and what warns"); a config written
 before it may still block a lone word, and `doctor` names those words with `rebuild-markers --dry-run`. `2026-09-30` matches a
 forbidden package as a whole name and reads the package families (`deny_package_prefixes`); a config written before it keeps
@@ -241,14 +252,17 @@ commit-tree`) and refuses a direct delete or overwrite of its file by path as `t
 config includes, `HOME` / `XDG_CONFIG_HOME` pointing git elsewhere, a script writing git's config, a glob or variable
 that hides the name, git aliases and other plumbing are not seen (the full list: "Limits" in `docs/BOUNDARY_CHECK_CI.md` of the LUMIS repository),
 and git runs no pre-commit hook for a merge, cherry-pick or rebase that applies without conflicts. `doctor` shows
-whether the check is in place, and the pull request check reads the diff whatever happened locally.
+whether the check is in place, and the pull request check reads the diff whatever happened locally. `2026-10-05` adds the
+unattended profile (above); a config without the `profile` key is attended, judged as by 2026-10-01.
 
 ## What `report` shows
 
 Every count, even at zero: `stopped: S (blocked: B · tamper: T) · held: H · asked: A · inspected: I · warned: W · possible: P ·
 noted: N · drift prompts: D`, then the agents that tried, the events, and a `requests (.lumis/requests): N` section listing up to
 ten request files, newest first, each with its reason — the requests the agent wrote with `request --reason` and that are
-waiting for you.
+waiting for you. In the unattended profile, or once such a refusal is on record, a line `unattended: N call(s) refused
+instead of asked` and the last five of them follow the counts; the `observe` / `unattended` switches are listed apart
+(`switches: N`), never counted as events.
 
 ## Two layers (and what each one records)
 

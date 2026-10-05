@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LUMIS scope guard — standalone installer and checker (stdlib only).
 
-    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--root .] [--observe] [--ci] [--pre-commit]
+    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--root .] [--observe] [--unattended] [--ci] [--pre-commit]
     python lumis_guard.py check --text "the plan or diff to check" [--root .]
     python lumis_guard.py status [--root .]
 
@@ -99,7 +99,7 @@ def split_items(text: str) -> list[str]:
     return out[:25]
 
 
-def guard_config(project: str, non_goals: list[str], stack: str = "", observe: bool = False) -> dict:
+def guard_config(project: str, non_goals: list[str], stack: str = "", observe: bool = False, unattended: bool = False) -> dict:
     """Triggers for the hook. Two classes leave here: `keywords` stop a tool call (exit 2) — the curated concept
     lexicon, phrases, and the words of a short boundary; `warn_keywords` only warn (exit 1) — a lone word out of a
     long sentence, a possible match for a human to judge. A hook reading a config without the second key behaves
@@ -107,7 +107,9 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
 
     `hook_version` names the hook installed next to this config (the `scope_guard.py` in this folder), so `doctor`
     can say when one is older than the other; `mode` is "observe" with `init --observe` (record, refuse nothing but
-    changes to the guard); `classes` holds a new dependency, a push and a write outside the project for the founder;
+    changes to the guard); `profile` is "unattended" with `init --unattended` (a call that would be held is refused
+    with its reason instead, for runs nobody watches), "attended" otherwise; `classes` holds a new dependency, a push
+    and a write outside the project for the founder;
     `stack` is the founder's own stack line, so a package it names is not held as a new dependency. `revision` stamps
     which rules these are — `{"amend": 0, "at": <install date>}` here, the amendment number after a LUMIS Amend — and
     `check-diff` prints it in the pull request report."""
@@ -150,7 +152,7 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
             "trigger_sources": trigger_sources, "drift_phrases": list(DRIFT_PHRASES), "design_non_goals": [],
             "log": ".lumis/guard.log", "hook_version": guard.HOOK_VERSION,
             "revision": {"amend": 0, "at": date.today().isoformat()}, "mode": "observe" if observe else "enforce",
-            "classes": dict(guard.DEFAULT_CLASSES), "stack": stack}
+            "profile": "unattended" if unattended else "attended", "classes": dict(guard.DEFAULT_CLASSES), "stack": stack}
 
 
 def explain(cfg: dict, trigger: str) -> str:
@@ -365,9 +367,35 @@ def cmd_init(args: argparse.Namespace) -> int:
     invariants = split_items(args.invariants or "")
     stack = (args.stack or "").strip()[:200]
     project = (args.project or root.name).strip()[:60]
-    cfg = guard_config(project, non_goals, stack, observe=bool(getattr(args, "observe", False)))
+    # A run over an installed guard replaces its Non-Goals and re-takes its fingerprints, and until 2026-10-05 it also
+    # reset the founder's `observe` / `unattended` switches: an agent's re-run turned the profile off and left doctor
+    # clean (review 05.10). So, like the switches, it writes nothing in a shell an agent client spawned, and a re-run
+    # keeps both switches — the flags can turn them on, `observe off` / `unattended off` turn them off.
+    previous = None
+    if (root / ".lumis" / "scope_guard.json").exists():
+        marker = guard.agent_shell()
+        if marker:
+            print(f"A LUMIS guard is already installed in {root}, and this shell belongs to an agent session ({marker} is "
+                  "set): nothing was written. Re-installing replaces the Non-Goals and re-takes the fingerprints — the "
+                  "founder runs it in a terminal of their own.", file=sys.stderr)
+            return 1
+        try:
+            previous = json.loads((root / ".lumis" / "scope_guard.json").read_text(encoding="utf-8"))
+        except Exception:
+            previous = None
+    cfg = guard_config(project, non_goals, stack, observe=bool(getattr(args, "observe", False)),
+                       unattended=bool(getattr(args, "unattended", False)))
+    if isinstance(previous, dict):
+        if guard.guard_mode(previous) == "observe":
+            cfg["mode"] = "observe"
+        if guard.guard_profile(previous) == "unattended":
+            cfg["profile"] = "unattended"
     (root / ".lumis").mkdir(parents=True, exist_ok=True)
     write_lf(root / ".lumis" / "scope_guard.json", json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+    if isinstance(previous, dict):  # a flag that switched one on is a switch: the same journal line as the command's
+        for key, old in (("mode", guard.guard_mode(previous)), ("profile", guard.guard_profile(previous))):
+            if old != cfg[key]:
+                guard.log_switch(root, cfg, key, old, cfg[key])
     # the log records what an agent attempted (secrets stripped): local evidence, shared deliberately, not by accident
     write_lf(root / ".lumis" / ".gitignore", "# the config before `rebuild-markers`: a local backup\nscope_guard.prev.json\n"
                                              "# local evidence, not telemetry: keep the guard log out of commits\nguard.log\n")
@@ -437,6 +465,9 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"  Hook {cfg['hook_version']} · mode: {cfg['mode']}"
           + (" (records what it would have stopped, refuses nothing but changes to the guard; "
              "`python scripts/scope_guard.py observe off` to enforce)" if cfg["mode"] == "observe" else "")
+          + f" · profile: {cfg['profile']}"
+          + (" (a held call is refused with its reason, for runs nobody watches; `python scripts/scope_guard.py "
+             "unattended off` to be asked again)" if cfg["profile"] == "unattended" else "")
           + " · classes: " + ", ".join(f"{k} {v}" for k, v in cfg["classes"].items()))
     print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section), CLAUDE.md (section)")
     print("  Agents: Claude Code (.claude/settings.json), Cursor (.cursor/hooks.json), Codex (.codex/hooks.json), Windsurf (.windsurf/hooks.json), Copilot (.github/hooks/lumis-scope-guard.json)")
@@ -562,6 +593,9 @@ def main() -> int:
     i.add_argument("--root", default=".")
     i.add_argument("--observe", action="store_true",
                    help="install in observe mode: record what would have been stopped, refuse nothing but changes to the guard")
+    i.add_argument("--unattended", action="store_true",
+                   help="install with the unattended profile, for runs nobody watches: a call that would be held for you "
+                        "is refused with its reason instead, and `report` lists it")
     i.add_argument("--ci", action="store_true",
                    help="also write .github/workflows/lumis-boundary-check.yml: the same boundaries checked on every pull request diff")
     i.add_argument("--pre-commit", action="store_true",

@@ -33,7 +33,9 @@ so the same guard works everywhere; only the config file and the payload shape d
         where the LUMIS pre-commit check is installed, the plain spellings of a commit past it (`--no-verify`, `-n`,
         `-c` / `--config-env core.hooksPath=…`, a `GIT_CONFIG_*` variable set in the command, a `git config` write of
         core.hooksPath, a write to this repository's `.git/config`, `git commit-tree`) are held the same way, and a
-        direct delete or overwrite of its file by path is refused as `tamper` (the limits: docs/BOUNDARY_CHECK_CI.md).
+        direct delete or overwrite of its file by path is refused as `tamper` (the limits: docs/BOUNDARY_CHECK_CI.md);
+        with `"profile": "unattended"` (a run nobody watches) every call that would be held is refused instead, with
+        the same reasons (exit 2), and logged as `held` with `"unattended": true` for the founder to read in `report`.
   * `python scripts/scope_guard.py prompt [--agent <name>]`
         adds a note to the context when the prompt names a boundary (a package, a path or a phrase — never a lone
         word) or contains a drift phrase ("quick fix for now", "while I'm in here", ...): advice, it never stops.
@@ -53,6 +55,9 @@ so the same guard works everywhere; only the config file and the payload shape d
         the manifest afterwards. Yours to run: the hook refuses it to the agent, `--dry-run` included.
   * `python scripts/scope_guard.py observe on|off` -> switch the guard to recording only (`on`) or back to refusing
         (`off`): rewrites the `mode` key of .lumis/scope_guard.json and re-baselines. Yours to run, like write-manifest.
+  * `python scripts/scope_guard.py unattended on|off` -> for runs nobody watches: refuse what would be held, with its
+        reason, instead of asking (`on`), or ask again (`off`): rewrites the `profile` key and re-baselines, like
+        `observe`. Yours to run.
   * `python scripts/scope_guard.py check-diff --base <ref> [--head <ref>] [--markdown f] [--sarif f] [--json f]`
         -> the same boundaries on a diff (a pull request in CI, `.github/workflows/lumis-boundary-check.yml`): added
         lines only, PASS / WARN / BLOCK, one markdown report, SARIF for code scanning, JSON; exit 2 on BLOCK, 1 when
@@ -93,7 +98,7 @@ for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to a legacy
 # The release this script belongs to — bump it on every change of this file. The pack writes the same string into
 # .lumis/scope_guard.json as `hook_version`, so `doctor` can tell a config that expects a newer hook (keys the old
 # script would ignore in silence) from a hook that is merely newer than its config (harmless: new keys take defaults).
-HOOK_VERSION = "2026-10-01"
+HOOK_VERSION = "2026-10-05"
 
 # --- the budget: a guard that cannot finish reading refuses (third review of 30.09) -------------------------------
 # Claude Code gives a hook 60 s by default and treats one that runs longer as a non-blocking error: the change lands.
@@ -169,7 +174,7 @@ DEFAULT_CLASSES = {"dependency": "ask", "outbound": "ask", "outside_root": "ask"
 CLASS_VERDICTS = ("allow", "ask", "block")
 
 EMPTY_CONFIG = {"non_goals": [], "keywords": [], "warn_keywords": [], "deny_packages": [], "deny_paths": [], "drift_phrases": [], "design_non_goals": [],
-                "mode": "enforce", "classes": dict(DEFAULT_CLASSES)}
+                "mode": "enforce", "profile": "attended", "classes": dict(DEFAULT_CLASSES)}
 ORIGIN_LABELS = {
     "founder": "set by the founder",
     "consilium": "added by the consilium for this release (DECISION_LOG.md)",
@@ -255,6 +260,13 @@ def emit_ask(agent: str, message: str) -> int:
 def guard_mode(cfg: dict) -> str:
     """"observe" or "enforce" (the default, and whatever else the key says: a typo must not switch the guard off)."""
     return "observe" if str((cfg or {}).get("mode") or "").strip().lower() == "observe" else "enforce"
+
+
+def guard_profile(cfg: dict) -> str:
+    """"unattended" or "attended" (the default, and whatever else the key says: like `mode`, only the exact word
+    switches). Unattended is for a run nobody watches (2026-10-05): a call that would be held for the founder waits
+    until morning there, so it is refused with its reason instead and the agent carries on with the rest."""
+    return "unattended" if str((cfg or {}).get("profile") or "").strip().lower() == "unattended" else "attended"
 
 
 def class_verdict(cfg: dict, name: str) -> str:
@@ -474,8 +486,9 @@ LISTING_EXECUTABLES = {"ls", "dir", "get-childitem", "gci"}
 # prints — `--staged --format text` is what the pre-commit check runs, review 2026-10-01; with `--markdown`, `--sarif` or
 # `--json` it writes a file, and that spelling is judged like any other command naming the hook — refused as
 # `tamper`) — and every other word naming this file —
-# `write-manifest`, `rebuild-markers`, `observe`, with or without `--dry-run` — stays a `tamper` refusal:
-# re-baselining, re-deriving the markers and switching the mode are the founder's, run by them in their own shell.
+# `write-manifest`, `rebuild-markers`, `observe`, `unattended`, with or without `--dry-run` — stays a `tamper` refusal:
+# re-baselining, re-deriving the markers and switching the mode or the profile are the founder's, run by them in their
+# own shell.
 # `pre-tool` and `prompt` were open too until 2026-09-23: they append to .lumis/guard.log, so an agent could pipe any
 # payload in and forge journal lines — a fake refusal, or noise that pushes real events out of the studio's view.
 # The separator is either slash: on Windows, where these agents mostly run, PowerShell tab-completion produces
@@ -1245,6 +1258,12 @@ def is_read_only_tool(tool_name: str, tool_input: dict) -> bool:
     return bool(words) and any(w in READ_TOOL_WORDS for w in words) and not any(w in WRITE_TOOL_WORDS for w in words)
 
 
+def without_bom(text: str) -> str:
+    """The text without U+FEFF: the byte order mark Windows editors put first, and the zero-width no-break space it
+    is elsewhere, neither of which is part of a word. Line numbers are unchanged: the mark is not a line."""
+    return text.replace("\ufeff", "") if "\ufeff" in text else text
+
+
 def text_of_tool_input(tool_name: str, tool_input: dict) -> tuple[str, str]:
     """(searchable text, file path) for a tool call, whatever the client or the MCP server calls its fields."""
     tool_input = tool_input or {}
@@ -1255,7 +1274,9 @@ def text_of_tool_input(tool_name: str, tool_input: dict) -> tuple[str, str]:
     for edit in tool_input.get("edits", []) or []:
         if isinstance(edit, dict):
             parts += [str(edit.get(k, "")) for k in EDIT_BODY_KEYS]
-    return "\n".join(p for p in parts if p), path
+    # a UTF-8 byte order mark (PowerShell 5 `Set-Content -Encoding utf8`, Notepad) is not part of the first word:
+    # with it, `import` on line 1 was never an import (field check 2026-10-05)
+    return without_bom("\n".join(p for p in parts if p)), path
 
 
 # --- explainability: which boundary a trigger belongs to -----------------------------------------------------
@@ -2742,7 +2763,7 @@ def _read_for_packages(path: Path) -> tuple[str | None, str]:
             return None, ""
         if path.stat().st_size > PACKAGE_READ_MAX:
             return None, f"context not read: {path.name} is larger than {PACKAGE_READ_MAX // 1_000_000} MB"
-        return path.read_text(encoding="utf-8", errors="replace"), ""
+        return without_bom(path.read_text(encoding="utf-8", errors="replace")), ""
     except Exception:
         return None, ""
 
@@ -4648,9 +4669,21 @@ CLASS_REASONS = {
 CLASS_HIT = re.compile(r"^(?:dependency|outbound|outside_root)\s+'")
 
 
-def class_message(active: list[tuple[str, str]], blocking: bool, skips: list[str] | tuple = ()) -> str:
+def class_message(active: list[tuple[str, str]], blocking: bool, skips: list[str] | tuple = (),
+                  unattended: bool = False) -> str:
     """The refusal or the question for the class hits of one call, and the pre-commit skips held with them
-    (`pre_commit_skips`): those are not a class — `classes` does not set them, they are always asked."""
+    (`pre_commit_skips`): those are not a class — `classes` does not set them, they are always asked. `unattended`
+    (the profile, `guard_profile`) turns the question into a refusal with the same reasons: nobody is there to answer
+    it, and a question at 1 a.m. stops the run until morning."""
+    if unattended and not blocking:
+        return ("⛔ LUMIS Scope Guard refused this instead of asking: unattended profile — "
+                + "; ".join([CLASS_REASONS[c](w) for c, w in active] + [pre_commit_skip_reason(s) for s in skips])
+                + ". Do not look for another route to it; carry on with the rest of the task. The founder reads these in "
+                  "the morning (`python scripts/scope_guard.py report`) and can "
+                # a call with both needs both: allowing the class does not let a commit past the check (review 05.10)
+                + " and ".join((["allow the class in .lumis/scope_guard.json → \"classes\""] if active else [])
+                               + (["make the commit through the check"] if skips else []))
+                + ", or switch the profile back (`python scripts/scope_guard.py unattended off`); both are the founder's to change.")
     head = ("⛔ LUMIS Scope Guard blocked this (.lumis/scope_guard.json → \"classes\"): " if blocking else
             "⏸ LUMIS Scope Guard holds this for the founder: ")
     reasons = [CLASS_REASONS[c](w) for c, w in active] + [pre_commit_skip_reason(s) for s in skips]
@@ -4699,7 +4732,7 @@ def redact(text: str, limit: int = 160) -> str:
 
 
 def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: list[str], agent: str = "", attempted: str = "",
-              observed: bool = False) -> None:
+              observed: bool = False, unattended: bool = False) -> None:
     rel = cfg.get("log", ".lumis/guard.log")
     if not rel:
         return
@@ -4717,6 +4750,9 @@ def log_event(cfg: dict, event: str, tool_name: str, tool_input: dict, hits: lis
     if observed:
         # observe mode: the event the guard WOULD have produced, under its own name, marked as not enforced
         entry["observed"] = True
+    if unattended:
+        # the unattended profile: a `held` call refused instead of asked — still a decision handed to the founder
+        entry["unattended"] = True
     if event in ("warned", "possible") and not entry["hits"]:
         return  # a warning with no reason teaches the agent to skip the whole category (field report 2026-09-22)
     try:
@@ -4793,7 +4829,18 @@ def write_request(reason: str) -> int:
     by_class = any(CLASS_HIT.match(str(h)) for h in hits)
     kind = {"tamper": "the guard's own files", "held": "a boundary class held for you"}.get(
         str(last.get("event")), "a boundary class set to block" if by_class else "a Non-Goal")
+    # refused by the unattended profile, the call did not wait: nothing is left to approve once (review 05.10)
+    refused_unattended = last.get("event") == "held" and bool(last.get("unattended"))
+    if refused_unattended:
+        kind = "held for you, refused by the unattended profile instead of asked"
+    ways = " and ".join((["allow the class in .lumis/scope_guard.json → \"classes\""] if by_class else [])
+                        + (["make the commit through the pre-commit check"]
+                           if any(str(h).startswith("pre-commit '") for h in hits) else []))
     amend_lines = [f"- Consider lifting or narrowing the boundary behind: {h}" for h in hits if "NG-" in str(h)] or (
+        ["- Refused by the unattended profile, not waiting for you: " + (f"to let it through, {ways}; " if ways else "")
+         + "to be asked about such calls again, switch the profile off (`python scripts/scope_guard.py unattended off`). "
+           "Then rerun the task."]
+        if refused_unattended else
         ["- A dependency, a push or a write outside the project waits for your decision: approve it once, or set the class "
          "in .lumis/scope_guard.json → \"classes\" (allow | ask | block)."] if (last.get("event") == "held" or by_class) else
         ["- The refusal concerned the guard's own files: if the change was meant, run Amend or edit the boundary yourself; the agent must not."])
@@ -4856,6 +4903,9 @@ def request_lines(root: Path, limit: int = 10) -> list[str] | None:
 
 def report(cfg: dict) -> int:
     entries = read_log(cfg)
+    # the founder's switches are not tool calls: listed apart, never counted as events (`log_switch`)
+    switches = [e for e in entries if e.get("event") == "switched"]
+    entries = [e for e in entries if e.get("event") != "switched"]
     counts = {"blocked": 0, "warned": 0, "possible": 0, "drift": 0, "tamper": 0, "timeout": 0}
     observed = 0
     for e in entries:
@@ -4877,10 +4927,26 @@ def report(cfg: dict) -> int:
     if guard_mode(cfg) == "observe" or observed:
         print(f"  mode: {guard_mode(cfg)} — {observed} event(s) would have been stopped"
               + (" (observe mode records them and stops nothing but changes to the guard itself)" if guard_mode(cfg) == "observe" else ""))
+    # the unattended profile: what was refused instead of asked, for the founder's morning read. Its lines start with
+    # "·", so the studio's reading of this text (lumis/core/guard_log.py) never counts them as events a second time
+    unattended = [e for e in entries if e.get("event") == "held" and e.get("unattended") and not e.get("observed")]
+    if unattended or guard_profile(cfg) == "unattended":
+        print(f"  unattended: {len(unattended)} call(s) refused instead of asked"
+              + (" (profile: unattended — `python scripts/scope_guard.py unattended off` to be asked again)"
+                 if guard_profile(cfg) == "unattended" else ""))
+        for e in unattended[-5:]:
+            where = f" {e.get('path')}" if e.get("path") else ""
+            print(f"    · {e.get('ts', '')} · {e.get('tool', '')}{where}: " + "; ".join(e.get("hits", [])))
+    if switches:
+        print(f"  switches: {len(switches)} (`observe` / `unattended`, each re-takes the fingerprints — one you did not"
+              " make came from code that ran the switch: look at what the agent ran at that time)")
+        for e in switches[-5:]:
+            print(f"    · {e.get('ts', '')} · {e.get('key', '')}: {e.get('old', '')} → {e.get('new', '')}")
     if counts.get("held"):
         print("  ('held' is a new dependency, a push or deploy, or a write outside the project, handed to you to approve —")
         print("   `classes` in .lumis/scope_guard.json sets each to allow, ask or block; a commit that skips the LUMIS")
-        print("   pre-commit check is always asked. A decision, not a violation.)")
+        print("   pre-commit check is held too. In the unattended profile every held call is refused with its reason")
+        print("   instead of waiting for you. A decision, not a violation.)")
     if counts.get("possible"):
         print("  ('possible' is a single word out of a long Non-Goal sentence that turned up in a change: a match for you")
         print("   to judge, not a violation. Nothing was blocked; the word alone does not prove the boundary was crossed.)")
@@ -4973,6 +5039,20 @@ def doctor() -> int:
                       " logged (`python scripts/scope_guard.py observe off` to enforce)")
             else:
                 print("  · mode: enforce")
+            if guard_profile(cfg) == "unattended":
+                print("  · profile: unattended — a held call is refused with its reason; read `report` in the morning"
+                      " (`python scripts/scope_guard.py unattended off` to be asked again)")
+            else:
+                # "waits for you" holds only where the client has an ask (review 05.10)
+                print("  · profile: attended (default) — a held call is asked in Claude Code and Cursor, and warned"
+                      " about and let through in Codex CLI, Windsurf and Copilot")
+            # a switch leaves a journal line whoever ran it: the founder, or code that hid the agent's marker
+            switches = [e for e in read_log({"log": ".lumis/guard.log"}) if e.get("event") == "switched"]
+            if switches:
+                last = switches[-1]
+                print(f"  · last switch: {last.get('ts', '')} · {last.get('key', '')}: {last.get('old', '')} →"
+                      f" {last.get('new', '')} ({len(switches)} on record, `report` lists them) — if you did not make it,"
+                      " look at what the agent ran at that time")
             print("  · classes: " + " · ".join(f"{name} {class_verdict(cfg, name)}" for name in DEFAULT_CLASSES))
             # the config names the hook it was written for: a newer config read by an older hook loses its new keys
             # in silence (the old script simply does not know them), the reverse only means new keys take defaults
@@ -5078,7 +5158,7 @@ def doctor() -> int:
               " If you changed nothing, the guard was rewritten. The hook refuses `write-manifest` to the agent.)")
     else:
         print(f"  ✓ baseline outside the repository — matches ({where}, recorded {recorded or 'unknown'})")
-    events = read_log({"log": ".lumis/guard.log"})
+    events = [e for e in read_log({"log": ".lumis/guard.log"}) if e.get("event") != "switched"]
     if events:
         agents = sorted({str(e.get("agent") or "unknown") for e in events})
         print(f"  ✓ .lumis/guard.log — {len(events)} events so far, from: {', '.join(agents)}")
@@ -5173,9 +5253,52 @@ def set_observe(root: Path, on: bool) -> int:
     scope_guard; scope_guard.main()"` with argv set to `observe on`), and that route left doctor clean because the
     re-baseline came with it (audit 2026-09-23). So the switch itself looks at where it runs: a shell an agent
     client spawned carries that client's marker, and there it writes nothing."""
+    return _switch_config_key(root, "observe", "mode", "observe" if on else "enforce", (
+        "mode: observe — the guard records what it would have stopped (`report`) and stops nothing but changes to "
+        "itself. Back to enforcing: python scripts/scope_guard.py observe off") if on else
+        "mode: enforce — Non-Goals are refused and the boundary classes are held again.")
+
+
+def set_unattended(root: Path, on: bool) -> int:
+    """`python scripts/scope_guard.py unattended on|off` — the founder's switch of the `profile` key (2026-10-05), built
+    like `observe on|off` and refused to the agent the same way (not in `GUARD_SELF_RUN`; the switch writes nothing in
+    an agent's shell). An agent that could switch it off would turn every refusal of the night back into a question
+    nobody answers; one that could switch it on would gain nothing, but the profile is the founder's either way."""
+    return _switch_config_key(root, "unattended", "profile", "unattended" if on else "attended", (
+        "profile: unattended — a call that would be held for you (a new dependency, a push or deploy, a write outside "
+        "the project, a commit past the pre-commit check) is refused with its reason instead, and the agent can carry on "
+        "with the rest. Read them in the morning: python scripts/scope_guard.py report. Back to being asked: "
+        "python scripts/scope_guard.py unattended off") if on else
+        "profile: attended — a held call is asked again in Claude Code and Cursor, and warned about and let through in "
+        "Codex CLI, Windsurf and Copilot.")
+
+
+def log_switch(root: Path, cfg: dict, key: str, old: str, new: str) -> None:
+    """A `switched` line in the journal for every founder switch, a no-op one included (it re-takes the fingerprints
+    all the same). The switch refuses in a shell that carries an agent client's marker, but code an agent writes and
+    runs can drop the marker and call it in-process, and the re-baseline then leaves doctor clean (review 2026-10-05).
+    This line is what remains: `report` lists the switches and `doctor` prints the last one. Code that also rewrites
+    the journal leaves none — a review aid, not a lock. `report`, `doctor` and the studio count no tool call for it."""
+    rel = cfg.get("log", ".lumis/guard.log")
+    if not rel:
+        return
+    entry = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "event": "switched", "key": key,
+             "old": old, "new": new, "hits": [f"{key}: {old} → {new}"]}
+    try:
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _switch_config_key(root: Path, word: str, key: str, value: str, done: str) -> int:
+    """One founder switch (`observe`, `unattended`): refuse in an agent's shell, rewrite one key of the config (LF),
+    re-baseline, record the switch in the journal (`log_switch`), print what is now in force. Returns the exit code."""
     marker = agent_shell()
     if marker:
-        print(f"observe is the founder's switch, and this shell belongs to an agent session ({marker} is set): nothing was "
+        print(f"{word} is the founder's switch, and this shell belongs to an agent session ({marker} is set): nothing was "
               "written. Run it in a terminal of your own — a command typed into the agent's own prompt runs inside its "
               "session too.", file=sys.stderr)
         return 1
@@ -5191,7 +5314,9 @@ def set_observe(root: Path, on: bool) -> int:
     if not isinstance(cfg, dict):
         print(f"{path} does not hold a JSON object — nothing was written.", file=sys.stderr)
         return 1
-    cfg["mode"] = "observe" if on else "enforce"
+    # what the hook read before, in its own terms (`guard_mode` / `guard_profile`), for the journal line
+    old = guard_mode(cfg) if key == "mode" else guard_profile(cfg) if key == "profile" else str(cfg.get(key, ""))
+    cfg[key] = value
     try:
         with open(path, "w", encoding="utf-8", newline="\n") as fh:  # LF on every OS, like the manifest
             fh.write(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
@@ -5199,11 +5324,8 @@ def set_observe(root: Path, on: bool) -> int:
         print(f"could not write {path}: {exc}", file=sys.stderr)
         return 1
     manifest, outside = rebaseline(root)
-    if on:
-        print("mode: observe — the guard records what it would have stopped (`report`) and stops nothing but changes to "
-              "itself. Back to enforcing: python scripts/scope_guard.py observe off")
-    else:
-        print("mode: enforce — Non-Goals are refused and the boundary classes are held again.")
+    log_switch(root, cfg, key, old, value)
+    print(done)
     print(f"{MANIFEST}: {len(manifest['files'])} guard file(s) fingerprinted")
     print(f"baseline outside the repository: {outside}" if outside else
           "baseline outside the repository: not written (switched off, or the home folder is read-only)")
@@ -5574,7 +5696,7 @@ def diff_text_lines(text: str) -> list[str]:
     also breaks on a form feed, U+2028, U+0085 and other characters an added line may carry: the second half of
     such a line lost its sign and was never matched, the hunk counts reset and later lines moved to another file
     or line (review 2026-09-28)."""
-    s = str(text or "")
+    s = without_bom(str(text or ""))
     if not s:
         return []
     parts = s.split("\n")
@@ -6722,8 +6844,8 @@ def guard_file_findings(changed: list[dict], first_install: bool = False) -> lis
 # edit to it can weaken the guard as surely as a lifted boundary (review 2026-09-28): a directory added to
 # architecture.top_level is never a new bounded context, a package named in `stack` is never held, `"log": ""` turns
 # the hook's journal off. `note` and `generated` are prose and a timestamp.
-CONFIG_KEYS_OWN = ("boundaries", "non_goals", "mode", "classes", "deny_packages", "deny_package_prefixes", "deny_paths",
-                   "keywords", "warn_keywords", "revision", "note", "generated")
+CONFIG_KEYS_OWN = ("boundaries", "non_goals", "mode", "profile", "classes", "deny_packages", "deny_package_prefixes",
+                   "deny_paths", "keywords", "warn_keywords", "revision", "note", "generated")
 CONFIG_KEY_HINTS = {
     "log": "the hook's journal",
     "stack": "the approved stack: a package it names is not held",
@@ -6804,8 +6926,8 @@ def _revision_via(old_rev: dict, new_rev: dict) -> str:
 def config_changes(base_cfg: dict, head_cfg: dict) -> dict:
     """What a pull request changes in .lumis/scope_guard.json. Boundaries are matched by their text first and only
     the leftovers by id, because NG-n is a position — Amend renumbers what follows a lifted boundary, and matching by
-    id alone would call every one of them "reworded". Then the mode, the classes, the trigger lists, every other key
-    (`other`), the revision."""
+    id alone would call every one of them "reworded". Then the mode, the profile, the classes, the trigger lists, every
+    other key (`other`), the revision."""
     base_cfg, head_cfg = base_cfg or {}, head_cfg or {}
     before, after = _boundary_list(base_cfg), _boundary_list(head_cfg)
     boundaries: list[dict] = []
@@ -6834,6 +6956,8 @@ def config_changes(base_cfg: dict, head_cfg: dict) -> dict:
     settings: list[dict] = []
     if guard_mode(base_cfg) != guard_mode(head_cfg):
         settings.append({"key": "mode", "old": guard_mode(base_cfg), "new": guard_mode(head_cfg)})
+    if guard_profile(base_cfg) != guard_profile(head_cfg):
+        settings.append({"key": "profile", "old": guard_profile(base_cfg), "new": guard_profile(head_cfg)})
     for name in DEFAULT_CLASSES:
         if class_verdict(base_cfg, name) != class_verdict(head_cfg, name):
             settings.append({"key": f"classes.{name}", "old": class_verdict(base_cfg, name), "new": class_verdict(head_cfg, name)})
@@ -8466,6 +8590,8 @@ USAGE = """LUMIS Scope Guard — scripts/scope_guard.py <mode>
   doctor            is the guard wired up here: files, interpreters, manifest, baseline, hook version
   request --reason  write a request to the founder about the last refusal or hold (.lumis/requests/)
   observe on|off    founder only, from the founder's own terminal: record without refusing
+  unattended on|off founder only, from the founder's own terminal: for runs nobody watches, refuse what would be
+                    held (with its reason, read in `report`) instead of asking
   write-manifest    founder only: re-baseline the guard files after an Amend or a deliberate edit
   rebuild-markers   founder only: re-derive the markers from the boundaries ([--dry-run])
   check-diff        the same boundaries on a diff (CI): --base <ref> [--head <ref>] | --diff <file> | stdin; exit 2 = BLOCK;
@@ -8524,12 +8650,19 @@ def main() -> int:
     if mode == "rebuild-markers":  # the founder re-derives the markers of a config they edited by hand
         # read straight from argv: `parse_args` answers (mode, agent) to five callers and swallows the rest
         return rebuild_markers(project_root(), dry_run="--dry-run" in sys.argv[1:])
+    # the two switches take exactly one word: `--dry-run off` switched for real, a flag nobody reads (review 05.10)
     if mode == "observe":  # the founder switches refusing off and on; the hook refuses this to the agent
-        switch = next((a.lower() for a in sys.argv[2:] if not a.startswith("-")), "")
+        switch = sys.argv[2].lower() if len(sys.argv) == 3 else ""
         if switch not in ("on", "off"):
             print("usage: python scripts/scope_guard.py observe on|off   (now: " + guard_mode(cfg) + ")", file=sys.stderr)
             return 1
         return set_observe(project_root(), switch == "on")
+    if mode == "unattended":  # the founder's profile for runs nobody watches; refused to the agent like `observe`
+        switch = sys.argv[2].lower() if len(sys.argv) == 3 else ""
+        if switch not in ("on", "off"):
+            print("usage: python scripts/scope_guard.py unattended on|off   (now: " + guard_profile(cfg) + ")", file=sys.stderr)
+            return 1
+        return set_unattended(project_root(), switch == "on")
     # first contact: the installed state is recorded outside the repository before any tool call is judged
     record_baseline_if_absent(project_root())
     payload = read_stdin_json()
@@ -8700,17 +8833,30 @@ def pre_tool(cfg: dict, agent: str, tool_name: str, tool_input: dict) -> int:
     skips = pre_commit_skips(tool_name, tool_input)
     if active or skips:
         blocking = any(class_verdict(cfg, c) == "block" for c, _w in active)
-        message = class_message(active, blocking, skips)
+        # the unattended profile (2026-10-05): nobody is there to answer, so what would be asked is refused with the
+        # same reasons — `allow` and `block` are untouched, and a call with a class set to block is a block as before
+        unattended = not blocking and guard_profile(cfg) == "unattended"
+        message = class_message(active, blocking, skips, unattended=unattended)
         labels = [f"{c} '{w}'" for c, w in active] + [f"pre-commit '{s}'" for s in skips]
-        # "asked" is taken — it is the prompt hook's event — so a call handed to the founder is `held`
+        # "asked" is taken — it is the prompt hook's event — so a call handed to the founder is `held`; refused by the
+        # unattended profile it is still `held` (a decision deferred to the founder), marked `"unattended": true`
         event = "blocked" if blocking else "held"
-        if observing:
-            sys.stderr.write("👁 OBSERVE (nothing blocked): would have " + ("blocked this — " if blocking else "asked the founder — ")
-                             + message + "\n")
-            log_event(cfg, event, tool_name, tool_input, labels, agent, attempted=attempted_text or command, observed=True)
+        if observing:  # observe wins over the profile: it records and stops nothing
+            # the reasons only, not the refusal: its "do not look for another route" would stop the agent on a call
+            # that goes through (review 05.10)
+            sys.stderr.write("👁 OBSERVE (nothing blocked): would have "
+                             + ("blocked this — " + message if blocking else
+                                "refused this instead of asking (unattended profile) — "
+                                + "; ".join([CLASS_REASONS[c](w) for c, w in active] + [pre_commit_skip_reason(s) for s in skips])
+                                + "." if unattended else "asked the founder — " + message)
+                             + "\n")
+            log_event(cfg, event, tool_name, tool_input, labels, agent, attempted=attempted_text or command, observed=True,
+                      unattended=unattended)
             return 1
-        log_event(cfg, event, tool_name, tool_input, labels, agent, attempted=attempted_text or command)
-        if blocking:
+        log_event(cfg, event, tool_name, tool_input, labels, agent, attempted=attempted_text or command,
+                  unattended=unattended)
+        if blocking or unattended:
+            # exit 2 in every client: Codex, Windsurf and Copilot, which have no "ask", get a real refusal here
             emit_denial(agent, message)
             return 2
         return emit_ask(agent, message)
