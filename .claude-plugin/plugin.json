@@ -1,7 +1,7 @@
 {
   "name": "lumis-scope-guard",
   "displayName": "LUMIS Scope Guard",
-  "description": "Turns your project's Non-Goals into boundaries your coding agent is stopped at, not told about. When you run its init with your Non-Goals, it writes permissions.deny rules and PreToolUse/UserPromptSubmit hooks into the project's .claude/settings.json, the same hook into the Cursor, Codex CLI, Windsurf and Copilot configs, plus scripts/scope_guard.py, .lumis/, CONSTITUTION.md, sections in .cursorrules and CLAUDE.md, and a copy of the fingerprints in ~/.lumis/baselines; the hook then refuses the agent's edits to its own files. The plugin itself adds no hooks. Stdlib Python: no network access, no telemetry, no model.",
+  "description": "Turns your project's Non-Goals into boundaries your coding agent is stopped at, not told about. When you run its init with your Non-Goals, it writes permissions.deny rules and PreToolUse/UserPromptSubmit hooks into the project's .claude/settings.json, the same hook into the Cursor, Codex CLI, Devin Desktop (ex-Windsurf) and GitHub Copilot configs, plus scripts/scope_guard.py, .lumis/, CONSTITUTION.md, sections in .cursorrules and CLAUDE.md, and a copy of the fingerprints in ~/.lumis/baselines; the hook then refuses the agent's edits to its own files. The plugin itself adds no hooks. Stdlib Python: no network access, no telemetry, no model.",
   "author": {
     "name": "LUMIS",
     "email": "support@lumis.tools",

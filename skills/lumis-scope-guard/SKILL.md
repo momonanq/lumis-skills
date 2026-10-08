@@ -14,11 +14,13 @@ Prompts alone do not hold; this installs hooks that block the change before it h
 - `/lumis-scope-guard init` — ask for the Non-Goals (one per line), optional invariants and stack, then run:
   `python <skill-dir>/scripts/lumis_guard.py init --project "<name>" --non-goals "<a; b; c>" [--invariants "<x; y>"] [--stack "<stack>"] --root <repo root>`
   It writes `.lumis/scope_guard.json`, merges deny rules and hooks into `.claude/settings.json`, writes hook configs for Cursor
-  (`.cursor/hooks.json`), Codex (`.codex/hooks.json`), Windsurf (`.windsurf/hooks.json`) and Copilot
-  (`.github/hooks/lumis-scope-guard.json`) — all of them deny on exit code 2, so one script guards every agent — copies `scripts/scope_guard.py`,
+  (`.cursor/hooks.json`), Codex
+  (`.codex/hooks.json`), Devin Desktop, ex-Windsurf (`.devin/hooks.json`, and the same file at the legacy
+  `.windsurf/hooks.json` for older builds) and GitHub Copilot (`.github/hooks/lumis-scope-guard.json`, Copilot's
+  camelCase format) — all of them deny on exit code 2, so one script guards every agent — copies `scripts/scope_guard.py`,
   writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and marked sections in `.cursorrules` and `CLAUDE.md` (existing content is kept).
   Add `--observe` to install in observe mode, `--unattended` for the unattended profile (both below). The output names the
-  hook version, the mode, the profile and the classes: `Hook 2026-10-05 · mode: enforce · profile: attended · classes: ...`.
+  hook version, the mode, the profile and the classes: `Hook 2026-10-07 · mode: enforce · profile: attended · classes: ...`.
   Add `--ci` to also write `.github/workflows/lumis-boundary-check.yml`, the same boundaries checked on every pull request
   (see "CI check" below). A different file already at that path is never overwritten: the LUMIS copy goes to
   `.github/lumis-boundary-check.lumis.yml` and the output says so. Without `--ci` the output says how to add it.
@@ -92,7 +94,7 @@ lists, never one under `allowed_markers` (`doctor` says so).
 Before the first edit, print a short report and wait for confirmation:
 1. Which MCP servers are actually loaded (list them or say "none").
 2. Which rule files you read: `.cursorrules`, `CLAUDE.md`, `CONSTITUTION.md`.
-3. Which hooks are active (`.claude/settings.json`, `.cursor/hooks.json`, `.codex/hooks.json`, `.windsurf/hooks.json` or `.github/hooks/*.json` → `scripts/scope_guard.py`).
+3. Which hooks are active (`.claude/settings.json`, `.cursor/hooks.json`, `.codex/hooks.json`, `.devin/hooks.json` / `.windsurf/hooks.json` or `.github/hooks/*.json` → `scripts/scope_guard.py`).
 4. The Non-Goals from CONSTITUTION.md, one line each.
 If anything is missing, say so explicitly; never pretend it is loaded.
 
@@ -164,11 +166,11 @@ Each class is set in `.lumis/scope_guard.json`:
 ```
 
 `allow` lets the call through silently, `ask` (the default, and what a missing or misspelled value means) hands the call to the
-founder, `block` refuses it with exit code 2 like a Non-Goal. Only Claude Code and Cursor have a real permission prompt for `ask`:
-the founder sees the reason and clicks. Codex CLI, Windsurf and Copilot have no such answer, so there `ask` is a warning on
-stderr (exit code 1): the call proceeds and the reason stays in the transcript and in the log. If you need a hard stop in those
-clients, set the class to `block`. (For Copilot this is the cautious reading: its hook schema may have an `ask` too, which has not
-been checked against a live client.) A held call is logged as `held`; it is a decision handed to you, not a violation. The agent never
+founder, `block` refuses it with exit code 2 like a Non-Goal. Claude Code, Cursor and GitHub Copilot have a real permission
+prompt for `ask`: the founder sees the reason and clicks (the Copilot cloud agent, with nobody to answer, treats `ask` as a
+refusal). Codex CLI and Devin Desktop (ex-Windsurf) have no such answer, so there `ask` is a warning on stderr (exit code 1):
+the call proceeds and the reason stays in the transcript and in the log. If you need a hard stop in those clients, set the
+class to `block`. Hooks run where the client runs them: Cursor cloud agents and the Copilot cloud agent run the repo's hooks; Codex cloud runs no command hooks, Claude Code cloud sessions read them only in single-repository sessions, Jules has none. The pull-request check reads the diff whatever the client did. Copilot lets a tool call through when a hook times out. Cursor lets a tool call through when the hook crashes or times out (it would need failClosed, which this pack does not set: Cursor's docs do not say whether a hook's own 'allow' skips your approval prompt, and we will not risk that); the hook refuses by itself after 20 s. A held call is logged as `held`; it is a decision handed to you, not a violation. The agent never
 changes `classes`: the config is one of the guard's own files.
 
 A package that is also a Non-Goal trigger stays a Non-Goal refusal; a class only looks at what no boundary already refused.
@@ -236,11 +238,11 @@ It is a review aid, not a security boundary. The spec is `docs/BOUNDARY_CHECK_CI
 
 ## Hook version
 
-The hook carries its release date (`HOOK_VERSION`, now `2026-10-05`) and the config records the version it was written for
+The hook carries its release date (`HOOK_VERSION`, now `2026-10-07`) and the config records the version it was written for
 (`hook_version`). `doctor` compares them. A config newer than the hook is a problem — `the hook in scripts/ is older than the
 config (…): copy scripts/scope_guard.py from the ZIP, then run write-manifest` — because the old hook would ignore the new keys
 in silence. A hook newer than the config is fine: keys the config lacks take their defaults. The fingerprint
-`hook 2026-10-05 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
+`hook 2026-10-07 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
 `request` writes. `2026-09-29` blocks only on high-precision evidence (see "What blocks and what warns"); a config written
 before it may still block a lone word, and `doctor` names those words with `rebuild-markers --dry-run`. `2026-09-30` matches a
 forbidden package as a whole name and reads the package families (`deny_package_prefixes`); a config written before it keeps
@@ -253,7 +255,12 @@ config includes, `HOME` / `XDG_CONFIG_HOME` pointing git elsewhere, a script wri
 that hides the name, git aliases and other plumbing are not seen (the full list: "Limits" in `docs/BOUNDARY_CHECK_CI.md` of the LUMIS repository),
 and git runs no pre-commit hook for a merge, cherry-pick or rebase that applies without conflicts. `doctor` shows
 whether the check is in place, and the pull request check reads the diff whatever happened locally. `2026-10-05` adds the
-unattended profile (above); a config without the `profile` key is attended, judged as by 2026-10-01.
+unattended profile (above); a config without the `profile` key is attended, judged as by 2026-10-01. `2026-10-07`
+corrects the client configs against the vendors' hook pages: Copilot's file is its camelCase format (`version: 1`,
+`preToolUse`, `bash` + `powershell`, `timeoutSec` 25; the old `PreToolUse` + `command` file ran nothing in the Copilot
+cloud agent, which honours only `bash`) and the hook reads Copilot's `{toolName, toolArgs}` payload; Cursor's file gets
+`version: 1` and `timeout: 60` (no `failClosed`, see above); Devin Desktop gets `.devin/hooks.json` next to the legacy `.windsurf/hooks.json`.
+Re-run `init` (or take a new pack) to get them; an older install keeps working where it worked.
 
 ## What `report` shows
 

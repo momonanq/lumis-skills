@@ -7,7 +7,7 @@
 
 `init` writes into the repository root: .lumis/scope_guard.json (triggers), .claude/settings.json (deny rules + hooks,
 merged into an existing file), scripts/scope_guard.py (the hook), CONSTITUTION.md (Non-Goals and invariants verbatim)
-hook configs for Cursor / Codex / Windsurf / Copilot,
+hook configs for Cursor / Codex / Devin Desktop (ex-Windsurf) / GitHub Copilot,
 and LUMIS sections in .cursorrules and CLAUDE.md (existing content kept); with `--ci` also
 .github/workflows/lumis-boundary-check.yml (the same boundaries checked on every pull request diff); with `--pre-commit`
 the git pre-commit hook that checks the staged change before each commit (the hook's own `install-pre-commit`). `check` reports Non-Goal triggers and drift phrases in a text. No network, no model.
@@ -78,7 +78,7 @@ DRIFT_PHRASES = (
 GUARD_SELF_PATHS = (".lumis/scope_guard.json", ".lumis/guard.log", ".lumis/guard.manifest.json",
                     "scripts/scope_guard.py", ".claude/settings.json", ".cursor/hooks.json",
                     ".codex/hooks.json", ".windsurf/hooks.json", ".github/hooks/lumis-scope-guard.json",
-                    "CONSTITUTION.md", guard.CI_WORKFLOW_PATH)
+                    "CONSTITUTION.md", ".devin/hooks.json", guard.CI_WORKFLOW_PATH)
 # Where `init --ci` puts its copy when the repository already has a *different* workflow at CI_WORKFLOW_PATH that
 # is not the one the manifest recorded: next to the workflows, not among them — a second `.yml` inside
 # .github/workflows/ would run as a second check and fight the first over the same pull request comment.
@@ -191,27 +191,40 @@ def hook_command(mode: str, agent: str = "", hook_path: str = "scripts/scope_gua
 
 def agent_hook_files(hook_path: str = "scripts/scope_guard.py") -> dict[str, dict]:
     """Hook configs for the agents that can stop a tool call before it runs. All of them deny on exit code 2,
-    so one script serves Cursor, Codex, Windsurf and Copilot; Claude Code is configured in .claude/settings.json."""
+    so one script serves Cursor, Codex, Devin Desktop (ex-Windsurf) and Copilot; Claude Code is configured in
+    .claude/settings.json. The same files as the pack's (`code_scaffolder.agent_hook_files`, hook 2026-10-07): Cursor
+    with `version: 1` and `timeout: 60` (no `failClosed`: under it every allowed call would need an "allow" answer, and Cursor's docs do not say whether that skips the user's approval prompt), Devin Desktop at `.devin/hooks.json` and the legacy `.windsurf/hooks.json`,
+    Copilot in its camelCase format (`preToolUse`, `bash` + `powershell`, `timeoutSec` 25)."""
     pre = hook_command("pre-tool", "cursor", hook_path)
+    refusing = {"command": pre, "timeout": 60}
     ws = {"command": hook_command("pre-tool", "windsurf", hook_path),
           "powershell": hook_command("pre-tool", "windsurf", hook_path, windows=True), "show_output": True}
+    devin = {"hooks": {
+        "pre_run_command": [dict(ws)],
+        "pre_write_code": [dict(ws)],
+        "pre_mcp_tool_use": [dict(ws)],
+        "pre_user_prompt": [{"command": hook_command("prompt", "windsurf", hook_path),
+                             "powershell": hook_command("prompt", "windsurf", hook_path, windows=True), "show_output": True}],
+    }}
     return {
-        ".cursor/hooks.json": {"hooks": {
-            "preToolUse": [{"command": pre}],
-            "beforeShellExecution": [{"command": pre}],
-            "beforeMCPExecution": [{"command": pre}],
+        ".cursor/hooks.json": {"version": 1, "hooks": {
+            "preToolUse": [dict(refusing)],
+            "beforeShellExecution": [dict(refusing)],
+            "beforeMCPExecution": [dict(refusing)],
             "beforeSubmitPrompt": [{"command": hook_command("prompt", "cursor", hook_path)}],
         }},
         ".codex/hooks.json": {"hooks": {"PreToolUse": [{"command": hook_command("pre-tool", "codex", hook_path)}]}},
-        ".windsurf/hooks.json": {"hooks": {
-            "pre_run_command": [dict(ws)],
-            "pre_write_code": [dict(ws)],
-            "pre_mcp_tool_use": [dict(ws)],
-            "pre_user_prompt": [{"command": hook_command("prompt", "windsurf", hook_path),
-                                 "powershell": hook_command("prompt", "windsurf", hook_path, windows=True), "show_output": True}],
-        }},
-        ".github/hooks/lumis-scope-guard.json": {"hooks": {"PreToolUse": [{"type": "command", "command": hook_command("pre-tool", "copilot", hook_path), "timeout": 15}]}},
+        ".windsurf/hooks.json": json.loads(json.dumps(devin)),
+        ".devin/hooks.json": json.loads(json.dumps(devin)),
+        ".github/hooks/lumis-scope-guard.json": {"version": 1, "hooks": {"preToolUse": [{
+            "type": "command", "bash": hook_command("pre-tool", "copilot", hook_path),
+            "powershell": hook_command("pre-tool", "copilot", hook_path, windows=True), "timeoutSec": 25}]}},
     }
+
+
+# the Copilot file is the guard's own (its name says so): rewritten whole, so a re-run drops the pre-2026-10-07
+# `PreToolUse` entry instead of keeping it next to the new `preToolUse` one
+OWN_HOOK_FILES = (".github/hooks/lumis-scope-guard.json",)
 
 
 def claude_settings(cfg: dict, existing: dict | None) -> dict:
@@ -410,19 +423,23 @@ def cmd_init(args: argparse.Namespace) -> int:
     write_lf(settings_path, json.dumps(claude_settings(cfg, existing), ensure_ascii=False, indent=2) + "\n")
     (root / "scripts").mkdir(parents=True, exist_ok=True)
     write_lf(root / "scripts" / "scope_guard.py", (HERE / "scope_guard.py").read_text(encoding="utf-8"))
-    for rel, content in agent_hook_files().items():  # Cursor, Codex, Windsurf, Copilot — same hook, same exit code 2
+    # Cursor, Codex, Devin Desktop (two paths), Copilot — same hook, same exit code 2
+    for rel, content in agent_hook_files().items():
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         merged = content
-        if target.exists():  # keep the user's own hooks, add ours per event
+        if target.exists() and rel not in OWN_HOOK_FILES:  # keep the user's own hooks, add ours per event
             try:
                 current = json.loads(target.read_text(encoding="utf-8"))
                 hooks = dict(current.get("hooks") or {})
                 for event, entries in content["hooks"].items():
-                    existing_entries = list(hooks.get(event) or [])
-                    if not any("scope_guard.py" in json.dumps(h) for h in existing_entries):
-                        existing_entries += entries
-                    hooks[event] = existing_entries
+                    # the user's entries stay; ours are replaced by the current ones, so a re-run brings an older
+                    # install's entry up to date (Cursor's `timeout`, hook 2026-10-07) instead of keeping it
+                    existing_entries = [h for h in list(hooks.get(event) or []) if "scope_guard.py" not in json.dumps(h)]
+                    hooks[event] = existing_entries + entries
+                for key, value in content.items():  # `version` (Cursor) where the user's file has none
+                    if key != "hooks":
+                        current.setdefault(key, value)
                 current["hooks"] = hooks
                 merged = current
             except Exception:
@@ -470,7 +487,9 @@ def cmd_init(args: argparse.Namespace) -> int:
              "unattended off` to be asked again)" if cfg["profile"] == "unattended" else "")
           + " · classes: " + ", ".join(f"{k} {v}" for k, v in cfg["classes"].items()))
     print("  Files: .lumis/scope_guard.json, .claude/settings.json (merged), scripts/scope_guard.py, " + const_path.name + ", .cursorrules (section), CLAUDE.md (section)")
-    print("  Agents: Claude Code (.claude/settings.json), Cursor (.cursor/hooks.json), Codex (.codex/hooks.json), Windsurf (.windsurf/hooks.json), Copilot (.github/hooks/lumis-scope-guard.json)")
+    print("  Agents: Claude Code (.claude/settings.json), Cursor (.cursor/hooks.json), Codex (.codex/hooks.json), "
+          "Devin Desktop, ex-Windsurf (.devin/hooks.json and the legacy .windsurf/hooks.json), "
+          "GitHub Copilot (.github/hooks/lumis-scope-guard.json)")
     if ci is None:
         print(f"  CI: add --ci to write {guard.CI_WORKFLOW_PATH} (the same check on every pull request)")
     elif ci[1] == "side":
@@ -556,7 +575,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     for rel in (".lumis/scope_guard.json", ".claude/settings.json", "scripts/scope_guard.py", "CONSTITUTION.md", ".cursorrules", "CLAUDE.md", ".lumis/guard.manifest.json",
-                ".cursor/hooks.json", ".codex/hooks.json", ".windsurf/hooks.json", ".github/hooks/lumis-scope-guard.json"):
+                ".cursor/hooks.json", ".codex/hooks.json", ".devin/hooks.json", ".windsurf/hooks.json", ".github/hooks/lumis-scope-guard.json"):
         print(("✓ " if (root / rel).exists() else "✗ ") + rel)
     ci_path = root / guard.CI_WORKFLOW_PATH  # optional: only `init --ci` (or a LUMIS ZIP) writes it
     print(("✓ " + guard.CI_WORKFLOW_PATH) if ci_path.exists() else f"– {guard.CI_WORKFLOW_PATH} (optional: init --ci)")

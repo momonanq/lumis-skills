@@ -6,10 +6,12 @@ so the same guard works everywhere; only the config file and the payload shape d
 
   agent            config written by LUMIS               events
   Claude Code      .claude/settings.json                 PreToolUse, UserPromptSubmit
-  Cursor           .cursor/hooks.json                    preToolUse, beforeShellExecution, beforeSubmitPrompt
+  Cursor           .cursor/hooks.json                    preToolUse, beforeShellExecution, beforeMCPExecution,
+                                                         beforeSubmitPrompt
   Codex CLI        .codex/hooks.json                     PreToolUse
-  Windsurf/Cascade .windsurf/hooks.json                  pre_run_command, pre_write_code, pre_user_prompt
-  Copilot (VS Code) .github/hooks/lumis-scope-guard.json PreToolUse
+  Devin Desktop    .devin/hooks.json (and the legacy     pre_run_command, pre_write_code, pre_mcp_tool_use,
+  (ex-Windsurf)    .windsurf/hooks.json, same content)   pre_user_prompt
+  GitHub Copilot   .github/hooks/lumis-scope-guard.json  preToolUse (CLI, cloud agent; VS Code maps it)
 
   * `python scripts/scope_guard.py pre-tool [--agent <name>]`
         blocks (exit 2) when the change or command touches a Non-Goal trigger:
@@ -69,7 +71,7 @@ so the same guard works everywhere; only the config file and the payload shape d
         the pull request check reads the diff again. Yours to run: the hook refuses it to the agent.
 
 `--agent` only picks the shape of the refusal each client renders best; the payload is recognised automatically,
-so a missing or wrong flag still blocks with exit 2. Every block and warning is appended to .lumis/guard.log
+so a missing or wrong flag still blocks with exit 2 (`--agent devin` is the same as `--agent windsurf`). Every block and warning is appended to .lumis/guard.log
 (one JSON object per line: time, agent, event, tool, path, what was attempted with obvious secrets stripped, hits). The log stays in the repository; nothing is
 sent anywhere. Edit .lumis/scope_guard.json to tune; re-run the LUMIS consilium (or Amend) to change the
 boundaries themselves.
@@ -98,7 +100,7 @@ for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to a legacy
 # The release this script belongs to — bump it on every change of this file. The pack writes the same string into
 # .lumis/scope_guard.json as `hook_version`, so `doctor` can tell a config that expects a newer hook (keys the old
 # script would ignore in silence) from a hook that is merely newer than its config (harmless: new keys take defaults).
-HOOK_VERSION = "2026-10-05"
+HOOK_VERSION = "2026-10-07"
 
 # --- the budget: a guard that cannot finish reading refuses (third review of 30.09) -------------------------------
 # Claude Code gives a hook 60 s by default and treats one that runs longer as a non-blocking error: the change lands.
@@ -194,17 +196,77 @@ def project_root() -> Path:
 # --- one payload shape out of five ----------------------------------------------------------------------------
 WINDSURF_EVENTS = {"pre_run_command": "Bash", "post_run_command": "Bash", "pre_write_code": "Write", "post_write_code": "Write",
                    "pre_read_code": "Read", "pre_mcp_tool_use": "MCP"}
+# `--agent devin` is Devin Desktop, the product formerly Windsurf (renamed 02.06.2026): the same Cascade payload and
+# the same answers, so it is the `windsurf` adapter under its new name. The generated configs keep `--agent windsurf`.
+AGENT_ALIASES = {"devin": "windsurf"}
+# GitHub Copilot's camelCase hooks (CLI and cloud agent, `.github/hooks/*.json` with `preToolUse`) send
+# {sessionId, timestamp, cwd, toolName, toolArgs}; toolArgs is an object, or a JSON string in the CLI docs' own test
+# input (`"toolArgs":"{\"command\":\"ls\"}"`). The runtime tools are documented by name only — bash, powershell,
+# create, edit, view, grep, glob, ... — not by their argument names, so the arguments are read defensively: a
+# `command`/`cmd` string is a shell call, a path with content is a write (an edit when an old string is there too).
+# Any other tool (an MCP tool, `task`, `web_fetch`) keeps its name and arguments and is judged like an MCP call.
+COPILOT_SHELL_TOOLS = {"bash", "powershell"}
+COPILOT_READ_TOOLS = {"view": "Read", "grep": "Grep", "rg": "Grep", "glob": "Glob"}
+COPILOT_PATH_KEYS = ("path", "file_path", "filePath")
+COPILOT_BODY_KEYS = ("file_text", "content", "contents", "new_str", "new_string", "newText", "text")
+COPILOT_OLD_KEYS = ("old_str", "old_string", "oldText")
+COPILOT_EDITOR_VERBS = {"view", "create", "str_replace", "insert", "undo_edit"}
+
+
+def copilot_tool_call(tool: str, args: object) -> tuple[str, dict]:
+    """(tool_name, tool_input) in the shapes the rest of this script reads (Bash / Write / Edit / Read / the name as
+    given) for one Copilot `toolName` + `toolArgs`."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {"arguments": args}
+    args = dict(args) if isinstance(args, dict) else {}
+    low = str(tool or "").strip().lower()
+
+    def first(keys: tuple[str, ...]) -> str | None:
+        return next((args[k] for k in keys if isinstance(args.get(k), str)), None)
+
+    command = first(("command", "cmd"))
+    if low in COPILOT_SHELL_TOOLS:
+        return "Bash", {"command": command or ""}
+    path, body, old = first(COPILOT_PATH_KEYS), first(COPILOT_BODY_KEYS), first(COPILOT_OLD_KEYS)
+    # an editor tool in the str_replace-editor style names its action in `command` (view, create, str_replace, …):
+    # that is a file operation on `path`, not a shell command
+    verb = command if (command in COPILOT_EDITOR_VERBS and path is not None) else None
+    if verb is not None:
+        args = {k: v for k, v in args.items() if k != "command"}
+    if low in COPILOT_READ_TOOLS or verb == "view":
+        return COPILOT_READ_TOOLS.get(low, "Read"), args
+    # a list of edits, where a tool sends one, is read as Devin Desktop's and Cursor's are
+    edits = {"edits": args["edits"]} if isinstance(args.get("edits"), list) else {}
+    if low == "edit" or verb in ("str_replace", "insert"):
+        return "Edit", {"file_path": path or "", "old_string": old or "", "new_string": body or "", **edits}
+    if low == "create" or verb == "create":
+        return "Write", {"file_path": path or "", "content": body or "", **edits}
+    if command is not None and verb is None:
+        return "Bash", {"command": command}
+    if path is not None and old is not None:
+        return "Edit", {"file_path": path, "old_string": old, "new_string": body or "", **edits}
+    if path is not None and body is not None:
+        return "Write", {"file_path": path, "content": body, **edits}
+    return str(tool or ""), args
 
 
 def normalize_payload(payload: dict) -> tuple[str, dict, str, str]:
     """(tool_name, tool_input, prompt, detected_agent) for any of the supported clients.
 
-    Claude Code, Codex, Copilot and Cursor's preToolUse already send {tool_name, tool_input}; Cursor's
-    beforeShellExecution sends a flat {command, cwd}; Windsurf wraps everything in {agent_action_name, tool_info}.
+    Claude Code, Codex, Cursor's preToolUse and Copilot's VS Code-compatible format (`PreToolUse`) send {tool_name,
+    tool_input}; Copilot's own camelCase format (`preToolUse`) sends {toolName, toolArgs}; Cursor's
+    beforeShellExecution sends a flat {command, cwd}; Devin Desktop (ex-Windsurf) wraps everything in
+    {agent_action_name, tool_info}.
     """
     if not isinstance(payload, dict):
         return "", {}, "", ""
-    if payload.get("agent_action_name"):  # Windsurf / Cascade
+    if "toolName" in payload:  # GitHub Copilot CLI / cloud agent (camelCase); hook 2026-10-07
+        name, args = copilot_tool_call(str(payload.get("toolName") or ""), payload.get("toolArgs"))
+        return name, args, "", "copilot"
+    if payload.get("agent_action_name"):  # Devin Desktop (ex-Windsurf) / Cascade
         event = str(payload.get("agent_action_name"))
         info = payload.get("tool_info") or {}
         if event == "pre_user_prompt":
@@ -231,30 +293,70 @@ def normalize_payload(payload: dict) -> tuple[str, dict, str, str]:
     return "", {}, str(payload.get("prompt") or payload.get("user_prompt") or ""), ""
 
 
+# What this run has already answered on stdout, and in which of Copilot's two formats it was called. `main` sets
+# `copilot_vscode` when `--agent copilot` arrives with the {tool_name, tool_input} payload — Copilot's VS Code-compatible
+# format (`PreToolUse`), which VS Code answers in Claude's `hookSpecificOutput` shape — and leaves it off for the
+# camelCase payload, whose answer is the top-level {permissionDecision, permissionDecisionReason}.
+_ANSWER = {"printed": False, "copilot_vscode": False}
+
+
+def _answer(obj: dict) -> None:
+    print(json.dumps(obj, ensure_ascii=False))
+    _ANSWER["printed"] = True
+
+
+def _copilot_decision(decision: str, message: str) -> dict:
+    if _ANSWER["copilot_vscode"]:
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                       "permissionDecisionReason": message}}
+    return {"permissionDecision": decision, "permissionDecisionReason": message}
+
+
 def emit_denial(agent: str, message: str) -> None:
     """Every client denies on exit 2; those that also render a structured reason get one."""
     sys.stderr.write(message + "\n")
     if agent == "cursor":
-        print(json.dumps({"permission": "deny", "user_message": message, "agent_message": message}, ensure_ascii=False))
+        _answer({"permission": "deny", "user_message": message, "agent_message": message})
     elif agent == "copilot":
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": message}}, ensure_ascii=False))
+        _answer(_copilot_decision("deny", message))
     elif agent == "codex":
-        print(json.dumps({"permissionDecision": "deny", "permissionDecisionReason": message}, ensure_ascii=False))
+        _answer({"permissionDecision": "deny", "permissionDecisionReason": message})
 
 
 def emit_ask(agent: str, message: str) -> int:
-    """Hand the decision to the human, where the client can: Claude Code and Cursor show a permission prompt for an
-    "ask" answer on exit 0. Codex, Windsurf and Copilot have no such answer, so they get the warning on stderr and
-    exit 1 — the call proceeds and the founder reads why in the transcript and in the log. Returns the exit code."""
+    """Hand the decision to the human, where the client can: Claude Code, Cursor and Copilot take an "ask" answer on
+    exit 0 (Copilot: a prompt in the CLI and in VS Code; its cloud agent, with nobody to answer, treats "ask" as
+    "deny"). Codex and Devin Desktop (ex-Windsurf) have no such answer, so they get the warning on stderr and exit 1 —
+    the call proceeds and the founder reads why in the transcript and in the log. Returns the exit code."""
     if agent == "claude":
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
-                                                 "permissionDecisionReason": message}}, ensure_ascii=False))
+        _answer({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
+                                        "permissionDecisionReason": message}})
         return 0
     if agent == "cursor":
-        print(json.dumps({"permission": "ask", "userMessage": message, "agentMessage": message}, ensure_ascii=False))
+        _answer({"permission": "ask", "userMessage": message, "agentMessage": message})
+        return 0
+    if agent == "copilot":
+        sys.stderr.write(message + "\n")
+        _answer(_copilot_decision("ask", message))
         return 0
     sys.stderr.write(message + "\n")
     return 1
+
+
+def client_exit(agent: str, code: int) -> int:
+    """The exit code a pre-tool verdict leaves with in this client (hook 2026-10-07). Exit 1 is "proceed, with a
+    warning on stderr" in Claude Code, Codex, Cursor and Devin Desktop, but not in Copilot: its camelCase `preToolUse`
+    is fail-closed on any non-zero exit but 2 ("A crashed or explicitly-denying hook still fails-closed"), so a warning
+    there exits 0 — "Empty output uses default behavior". The warning stays on stderr and in .lumis/guard.log.
+
+    Never an "allow" answer: a call the hook lets through gets no stdout in any client. A hook's own "allow" may skip
+    the user's approval prompt (it does in Claude Code; Cursor's docs do not say), so the hook leaves that decision to
+    the client — which is also why the Cursor configs carry no `failClosed`, under which no output would block."""
+    if code == 2 or _ANSWER["printed"]:
+        return code
+    if agent == "copilot" and not _ANSWER["copilot_vscode"]:
+        return 0
+    return code
 
 
 def guard_mode(cfg: dict) -> str:
@@ -445,6 +547,10 @@ GUARD_FILES = (
     ".claude/settings.json", ".cursor/hooks.json", ".codex/hooks.json", ".windsurf/hooks.json",
     ".github/hooks/lumis-scope-guard.json",
     "CONSTITUTION.md",
+    # Devin Desktop (ex-Windsurf) reads `.devin/hooks.json` first and `.windsurf/hooks.json` only when that one is
+    # absent (hook 2026-10-07): an agent that wrote a `.devin/hooks.json` of its own would replace the legacy file's
+    # hooks without touching it. Listed after the older names so an install without it fingerprints as before.
+    ".devin/hooks.json",
     # Claude Code reads the project-local override too, and `{"disableAllHooks": true}` there switches this hook off
     # as surely as an edit of settings.json does (audit 2026-09-23). It is not fingerprinted (see MANIFEST_FILES):
     # the client itself writes it whenever the founder clicks "always allow".
@@ -455,7 +561,7 @@ GUARD_FILES = (
 GUARD_TEXT_FILES = (".cursorrules", "CLAUDE.md", "AGENTS.md")
 # the directories that hold the guard: `rm -rf .lumis`, `mv scripts scripts_old`, `tar -C scripts` rewrite it just as
 # surely as a write to the file (the 2026-09-11 tamper test: five of eleven passes were directory-level)
-GUARD_DIRS = (".lumis", "scripts", ".claude", ".cursor", ".codex", ".windsurf", ".github/hooks")
+GUARD_DIRS = (".lumis", "scripts", ".claude", ".cursor", ".codex", ".windsurf", ".devin", ".github/hooks")
 # executables that replace, remove or unpack over a directory; `ls scripts` and `git add scripts` are not these
 DIR_MUTATORS = {"rm", "rmdir", "rd", "del", "erase", "mv", "move", "ren", "rename", "cp", "copy", "xcopy", "robocopy",
                 "rsync", "tar", "unzip", "7z", "chmod", "chown", "chattr", "ln", "truncate", "shred", "unlink",
@@ -4980,8 +5086,9 @@ AGENT_CONFIGS = {
     "Claude Code": (".claude/settings.json", "hooks"),
     "Cursor": (".cursor/hooks.json", "hooks"),
     "Codex CLI": (".codex/hooks.json", "hooks"),
-    "Windsurf": (".windsurf/hooks.json", "hooks"),
-    "Copilot (VS Code)": (".github/hooks/lumis-scope-guard.json", "hooks"),
+    "Devin Desktop (ex-Windsurf)": (".devin/hooks.json", "hooks"),
+    "Devin Desktop, legacy path": (".windsurf/hooks.json", "hooks"),
+    "GitHub Copilot": (".github/hooks/lumis-scope-guard.json", "hooks"),
 }
 
 
@@ -5044,8 +5151,9 @@ def doctor() -> int:
                       " (`python scripts/scope_guard.py unattended off` to be asked again)")
             else:
                 # "waits for you" holds only where the client has an ask (review 05.10)
-                print("  · profile: attended (default) — a held call is asked in Claude Code and Cursor, and warned"
-                      " about and let through in Codex CLI, Windsurf and Copilot")
+                print("  · profile: attended (default) — a held call is asked in Claude Code, Cursor and GitHub Copilot (its"
+                      " cloud agent treats a question as a refusal), and warned about and let through in Codex CLI and"
+                      " Devin Desktop (ex-Windsurf)")
             # a switch leaves a journal line whoever ran it: the founder, or code that hid the agent's marker
             switches = [e for e in read_log({"log": ".lumis/guard.log"}) if e.get("event") == "switched"]
             if switches:
@@ -5077,7 +5185,12 @@ def doctor() -> int:
     for agent, (rel, key) in AGENT_CONFIGS.items():
         path = root / rel
         if not path.exists():
-            print(f"  – {agent}: {rel} not present (fine if you do not use it)")
+            if rel == ".devin/hooks.json" and (root / ".windsurf" / "hooks.json").exists():
+                # an install from before hook 2026-10-07: Devin Desktop reads the legacy file when this one is absent
+                print(f"  – {agent}: {rel} not present — Devin Desktop reads the legacy .windsurf/hooks.json instead"
+                      " (a new pack or `init` writes both)")
+            else:
+                print(f"  – {agent}: {rel} not present (fine if you do not use it)")
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -5090,17 +5203,24 @@ def doctor() -> int:
             problems.append(f"{rel} exists but does not call scope_guard.py")
             print(f"  ✗ {agent}: {rel} — no scope_guard.py in it")
             continue
-        # Windsurf carries a separate "powershell" command for Windows; check only what this OS would run
+        # Devin Desktop and Copilot carry a separate "powershell" command for Windows (Copilot's POSIX one is "bash");
+        # check only what this OS would run
         win = os.name == "nt"
         for entries in (data.get(key) or {}).values() if isinstance(data.get(key), dict) else []:
             for entry in entries if isinstance(entries, list) else []:
                 if not isinstance(entry, dict):
                     continue
                 for hook in (entry.get("hooks") or [entry]):
-                    line = str((hook.get("powershell") if win and hook.get("powershell") else hook.get("command")) or "")
+                    line = str((hook.get("powershell") if win and hook.get("powershell")
+                                else hook.get("command") or hook.get("bash")) or "")
                     if "scope_guard.py" in line:
                         interpreters.add(line)
         print(f"  ✓ {agent}: {rel}")
+        if rel == ".github/hooks/lumis-scope-guard.json" and "preToolUse" not in (data.get(key) or {}):
+            # written before hook 2026-10-07: `PreToolUse` with `command` only and no `version` — the Copilot cloud
+            # agent honours only `bash`, so it ran nothing there
+            print("    · written before hook 2026-10-07 (no camelCase preToolUse, no bash command): the Copilot cloud agent"
+                  " runs no hook from it — a new pack or `init` rewrites it")
     # a hook line names the interpreters it may run (`python` first, `python3` when there is no bare `python`);
     # it starts as long as one of them is on PATH — stock macOS/Linux have no `python`, Windows has no `python3`
     for line in sorted(interpreters):
@@ -5233,7 +5353,7 @@ def rebaseline(root: Path) -> tuple[dict, Path | None]:
 
 # The variable each agent client sets in the shells it spawns for the agent's commands. CLAUDECODE=1 was read in a
 # Claude Code session on the founder's machine (2026-09-23); CODEX_SANDBOX and CODEX_SANDBOX_NETWORK_DISABLED are
-# what Codex CLI documents for its sandboxed commands. Cursor, Windsurf and Copilot set nothing this script knows of,
+# what Codex CLI documents for its sandboxed commands. Cursor, Devin Desktop and Copilot set nothing this script knows of,
 # so there the check cannot tell an agent from the founder — it is a speed bump, not a lock.
 AGENT_SHELL_MARKERS = ("CLAUDECODE", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED")
 
@@ -5269,8 +5389,8 @@ def set_unattended(root: Path, on: bool) -> int:
         "the project, a commit past the pre-commit check) is refused with its reason instead, and the agent can carry on "
         "with the rest. Read them in the morning: python scripts/scope_guard.py report. Back to being asked: "
         "python scripts/scope_guard.py unattended off") if on else
-        "profile: attended — a held call is asked again in Claude Code and Cursor, and warned about and let through in "
-        "Codex CLI, Windsurf and Copilot.")
+        "profile: attended — a held call is asked again in Claude Code, Cursor and GitHub Copilot (its cloud agent "
+        "treats a question as a refusal), and warned about and let through in Codex CLI and Devin Desktop (ex-Windsurf).")
 
 
 def log_switch(root: Path, cfg: dict, key: str, old: str, new: str) -> None:
@@ -8582,7 +8702,7 @@ def parse_args(argv: list[str]) -> tuple[str, str]:
             agent = rest.pop(0).strip().lower()
         elif arg.startswith("--agent="):
             agent = arg.split("=", 1)[1].strip().lower()
-    return mode, agent
+    return mode, AGENT_ALIASES.get(agent, agent)
 
 
 USAGE = """LUMIS Scope Guard — scripts/scope_guard.py <mode>
@@ -8667,6 +8787,8 @@ def main() -> int:
     record_baseline_if_absent(project_root())
     payload = read_stdin_json()
     tool_name, tool_input, prompt, detected = normalize_payload(payload)
+    # `--agent copilot` with the {tool_name, tool_input} payload: Copilot's VS Code-compatible format, answered in its shape
+    _ANSWER["copilot_vscode"] = agent == "copilot" and detected != "copilot"
     agent = agent or detected or "claude"
     if mode == "prompt" or (not tool_name and prompt):
         # the earliest signal: the request itself names a boundary. The prompt hook cannot block a tool call — none
@@ -8698,11 +8820,11 @@ def main() -> int:
         code = pre_tool(cfg, agent, tool_name, tool_input)
         if code != 2:
             scan_checkpoint()  # the parts no reader watches (the classes, the warnings) count against the budget too
-        return code
     except ScanBudgetExceeded:
-        return refuse_unfinished(cfg, agent, tool_name, tool_input)
+        code = refuse_unfinished(cfg, agent, tool_name, tool_input)
     finally:
         stop_scan_budget()
+    return client_exit(agent, code)
 
 
 def pre_tool(cfg: dict, agent: str, tool_name: str, tool_input: dict) -> int:
@@ -8856,7 +8978,7 @@ def pre_tool(cfg: dict, agent: str, tool_name: str, tool_input: dict) -> int:
         log_event(cfg, event, tool_name, tool_input, labels, agent, attempted=attempted_text or command,
                   unattended=unattended)
         if blocking or unattended:
-            # exit 2 in every client: Codex, Windsurf and Copilot, which have no "ask", get a real refusal here
+            # exit 2 in every client: Codex and Devin Desktop, which have no "ask", get a real refusal here
             emit_denial(agent, message)
             return 2
         return emit_ask(agent, message)
