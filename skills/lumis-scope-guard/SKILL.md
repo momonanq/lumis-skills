@@ -12,7 +12,7 @@ Prompts alone do not hold; this installs hooks that block the change before it h
 ## Commands
 
 - `/lumis-scope-guard init` — ask for the Non-Goals (one per line), optional invariants and stack, then run:
-  `python <skill-dir>/scripts/lumis_guard.py init --project "<name>" --non-goals "<a; b; c>" [--invariants "<x; y>"] [--stack "<stack>"] --root <repo root>`
+  `python <skill-dir>/scripts/lumis_guard.py init --project "<name>" --non-goals "<a; b; c>" [--invariants "<x; y>"] [--stack "<stack>"] [--deny-paths "<file; folder/>"] --root <repo root>`
   It writes `.lumis/scope_guard.json`, merges deny rules and hooks into `.claude/settings.json`, writes hook configs for Cursor
   (`.cursor/hooks.json`), Codex
   (`.codex/hooks.json`), Devin Desktop, ex-Windsurf (`.devin/hooks.json`, and the same file at the legacy
@@ -20,13 +20,21 @@ Prompts alone do not hold; this installs hooks that block the change before it h
   camelCase format) — all of them deny on exit code 2, so one script guards every agent — copies `scripts/scope_guard.py`,
   writes `CONSTITUTION.md` (never overwrites a hand-written one — it creates `CONSTITUTION.lumis.md` instead) and marked sections in `.cursorrules` and `CLAUDE.md` (existing content is kept).
   Add `--observe` to install in observe mode, `--unattended` for the unattended profile (both below). The output names the
-  hook version, the mode, the profile and the classes: `Hook 2026-10-07 · mode: enforce · profile: attended · classes: ...`.
+  hook version, the mode, the profile and the classes: `Hook 2026-10-26 · mode: enforce · profile: attended · classes: ...`.
   Add `--ci` to also write `.github/workflows/lumis-boundary-check.yml`, the same boundaries checked on every pull request
   (see "CI check" below). A different file already at that path is never overwritten: the LUMIS copy goes to
   `.github/lumis-boundary-check.lumis.yml` and the output says so. Without `--ci` the output says how to add it.
   Add `--pre-commit` (or run `python scripts/scope_guard.py install-pre-commit` yourself) for the same check on the staged
   change before each commit: local only — each clone installs it once, `git commit --no-verify` skips it, the pull request
   check is the server-side one; a pre-commit hook that is not LUMIS's is never overwritten (the line to add is printed).
+  Add `--deny-paths "api/openapi.yaml; auth/"` (semicolon- or newline-separated, like `--non-goals`) for the paths no
+  sentence names well enough — a contract file, a folder (a trailing `/`): each is cleaned (`./`, `x/../`, doubled
+  slashes and backslashes resolved, lower-cased, a leading `/` means the repository root) and added to `deny_paths`, so a
+  Write, an Edit or a command that writes it is refused however the path is spelled (`api/sub/../openapi.yaml`, an
+  absolute path inside the repository). The refusal names the Non-Goal whose text mentions the path or its last segment, or
+  else a boundary of its own, `PATH-n` "Protected path: <path>" (set by the founder); the output lists them under
+  `Protected paths:`, and `doctor` lists them as protected (an existing contract file is not a problem there). Do not edit
+  `.lumis/scope_guard.json` by hand for this.
 - `/lumis-scope-guard check-diff` — run `python scripts/scope_guard.py check-diff --base <target branch>` from the repository
   and report the verdict and each finding it prints. Read-only: it reads git and prints; do not add `--markdown`, `--sarif` or
   `--json` (writing a file with the hook's command is refused to the agent).
@@ -238,11 +246,11 @@ It is a review aid, not a security boundary. The spec is `docs/BOUNDARY_CHECK_CI
 
 ## Hook version
 
-The hook carries its release date (`HOOK_VERSION`, now `2026-10-07`) and the config records the version it was written for
+The hook carries its release date (`HOOK_VERSION`, now `2026-10-26`) and the config records the version it was written for
 (`hook_version`). `doctor` compares them. A config newer than the hook is a problem — `the hook in scripts/ is older than the
 config (…): copy scripts/scope_guard.py from the ZIP, then run write-manifest` — because the old hook would ignore the new keys
 in silence. A hook newer than the config is fine: keys the config lacks take their defaults. The fingerprint
-`hook 2026-10-07 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
+`hook 2026-10-26 · hook <digest> · config <digest>` ends the first line of `report` and of `doctor`, and closes the file
 `request` writes. `2026-09-29` blocks only on high-precision evidence (see "What blocks and what warns"); a config written
 before it may still block a lone word, and `doctor` names those words with `rebuild-markers --dry-run`. `2026-09-30` matches a
 forbidden package as a whole name and reads the package families (`deny_package_prefixes`); a config written before it keeps
@@ -260,7 +268,12 @@ corrects the client configs against the vendors' hook pages: Copilot's file is i
 `preToolUse`, `bash` + `powershell`, `timeoutSec` 25; the old `PreToolUse` + `command` file ran nothing in the Copilot
 cloud agent, which honours only `bash`) and the hook reads Copilot's `{toolName, toolArgs}` payload; Cursor's file gets
 `version: 1` and `timeout: 60` (no `failClosed`, see above); Devin Desktop gets `.devin/hooks.json` next to the legacy `.windsurf/hooks.json`.
-Re-run `init` (or take a new pack) to get them; an older install keeps working where it worked.
+Re-run `init` (or take a new pack) to get them; an older install keeps working where it worked. `2026-10-26` matches a
+forbidden path against the target as the file system resolves it — before it, `api/sub/../openapi.yaml`, `api/./openapi.yaml`,
+`api//openapi.yaml` and an absolute path inside the repository passed a `deny_paths` entry `api/openapi.yaml` (an outside
+tester's row); an absolute path outside the repository is judged by the `outside_root` class, never as a crossing. It adds
+`init --deny-paths` (above), and `note`, `notes`, `write`, `writes` only warn beside another marker of their boundary (see
+`rebuild-markers --dry-run` for a config written before). No config key is required: `declared_paths` is optional.
 
 ## What `report` shows
 

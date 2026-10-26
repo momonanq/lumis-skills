@@ -100,7 +100,7 @@ for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to a legacy
 # The release this script belongs to — bump it on every change of this file. The pack writes the same string into
 # .lumis/scope_guard.json as `hook_version`, so `doctor` can tell a config that expects a newer hook (keys the old
 # script would ignore in silence) from a hook that is merely newer than its config (harmless: new keys take defaults).
-HOOK_VERSION = "2026-10-07"
+HOOK_VERSION = "2026-10-26"
 
 # --- the budget: a guard that cannot finish reading refuses (third review of 30.09) -------------------------------
 # Claude Code gives a hook 60 s by default and treats one that runs longer as a non-blocking error: the change lands.
@@ -2486,10 +2486,7 @@ def trigger_hits(cfg: dict, text: str, path: str = "", *, file: str = "", shell:
     hits: list[tuple[str, str]] = [("package", pkg) for pkg in
                                    package_hits(cfg, text, file or path, shell=shell, prose=prose, statement=statement,
                                                 statement_base=statement_base)]
-    slashed_path, slashed_text = str(path or "").replace("\\", "/").lower(), low.replace("\\", "/")
-    for deny_path in cfg.get("deny_paths", []):
-        if deny_path and (deny_path_pattern(deny_path).search(slashed_path) or deny_path_pattern(deny_path).search(slashed_text)):
-            hits.append(("path", deny_path))
+    hits += [("path", deny_path) for deny_path in deny_path_hits(cfg, path, low)]
     words = _without_home_folders(text)
     low_words, spelled = words.lower(), _spelled_out(words)
     for kw in cfg.get("keywords", []):
@@ -2504,14 +2501,91 @@ _DENY_PATH_PATTERNS: dict[str, "re.Pattern[str]"] = {}
 def deny_path_pattern(deny_path: str) -> "re.Pattern[str]":
     """A forbidden path as a whole path segment: `ios/` is src/ios/App.swift and `ios/` itself, never
     `scenarios/`, `studios/` or `portfolios/`. A plain substring test refused `pytest tests/scenarios/` and a commit
-    message about "the scenarios/ page" as crossings of «No native iOS/Android apps» (audit 2026-09-23)."""
-    low = str(deny_path or "").replace("\\", "/").lower()
-    pattern = _DENY_PATH_PATTERNS.get(low)
+    message about "the scenarios/ page" as crossings of «No native iOS/Android apps» (audit 2026-09-23).
+    The config's spelling is cleaned once, like the target's (`_clean_target`): `./api/openapi.yaml`,
+    `api\\openapi.yaml` and `api//openapi.yaml` are the entry `api/openapi.yaml`, `auth\\` is the folder `auth/`
+    (2026-10-26). An entry that cleans to nothing (`./`) matches nothing, never everything."""
+    key = str(deny_path or "")
+    pattern = _DENY_PATH_PATTERNS.get(key)
     if pattern is None:
+        low = _clean_target(key)
         head = r"(?<![A-Za-z0-9_.\-])" if low[:1].isalnum() or low[:1] == "_" else ""
-        pattern = re.compile(head + re.escape(low))
-        _DENY_PATH_PATTERNS[low] = pattern
+        pattern = re.compile(head + re.escape(low)) if low else re.compile(r"(?!)")
+        _DENY_PATH_PATTERNS[key] = pattern
     return pattern
+
+
+def _clean_target(token: str) -> str:
+    """`_clean_path`, keeping a folder a folder: `auth/`, `auth/.` and `auth/sub/..` are `auth/` — the trailing
+    slash is what makes a forbidden path a folder (`deny_paths`, `init --deny-paths`)."""
+    t = str(token or "").strip().strip("'\"`").replace("\\", "/")
+    clean = _clean_path(t)
+    if clean and not clean.endswith("/") and (t.endswith(("/", "/.", "/..")) or t in (".", "..")):
+        clean += "/"
+    return clean
+
+
+def deny_path_hits(cfg: dict, path: str = "", text: str = "") -> list[str]:
+    """The forbidden paths (`deny_paths`) a target path or a text reaches, as the config lists them — the one
+    deny_paths matcher: `trigger_hits` (the hook, `scan_fragment`, the studio) and `path_findings` (`check-diff`'s
+    diff file headers) read through it. Pure, linear in the input.
+
+    Each entry is compared, segment-anchored (`deny_path_pattern`), with the target as spelled and as the file system
+    resolves it (`_clean_path`: `./`, `x/../` and doubled slashes gone), and in a text — a shell command, a line of
+    content — with every whitespace-separated word holding a slash, cleaned the same way. Until 2026-10-26 only the
+    spelling was compared: with `deny_paths: ["api/openapi.yaml"]` a Write to `api/sub/../openapi.yaml`,
+    `api/./openapi.yaml`, `api//openapi.yaml` or `<root>\\api\\sub\\..\\openapi.yaml`, and `sed -i … api/sub/../openapi.yaml`,
+    passed with exit 0 (an outside tester's contract-file row, 26.10). An absolute target inside the project still
+    holds `…/api/openapi.yaml` once cleaned; one outside it is not this matcher's to read (`judge_tool_input`)."""
+    deny = [d for d in cfg.get("deny_paths") or [] if str(d or "").strip()]
+    if not deny or not (path or text):
+        return []
+    forms: list[str] = []
+    if path:
+        forms += [str(path).replace("\\", "/").lower(), _clean_target(path)]
+    if text:
+        slashed = str(text).lower().replace("\\", "/")
+        forms.append(slashed)
+        if "/." in slashed or "//" in slashed:  # nothing for the cleaning to change otherwise
+            forms.append(" ".join(_clean_target(word) for word in slashed.split() if "/" in word))
+    return [d for d in deny if any(form and deny_path_pattern(d).search(form) for form in forms)]
+
+
+def _mentions_path(text: str, path: str) -> bool:
+    """A Non-Goal's text names the path, or its last segment, as a whole word (`auth/` is not in «No OAuth»)."""
+    low = str(text or "").lower()
+    whole, last = path.lower().rstrip("/"), path.lower().rstrip("/").rsplit("/", 1)[-1]
+    return any(re.search(r"(?<![a-z0-9_])" + re.escape(name) + r"(?![a-z0-9_])", low) for name in {whole, last} if name)
+
+
+def declared_paths(raw: list[str] | str, boundaries: list[dict], sources: dict | None = None) -> dict:
+    """The founder's protected paths (`init --deny-paths`, `generate_scope_guard_config(deny_paths=…)`), ready to
+    merge into a config: `{"paths": [...], "sources": {path: boundary id}, "boundaries": [new boundaries]}`. Pure.
+
+    Each entry is cleaned as the matcher cleans it (`_clean_target`; a trailing slash keeps a folder a folder, a
+    leading `/` means the project root); one that leaves the project (`../x`) or cleans to nothing is dropped. Its
+    source is, in this order: the boundary the config already gives it (`sources`, a lexicon path such as
+    `billing/`), the first Non-Goal whose text names the path or its last segment, else a boundary of its own —
+    `PATH-n`, "Protected path: <path>", set by the founder — so a refusal still says which boundary and who set it."""
+    items = re.split(r"[;\n]", raw) if isinstance(raw, str) else [str(p) for p in raw or []]
+    sources = {str(k).lower(): str(v) for k, v in (sources or {}).items()}
+    out: dict = {"paths": [], "sources": {}, "boundaries": []}
+    taken = sum(1 for b in boundaries or [] if str(b.get("kind") or "") == "path")
+    for item in items:
+        path = _clean_target(item).lstrip("/")
+        if not path.strip("/") or path == ".." or path.startswith("../") or path in out["paths"]:
+            continue
+        out["paths"].append(path)
+        if path in sources:
+            continue
+        named = next((b for b in boundaries or [] if str(b.get("kind") or "") != "path"
+                      and _mentions_path(str(b.get("text") or ""), path)), None)
+        if named is None:
+            named = {"id": f"PATH-{taken + len(out['boundaries']) + 1}", "text": f"Protected path: {path}", "origin": "founder",
+                     "source": ".lumis/scope_guard.json (init --deny-paths)", "kind": "path"}
+            out["boundaries"].append(named)
+        out["sources"][path] = str(named.get("id") or "")
+    return out
 
 
 # `C:\Users\<name>\…`, `/Users/<name>/…`, `/home/<name>/…`: the folder every absolute path on the machine starts with.
@@ -2984,7 +3058,11 @@ def judge_tool_input(cfg: dict, tool_name: str, tool_input: dict) -> dict[str, l
         units, file = [_command_without_data(text)], ""
     else:
         units, file = str(text or "").split("\n"), path
-        judged["block"] += [(kind, trigger, "") for kind, trigger in trigger_hits(cfg, "", path)]
+        # an absolute target outside the project (`/tmp/api/openapi.yaml`) is not the project's api/openapi.yaml: it is
+        # a write outside the root, judged by its class (`outside_root_writes`), never a forbidden-path crossing
+        # (2026-10-26 — the cleaned path is matched now, and every absolute path holds folder names of its own)
+        judged["block"] += [(kind, trigger, "") for kind, trigger in
+                            trigger_hits(cfg, "", "" if _outside_project(path) else path)]
     scan_progress(0, len(units))
     if len(str(text or "")) > PACKAGE_READ_MAX:
         unread.append(f"the content past {PACKAGE_READ_MAX // 1_000_000} MB ({len(str(text)):,} characters) was not "
@@ -3234,12 +3312,14 @@ TECHNOLOGY_WORDS = {
 # JavaScript repository names in its ignore files, CI and lockfiles; `connection`, `pool`, `generated`, `mocks` what
 # every Go or Java repository says in its own code (decision 1б, 29.09: the phrases `connection pool` and `generated
 # mocks` still block). No capability word (`CAPABILITY_TRIGGERS`) and no technology is on it (test_boundary_markers).
+# 2026-10-26: `note`, `notes`, `write`, `writes` («…without a note», «No writes under auth/»), which also warn as a
+# lone word of a short boundary beside a marker of the same clause that blocks (`markers_for`).
 # The product's `boundary_markers.CODE_HOMONYMS` is the same list.
 CODE_HOMONYMS = {
     "collection", "collections", "session", "sessions", "record", "records", "mobile", "yarn", "lockfile", "lockfiles",
     "token", "tokens", "cache", "caches", "queue", "queues", "stream", "streams", "channel", "channels",
     "message", "messages", "connection", "connections", "pool", "pools", "generated", "generate", "modify", "modified",
-    "manually", "manual", "persistent", "mock", "mocks",
+    "manually", "manual", "persistent", "mock", "mocks", "note", "notes", "write", "writes",
 }
 SHORT_BOUNDARY_WORDS = 4  # longer than this, in the founder's own words, and the boundary's lone words only warn
 PHRASE_BRIDGES = {"of"}   # the one dropped word a phrase steps over (see markers_for); the product's list is the same
@@ -3387,13 +3467,13 @@ def markers_for(boundary: str, vocabulary: set) -> tuple:
     if whole:
         raw = [normalize(boundary)]
     short = len(words) <= SHORT_BOUNDARY_WORDS
-    blocking, warning = [], []
+    decided: list = []  # (text, "block" | "warn" | "beside") in the order of `raw`, as the product lists its markers
     phrase_words: set = set()  # the words of the phrases armed so far: every phrase comes before the first word
     for text in raw:
         parts = text.split()
         if text in code:
             if text not in vocabulary:
-                blocking.append(text)
+                decided.append((text, "block"))
             continue
         if not text or len(text) < 3 or text in GENERIC_ARCHITECTURAL_STOPWORDS:
             continue
@@ -3404,19 +3484,31 @@ def markers_for(boundary: str, vocabulary: set) -> tuple:
         if whole:
             continue  # nothing but function words: a marker nobody would ever write into a file
         if " " in text:
-            blocking.append(text)
+            decided.append((text, "block"))
             phrase_words.update(parts)
         elif short and text in TECHNOLOGY_WORDS:
-            blocking.append(text)  # a short boundary whose one word is the name of the thing refused
+            decided.append((text, "block"))  # a short boundary whose one word is the name of the thing refused
         elif text in code_parts or (short and text in phrase_words and text in CODE_HOMONYMS):
             # one part of a longer name the boundary gives, and a word code uses for something else: the phrase or
             # the code name blocks, the word warns — a lone `collection` refused `from collections import
             # defaultdict` (2026-09-29). `payment` and `billing` name the capability itself and keep blocking.
-            warning.append(text)
+            decided.append((text, "warn"))
+        elif short and text in CODE_HOMONYMS and text not in list_items:
+            decided.append((text, "beside"))  # settled below, once the boundary's other markers are known
         elif short or text in list_items:
-            blocking.append(text)
+            decided.append((text, "block"))
         else:
-            warning.append(text)
+            decided.append((text, "warn"))
+    # A word code uses for something else, beside a marker of the same clause of a short boundary that blocks, warns:
+    # that marker carries the refusal. «No new dependencies without a note» armed `note`, «No writes under auth/»
+    # `writes`, and `note = …` in code would have been refused (an outside tester's row, 2026-10-26). Alone in its
+    # clause it still blocks: «No sessions» and the `sessions` of «No sessions or cookies» are the thing refused.
+    clause_words = [set(c.split()) for c in clauses]
+    blockers = [set(t.split()) for t, severity in decided if severity == "block"]
+    carried = {t for t, severity in decided if severity == "beside"
+               and any(t in ws and any(b <= ws and b != {t} for b in blockers) for ws in clause_words)}
+    blocking = [t for t, severity in decided if severity == "block" or (severity == "beside" and t not in carried)]
+    warning = [t for t, severity in decided if severity == "warn" or t in carried]
     return blocking[:MARKERS_PER_BOUNDARY], warning[:WARN_MARKERS_PER_BOUNDARY]
 
 
@@ -4520,6 +4612,13 @@ def _outside_root(raw: str, cwd: Path | None) -> bool:
     return True
 
 
+def _outside_project(path: str) -> bool:
+    """An absolute target (`/tmp/x`, `C:\\elsewhere\\x`, `~/x`) that does not lie inside the project — whether or not
+    the outside_root class asks about it (a scratch place does not). A relative path is the project's own: False."""
+    target = _resolve_target(path, None)
+    return bool(target) and not _within(target, str(project_root()))
+
+
 REDIRECT_TOKEN = re.compile(r"^(?:\d|&)?(?:>\||>>?)(.*)$")  # `>|` first: it is noclobber's redirect, not `>` then a pipe
 
 
@@ -5286,7 +5385,13 @@ def doctor() -> int:
         print("  – .lumis/guard.log — empty: no agent has hit a boundary here yet (or none has run)")
     # a forbidden path that already exists means the boundary was crossed before the guard arrived, or it is stale:
     # either way the founder should decide through Amend, never by the hook going quiet about it
-    present = [p for p in cfg.get("deny_paths", []) if p and (root / p.strip("/")).exists()]
+    # — except a path the founder declared (`init --deny-paths`, 2026-10-26): a contract file is protected because it
+    # exists, so it is listed with the boundary it answers to, never counted as a problem
+    declared = [str(p) for p in cfg.get("declared_paths") or [] if str(p or "").strip()]
+    for p in declared:
+        state = "exists, a write to it is refused" if (root / p.strip("/")).exists() else "not in the repository yet, creating it is refused"
+        print(f"  ✓ protected path '{p}'{explain(cfg, p)} — {state}")
+    present = [p for p in cfg.get("deny_paths", []) if p and p not in declared and (root / p.strip("/")).exists()]
     for p in present:
         print(f"  ✗ forbidden path '{p}' already exists in the repository")
         problems.append(f"forbidden path '{p}' already exists — crossed before the guard was installed, or a stale boundary; decide through Amend")
@@ -5297,9 +5402,9 @@ def doctor() -> int:
         per: dict[str, int] = {b.get("id", ""): 0 for b in boundaries}
         for e in events:
             for hit in e.get("hits", []):
-                m = re.search(r"\bNG-(\d+)\b", str(hit))
-                if m and f"NG-{m.group(1)}" in per:
-                    per[f"NG-{m.group(1)}"] += 1
+                m = re.search(r"\b((?:NG|PATH)-\d+)\b", str(hit))  # PATH-n: a protected path's own boundary
+                if m and m.group(1) in per:
+                    per[m.group(1)] += 1
         quiet = [b for b in boundaries if per.get(b.get("id", ""), 0) == 0]
         touched = [(b.get("id"), per[b.get("id", "")]) for b in boundaries if per.get(b.get("id", ""), 0)]
         if touched:
@@ -5548,8 +5653,13 @@ def derive_config_markers(cfg: dict) -> dict:
     trigger_sources: dict[str, str] = {}
     matched: dict[str, list[str]] = {}
     per_boundary: dict[str, dict] = {}
+    # a protected path's own boundary ("Protected path: api/openapi.yaml", `init --deny-paths`) is a path, not a
+    # sentence: nothing is derived from its words (2026-10-26)
+    path_only = {str(b.get("id") or "") for b in cfg.get("boundaries") or [] if isinstance(b, dict) and b.get("kind") == "path"}
     for b in boundaries:
         bid, text = b["id"], b["text"]
+        if bid in path_only:
+            continue
         low = text.lower()
         added_block: list[str] = []
         added_warn: list[str] = []
@@ -5590,6 +5700,11 @@ def derive_config_markers(cfg: dict) -> dict:
     blocking_keywords = keywords[:320]
     packages_added = lexicon_packages_missing(cfg)
     packages += packages_added
+    # the paths and packages are kept as listed, and so is the boundary each answers to when today's lexicon does
+    # not give it one: a protected path (`declared_paths`) or one added by hand kept its NG only until a rebuild
+    for t in packages + paths:
+        if str(t).lower() in old_sources:
+            trigger_sources.setdefault(str(t).lower(), old_sources[str(t).lower()])
     warn_only = [w for w in dedupe(warn_keywords) if w not in set(blocking_keywords) and w.lower() not in allowed][:240]
     return {
         "boundaries": boundaries, "per_boundary": per_boundary, "keywords": blocking_keywords,
@@ -6821,12 +6936,10 @@ def path_findings(cfg: dict, changed: list[dict]) -> list[dict]:
         path = str(ch.get("path") or "")
         if ch.get("status") not in ("A", "M", "T", "R", "C") or not path or _guard_file_name(path):
             continue
-        low, prose = path.replace("\\", "/").lower(), _ci_prose(path)
+        prose = _ci_prose(path)
         verb = {"A": "added", "R": "moved", "C": "copied"}.get(str(ch.get("status")), "changed")
-        for deny_path in cfg.get("deny_paths") or []:
-            deny_path = str(deny_path or "")
-            if not deny_path or not deny_path_pattern(deny_path).search(low):
-                continue
+        for deny_path in deny_path_hits(cfg, path):  # the hook's own matcher: a header path is cleaned the same way
+            deny_path = str(deny_path)
             said = f"{TRIGGER_LABELS['path']} '{deny_path}'" + explain(cfg, deny_path)
             where = {"trigger": deny_path, "trigger_kind": "path", "file": path, "excerpt": path}
             if prose:

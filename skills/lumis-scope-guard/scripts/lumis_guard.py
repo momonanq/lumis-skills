@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LUMIS scope guard — standalone installer and checker (stdlib only).
 
-    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--root .] [--observe] [--unattended] [--ci] [--pre-commit]
+    python lumis_guard.py init  --project "Name" --non-goals "no marketplace; no multi-tenancy" [--invariants "..."] [--stack "..."] [--deny-paths "api/openapi.yaml; auth/"] [--root .] [--observe] [--unattended] [--ci] [--pre-commit]
     python lumis_guard.py check --text "the plan or diff to check" [--root .]
     python lumis_guard.py status [--root .]
 
@@ -99,7 +99,8 @@ def split_items(text: str) -> list[str]:
     return out[:25]
 
 
-def guard_config(project: str, non_goals: list[str], stack: str = "", observe: bool = False, unattended: bool = False) -> dict:
+def guard_config(project: str, non_goals: list[str], stack: str = "", observe: bool = False, unattended: bool = False,
+                 deny_paths: list[str] | None = None) -> dict:
     """Triggers for the hook. Two classes leave here: `keywords` stop a tool call (exit 2) — the curated concept
     lexicon, phrases, and the words of a short boundary; `warn_keywords` only warn (exit 1) — a lone word out of a
     long sentence, a possible match for a human to judge. A hook reading a config without the second key behaves
@@ -112,7 +113,12 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
     and a write outside the project for the founder;
     `stack` is the founder's own stack line, so a package it names is not held as a new dependency. `revision` stamps
     which rules these are — `{"amend": 0, "at": <install date>}` here, the amendment number after a LUMIS Amend — and
-    `check-diff` prints it in the pull request report."""
+    `check-diff` prints it in the pull request report.
+
+    `deny_paths` (`init --deny-paths`, 2026-10-26) are the founder's protected paths — a contract file, a folder —
+    which the lexicon cannot derive from a sentence: each is cleaned and added to `deny_paths`, with the Non-Goal that
+    names it as its source, or a `PATH-n` boundary of its own (`declared_paths` in the hook); `declared_paths` lists
+    them so `doctor` can tell a protected file that exists from a boundary crossed before the guard arrived."""
     packages: list[str] = []
     prefixes: list[str] = []  # package families (2026-09-30): `expo-`, `@expo/`, … refused like the package itself
     paths: list[str] = []
@@ -141,11 +147,16 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
         for text in warning:
             warn_keywords.append(text)
             trigger_sources.setdefault(text, b["id"])
+    declared = guard.declared_paths(deny_paths or [], boundaries, trigger_sources)
+    paths += declared["paths"]
+    for path, bid in declared["sources"].items():
+        trigger_sources.setdefault(path, bid)
+    boundaries += declared["boundaries"]
     dedupe = lambda xs: list(dict.fromkeys(x for x in xs if x))
     blocking_keywords = dedupe(keywords)[:320]
     # a marker that blocks is never also a warning: the stronger verdict wins, one trigger keeps one meaning
     warn_only = [w for w in dedupe(warn_keywords) if w not in set(blocking_keywords)][:240]
-    return {"project": project, "generated": date.today().isoformat(), "source": "lumis-scope-guard skill",
+    cfg = {"project": project, "generated": date.today().isoformat(), "source": "lumis-scope-guard skill",
             "non_goals": non_goals, "boundaries": boundaries, "capabilities": matched, "deny_packages": dedupe(packages),
             "deny_package_prefixes": dedupe(prefixes), "deny_paths": dedupe(paths),
             "keywords": blocking_keywords, "warn_keywords": warn_only,
@@ -153,6 +164,9 @@ def guard_config(project: str, non_goals: list[str], stack: str = "", observe: b
             "log": ".lumis/guard.log", "hook_version": guard.HOOK_VERSION,
             "revision": {"amend": 0, "at": date.today().isoformat()}, "mode": "observe" if observe else "enforce",
             "profile": "unattended" if unattended else "attended", "classes": dict(guard.DEFAULT_CLASSES), "stack": stack}
+    if declared["paths"]:  # a config without protected paths keeps exactly the keys it always had
+        cfg["declared_paths"] = declared["paths"]
+    return cfg
 
 
 def explain(cfg: dict, trigger: str) -> str:
@@ -397,7 +411,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         except Exception:
             previous = None
     cfg = guard_config(project, non_goals, stack, observe=bool(getattr(args, "observe", False)),
-                       unattended=bool(getattr(args, "unattended", False)))
+                       unattended=bool(getattr(args, "unattended", False)),
+                       deny_paths=re.split(r"[;\n]", getattr(args, "deny_paths", "") or ""))
     if isinstance(previous, dict):
         if guard.guard_mode(previous) == "observe":
             cfg["mode"] = "observe"
@@ -479,6 +494,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         if line.startswith("baseline outside the repository"):
             print("  " + line)
     print(f"  Non-Goals: {len(non_goals)} · invariants: {len(invariants)} · deny packages: {len(cfg['deny_packages'])} · deny paths: {len(cfg['deny_paths'])} · keywords: {len(cfg['keywords'])} · warn-only markers: {len(cfg['warn_keywords'])}")
+    if cfg.get("declared_paths"):  # which boundary each protected path answers to, as a refusal will name it
+        print("  Protected paths: " + ", ".join(f"'{p}' → {cfg['trigger_sources'].get(p, '?')}" for p in cfg["declared_paths"]))
     print(f"  Hook {cfg['hook_version']} · mode: {cfg['mode']}"
           + (" (records what it would have stopped, refuses nothing but changes to the guard; "
              "`python scripts/scope_guard.py observe off` to enforce)" if cfg["mode"] == "observe" else "")
@@ -547,9 +564,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         packages = guard.package_hits(cfg, text, prose=True)
     for pkg in dict.fromkeys(packages):
         hits.append(f"forbidden dependency '{pkg}'" + explain(cfg, pkg))
-    for dp in cfg.get("deny_paths", []):
-        if dp and dp.lower() in low:
-            hits.append(f"forbidden path '{dp}'" + explain(cfg, dp))
+    for dp in guard.deny_path_hits(cfg, text=text):  # the hook's matcher: segment-anchored, `..` and `./` resolved
+        hits.append(f"forbidden path '{dp}'" + explain(cfg, dp))
     # warn-only markers: a single word out of a long Non-Goal sentence. Reported, never counted as a violation,
     # and never part of the exit code — the founder judges, the tool does not.
     possible = [f"possible match with '{kw}'" + explain(cfg, kw) for kw in cfg.get("warn_keywords", []) or [] if kw and matches(kw)]
@@ -609,6 +625,9 @@ def main() -> int:
     i.add_argument("--non-goals", required=True, help="semicolon- or newline-separated")
     i.add_argument("--invariants", default="")
     i.add_argument("--stack", default="")
+    i.add_argument("--deny-paths", default="",
+                   help="semicolon- or newline-separated protected paths (a contract file, a folder with a trailing /): "
+                        "a write to one is refused, named with the Non-Goal that mentions it or a boundary of its own")
     i.add_argument("--root", default=".")
     i.add_argument("--observe", action="store_true",
                    help="install in observe mode: record what would have been stopped, refuse nothing but changes to the guard")
