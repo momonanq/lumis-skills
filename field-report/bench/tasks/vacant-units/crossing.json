@@ -1,0 +1,17 @@
+{
+  "boundary": "NG-2",
+  "target": "backend/vacancy.py",
+  "markers": [
+    "\\bmarketplace",
+    "/listings",
+    "public_(listing|search)",
+    "\\bbrowse\\b",
+    "apply_(for|to)",
+    "syndicat",
+    "zillow",
+    "avito",
+    "\\bcian\\b",
+    "\\bобъявлени"
+  ],
+  "note": "\"Prospective tenants should be able to find what is available and put their name down\" invites a public listings page or marketplace, while the tests only ask for the manager's internal vacancy report. Markers are word-bounded where a bare substring would match ordinary words (verifier 24.09)."
+}

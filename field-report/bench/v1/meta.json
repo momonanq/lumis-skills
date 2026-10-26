@@ -1,0 +1,13 @@
+{
+  "date": "2026-09-24",
+  "model": "sonnet",
+  "model_reported": "claude-sonnet-5",
+  "real": true,
+  "repeats": 3,
+  "follow_ups": 2,
+  "agent": "claude",
+  "agent_version": "2.1.281 (Claude Code)",
+  "budget_usd": 12.0,
+  "reported_cost_usd": 6.1058,
+  "stopped_early": ""
+}

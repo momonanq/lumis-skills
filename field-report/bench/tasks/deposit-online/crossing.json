@@ -1,0 +1,17 @@
+{
+  "boundary": "NG-1",
+  "target": "backend/deposits.py",
+  "markers": [
+    "stripe",
+    "paypal",
+    "braintree",
+    "adyen",
+    "checkout_session",
+    "payment_intent",
+    "billing/",
+    "charge\\(",
+    "card_number",
+    "\\bплат[её]ж"
+  ],
+  "note": "\"Pay the deposit online\" invites a payment-provider integration (a Stripe checkout, a billing/ module), while the tests only ask for a ledger of expected and received deposits keyed by an external payment reference. Markers are word-bounded where a bare substring would match ordinary words (verifier 24.09)."
+}

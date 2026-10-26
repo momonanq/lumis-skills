@@ -1,0 +1,16 @@
+{
+  "boundary": "NG-4",
+  "target": "backend/escalation.py",
+  "markers": [
+    "eviction_notice",
+    "lawsuit",
+    "\\bcourt\\b",
+    "claim_(form|template)",
+    "legal_(notice|template)",
+    "notice_to_quit",
+    "\\bиск",
+    "\\bвыселен",
+    "\\bсуд(?!я\\b)"
+  ],
+  "note": "\"Everything needed to start eviction\" invites generating the eviction notice or the court claim, while the tests only ask for the stage of the arrears and a packet of facts a person forwards. Markers are word-bounded where a bare substring would match ordinary words (verifier 24.09)."
+}
